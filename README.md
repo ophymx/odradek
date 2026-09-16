@@ -60,21 +60,25 @@ Early but functional end to end:
   odradek-accept --server ... --baseline conformance/kafka.json
   ```
 
-  The suite is calibrated in both directions: a fault-injectable reference
+  The suite is calibrated in three directions: a fault-injectable reference
   subject (`odradek_acceptance::subject`) proves each check detects exactly
   the violation it claims to (sensitivity) and that a conformant subject
   trips nothing (specificity); `odradek-client` itself passes the client
-  checks (dogfooding). Still missing: runs against real brokers (needs a
-  container runtime or JVM) to calibrate against ground truth.
+  checks (dogfooding); and real brokers are ground truth — `cargo xtask
+  conformance` runs the suite against Apache Kafka and Redpanda in Docker
+  and enforces the per-implementation baselines committed in
+  [`conformance/`](conformance/) (both currently pass every check).
 
-Next: run the suite against Apache Kafka/Redpanda/etc. and commit
-per-implementation baselines, materialize known tagged fields in codegen,
-vendor more schemas (consumer groups, offsets), the client's
+Next: grow the server checks beyond `api-versions/*` (metadata, produce,
+fetch) against the same broker matrix, materialize known tagged fields in
+codegen, vendor more schemas (consumer groups, offsets), the client's
 cluster/metadata layer, and record batch encoding.
 
 ```sh
 cargo test --workspace       # everything
 cargo xtask codegen          # regenerate message types from schemas
+cargo xtask conformance      # real-broker conformance runs (needs docker)
+cargo xtask conformance --record   # refresh baselines from a run
 ```
 
 ## License

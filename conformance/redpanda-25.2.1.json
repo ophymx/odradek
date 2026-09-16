@@ -1,0 +1,8 @@
+{
+  "checks": {
+    "api-versions/correlation-echo": "pass",
+    "api-versions/flexible-v3": "pass",
+    "api-versions/unsupported-version-error": "pass",
+    "api-versions/v0-basic": "pass"
+  }
+}

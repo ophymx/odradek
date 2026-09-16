@@ -3,6 +3,9 @@
 //! `cargo xtask codegen` regenerates `odradek-protocol/src/messages/` from
 //! the Kafka message schemas vendored in `odradek-protocol/schemas/`.
 //!
+//! `cargo xtask conformance` runs the acceptance suite against real broker
+//! implementations in Docker; see `conformance.rs`.
+//!
 //! Known limitation (v1): fields with a `tag` (tagged fields) are not
 //! materialized as struct fields; they round-trip losslessly through
 //! `unknown_tagged_fields`. Each generated module lists what was skipped.
@@ -14,11 +17,15 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
+mod conformance;
+
 fn main() -> Result<()> {
-    let task = std::env::args().nth(1).unwrap_or_default();
-    match task.as_str() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let task = args.first().map(String::as_str).unwrap_or_default();
+    match task {
         "codegen" => codegen(),
-        other => bail!("unknown task {other:?}; available tasks: codegen"),
+        "conformance" => conformance::conformance(&args[1..]),
+        other => bail!("unknown task {other:?}; available tasks: codegen, conformance"),
     }
 }
 
