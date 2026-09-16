@@ -187,6 +187,18 @@ impl Cluster {
         Ok(&self.conns[&node_id])
     }
 
+    /// Forget cached leadership for `topic` — e.g. after a
+    /// NOT_LEADER_OR_FOLLOWER — so the next lookup refreshes.
+    pub fn mark_stale(&mut self, topic: &str) {
+        self.topics.remove(topic);
+    }
+
+    /// Drop the pooled connection to `node_id` (e.g. after it failed);
+    /// the next use redials.
+    pub fn forget_broker(&mut self, node_id: i32) {
+        self.conns.remove(&node_id);
+    }
+
     /// A negotiated connection to the current leader of
     /// `topic[partition]`, refreshing metadata once if leadership is
     /// unknown.

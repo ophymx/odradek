@@ -142,17 +142,37 @@ async fn serve_conn(
                 buf.freeze()
             }
             0 => {
+                use odradek_protocol::messages::produce_response::{
+                    PartitionProduceResponse, TopicProduceResponse,
+                };
                 let produce = ProduceRequest::decode(&mut frame, api_version).unwrap();
+                let mut responses = Vec::new();
                 for topic in &produce.topic_data {
                     assert_eq!(topic.name, TOPIC);
+                    let mut partitions = Vec::new();
                     for p in &topic.partition_data {
                         arrivals.lock().unwrap().push((node_id, p.index));
+                        partitions.push(PartitionProduceResponse {
+                            index: p.index,
+                            error_code: 0,
+                            base_offset: 7,
+                            log_append_time_ms: -1,
+                            ..Default::default()
+                        });
                     }
+                    responses.push(TopicProduceResponse {
+                        name: topic.name.clone(),
+                        partition_responses: partitions,
+                        ..Default::default()
+                    });
                 }
                 let mut buf = BytesMut::new();
-                ProduceResponse::default()
-                    .encode(&mut buf, api_version)
-                    .unwrap();
+                ProduceResponse {
+                    responses,
+                    ..Default::default()
+                }
+                .encode(&mut buf, api_version)
+                .unwrap();
                 buf.freeze()
             }
             other => panic!("fake broker got api key {other}"),
@@ -245,6 +265,30 @@ async fn leaderless_partition_is_an_error_not_a_guess() {
         }
         other => panic!("expected UnknownLeader, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn producer_delivers_a_batch_and_returns_the_offset() {
+    use odradek_client::Producer;
+    use odradek_protocol::records::Record;
+
+    let fake = spawn_fake_cluster(3, &[]).await;
+    let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+    let mut producer = Producer::new(cluster);
+    let offset = producer
+        .produce(
+            TOPIC,
+            2,
+            vec![Record {
+                key: Some(Bytes::from_static(b"k")),
+                value: Some(Bytes::from_static(b"v")),
+                ..Default::default()
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(offset, 7); // the fake's fixed base offset
+    assert!(fake.arrivals.lock().unwrap().contains(&(2, 2)));
 }
 
 #[tokio::test]

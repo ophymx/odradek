@@ -14,20 +14,23 @@
 //! 3. `producer` / `consumer`: batching, compression, consumer groups.
 //!
 //! Current state: `conn` (framing, correlation-id pipelining, ApiVersions
-//! negotiation) and `cluster` (metadata cache, per-broker connections,
-//! partition-leader routing) are implemented; `producer` and `consumer`
-//! are next.
+//! negotiation), `cluster` (metadata cache, per-broker connections,
+//! partition-leader routing), and a minimal `producer` (single-batch
+//! sends with leader-change retries) are implemented; batching,
+//! compression, and `consumer` are next.
 
 pub mod cluster;
 pub mod conn;
 pub mod error;
 pub mod negotiate;
+pub mod producer;
 
 pub use cluster::Cluster;
 pub use conn::Connection;
 pub use error::ClientError;
 pub use negotiate::ApiVersionRanges;
 pub use odradek_protocol as protocol;
+pub use producer::{Producer, ProducerConfig};
 
 /// Configuration shared by every entry point of the client.
 #[derive(Debug, Clone)]
