@@ -1,0 +1,18 @@
+[package]
+name = "odradek-acceptance"
+description = "Acceptance suite for the Kafka protocol: validates server and client implementations for wire-level conformance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+odradek-protocol = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["Jeffrey T. Peckham <abic@ophymx.com>"]
+
+[workspace.dependencies]
+# internal crates
+odradek-protocol = { path = "crates/odradek-protocol", version = "0.1.0" }
+odradek-client = { path = "crates/odradek-client", version = "0.1.0" }
+
+# external
+bytes = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "sync", "time", "macros"] }
+tracing = "0.1"
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+cast_possible_truncation = "warn"

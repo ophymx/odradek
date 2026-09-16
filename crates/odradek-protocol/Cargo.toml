@@ -1,0 +1,15 @@
+[package]
+name = "odradek-protocol"
+description = "Sans-I/O implementation of the Kafka wire protocol: primitive codecs, message framing, and versioned message types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
