@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use odradek_acceptance::Verdict;
-use odradek_acceptance::checks::client::{ObserveConfig, ROUTING_TOPIC, run};
-use odradek_client::{ClientConfig, Cluster, Connection};
+use odradek_acceptance::checks::client::{HarnessFault, ObserveConfig, ROUTING_TOPIC, run};
+use odradek_client::{ClientConfig, Cluster, Connection, Producer};
 use odradek_protocol::messages::produce_request::{
     PartitionProduceData, ProduceRequest, TopicProduceData,
 };
@@ -18,6 +18,7 @@ fn config() -> ObserveConfig {
     ObserveConfig {
         max_requests: 16,
         idle_timeout: Duration::from_millis(1500),
+        fault: None,
     }
 }
 
@@ -114,6 +115,89 @@ async fn misbehaving_client_is_caught() {
             Some(Verdict::Pass)
         ),
         "false positive on header check:\n{report}"
+    );
+}
+
+/// Recovery dogfood: the harness moves partition 0's leadership on the
+/// first produce; our producer must refresh metadata and re-deliver to
+/// the new leader.
+#[tokio::test]
+async fn odradek_client_recovers_from_leader_change() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let harness = tokio::spawn(async move {
+        let config = ObserveConfig {
+            fault: Some(HarnessFault::LeaderMove),
+            ..config()
+        };
+        run(&listener, &config).await
+    });
+
+    let cluster = Cluster::connect(ClientConfig {
+        bootstrap_servers: vec![addr],
+        client_id: "odradek".into(),
+    })
+    .await
+    .unwrap();
+    let mut producer = Producer::new(cluster);
+    let offset = producer
+        .produce(
+            ROUTING_TOPIC,
+            0,
+            vec![odradek_protocol::records::Record {
+                value: Some(Bytes::from_static(b"survives the move")),
+                ..Default::default()
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(offset, 0);
+    drop(producer);
+
+    let report = harness.await.unwrap();
+    assert!(
+        matches!(
+            report.verdict("client/recovers-from-leader-change"),
+            Some(Verdict::Pass)
+        ),
+        "recovery not credited:\n{report}"
+    );
+    assert!(report.is_conformant(), "{report}");
+}
+
+/// Recovery sensitivity: a client that gets NOT_LEADER and simply gives
+/// up must be caught.
+#[tokio::test]
+async fn client_that_abandons_after_leader_change_is_caught() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let harness = tokio::spawn(async move {
+        let config = ObserveConfig {
+            fault: Some(HarnessFault::LeaderMove),
+            ..config()
+        };
+        run(&listener, &config).await
+    });
+
+    let conn = Connection::connect(&addr, &ClientConfig::default())
+        .await
+        .unwrap();
+    let ranges = conn.negotiate().await.unwrap();
+    let version = ranges.pick(0, (3, 12)).unwrap();
+    // Correctly routed (partition 0 → broker 0), answered NOT_LEADER by
+    // the staged move — and then this client just walks away.
+    conn.request(0, version, &produce_body(0, version))
+        .await
+        .unwrap();
+    drop(conn);
+
+    let report = harness.await.unwrap();
+    assert!(
+        matches!(
+            report.verdict("client/recovers-from-leader-change"),
+            Some(Verdict::Fail { .. })
+        ),
+        "abandonment not caught:\n{report}"
     );
 }
 

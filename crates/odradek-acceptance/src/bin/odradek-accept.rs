@@ -25,7 +25,8 @@ use tokio::net::TcpListener;
 fn usage() -> ExitCode {
     eprintln!(
         "usage: odradek-accept (--server <host:port> | --client-listen <host:port>)\n\
-         \x20                    [--json] [--baseline <file>] [--write-baseline <file>]"
+         \x20                    [--fault leader-move] [--json]\n\
+         \x20                    [--baseline <file>] [--write-baseline <file>]"
     );
     ExitCode::from(2)
 }
@@ -33,6 +34,7 @@ fn usage() -> ExitCode {
 struct Args {
     server: Option<String>,
     client_listen: Option<String>,
+    fault: Option<checks::client::HarnessFault>,
     json: bool,
     baseline: Option<String>,
     write_baseline: Option<String>,
@@ -42,6 +44,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut parsed = Args {
         server: None,
         client_listen: None,
+        fault: None,
         json: false,
         baseline: None,
         write_baseline: None,
@@ -51,14 +54,23 @@ fn parse_args(args: &[String]) -> Option<Args> {
         match arg.as_str() {
             "--server" => parsed.server = Some(it.next()?.clone()),
             "--client-listen" => parsed.client_listen = Some(it.next()?.clone()),
+            "--fault" => {
+                parsed.fault = match it.next()?.as_str() {
+                    "leader-move" => Some(checks::client::HarnessFault::LeaderMove),
+                    _ => return None,
+                }
+            }
             "--json" => parsed.json = true,
             "--baseline" => parsed.baseline = Some(it.next()?.clone()),
             "--write-baseline" => parsed.write_baseline = Some(it.next()?.clone()),
             _ => return None,
         }
     }
-    // Exactly one subject.
+    // Exactly one subject; faults only apply to the client harness.
     if parsed.server.is_some() == parsed.client_listen.is_some() {
+        return None;
+    }
+    if parsed.fault.is_some() && parsed.client_listen.is_none() {
         return None;
     }
     Some(parsed)
@@ -83,7 +95,11 @@ async fn main() -> ExitCode {
             }
         };
         eprintln!("waiting for a client connection on {addr} ...");
-        checks::client::run(&listener, &checks::client::ObserveConfig::default()).await
+        let config = checks::client::ObserveConfig {
+            fault: args.fault,
+            ..Default::default()
+        };
+        checks::client::run(&listener, &config).await
     };
 
     if args.json {

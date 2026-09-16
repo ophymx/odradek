@@ -50,6 +50,17 @@ pub const ROUTING_TOPIC: &str = "odradek-routing";
 /// The routing topic's id, for id-addressed clients (16 bytes).
 pub const ROUTING_TOPIC_ID: [u8; 16] = *b"odradek-routing!";
 
+/// A deliberate misbehavior the harness can stage to observe how the
+/// client copes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarnessFault {
+    /// The first produce for each routing-topic partition is answered
+    /// with NOT_LEADER_OR_FOLLOWER and leadership moves to the next
+    /// broker; later metadata reflects the move. A resilient client
+    /// refreshes and re-delivers to the new leader.
+    LeaderMove,
+}
+
 /// Limits for one observation session.
 #[derive(Debug, Clone)]
 pub struct ObserveConfig {
@@ -57,6 +68,8 @@ pub struct ObserveConfig {
     pub max_requests: usize,
     /// Stop when every connection goes quiet for this long.
     pub idle_timeout: Duration,
+    /// Optional staged misbehavior.
+    pub fault: Option<HarnessFault>,
 }
 
 impl Default for ObserveConfig {
@@ -64,6 +77,7 @@ impl Default for ObserveConfig {
         ObserveConfig {
             max_requests: 32,
             idle_timeout: Duration::from_secs(3),
+            fault: None,
         }
     }
 }
@@ -91,10 +105,57 @@ struct Observation {
     routes: Vec<(String, i32)>,
 }
 
-/// The impersonated cluster's endpoints; broker `i` listens on
-/// `ports[i]`.
+/// A NOT_LEADER injection that actually fired.
+#[derive(Debug, Clone, Copy)]
+struct FaultEvent {
+    partition: i32,
+    to_node: i32,
+}
+
+/// The impersonated cluster: endpoints (broker `i` on `ports[i]`) and
+/// mutable leadership for the routing topic.
 struct ClusterView {
     ports: Vec<u16>,
+    fault: Option<HarnessFault>,
+    /// Current leader per routing-topic partition.
+    leaders: std::sync::Mutex<Vec<i32>>,
+    /// Leader-move injections that fired.
+    events: std::sync::Mutex<Vec<FaultEvent>>,
+}
+
+impl ClusterView {
+    /// The produce verdict for `partition` arriving at `node_id`: the
+    /// error code to answer, staging the leader move when armed.
+    fn produce_error(&self, partition: i32, node_id: i32) -> i16 {
+        let mut leaders = self.leaders.lock().unwrap();
+        let Some(slot) = usize::try_from(partition)
+            .ok()
+            .filter(|&p| p < leaders.len())
+        else {
+            return 3; // UNKNOWN_TOPIC_OR_PARTITION
+        };
+        if leaders[slot] != node_id {
+            return 6; // NOT_LEADER_OR_FOLLOWER
+        }
+        if self.fault == Some(HarnessFault::LeaderMove) {
+            let already_moved = self
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.partition == partition);
+            if !already_moved {
+                let to_node = (node_id + 1) % BROKER_COUNT;
+                leaders[slot] = to_node;
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(FaultEvent { partition, to_node });
+                return 6;
+            }
+        }
+        0
+    }
 }
 
 /// Accept client connections (bootstrap on `listener`, brokers 1+ on
@@ -126,7 +187,12 @@ pub async fn run(listener: &TcpListener, config: &ObserveConfig) -> Report {
             .iter()
             .filter_map(|l| l.local_addr().ok().map(|a| a.port())),
     );
-    let view = Arc::new(ClusterView { ports });
+    let view = Arc::new(ClusterView {
+        ports,
+        fault: config.fault,
+        leaders: std::sync::Mutex::new((0..BROKER_COUNT).collect()),
+        events: std::sync::Mutex::new(Vec::new()),
+    });
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let conn_counter = Arc::new(AtomicUsize::new(0));
@@ -195,7 +261,13 @@ pub async fn run(listener: &TcpListener, config: &ObserveConfig) -> Report {
     for t in &accept_tasks {
         t.abort();
     }
-    evaluate(&observations, &format!("client {peer}"))
+    let events = view.events.lock().unwrap().clone();
+    evaluate(
+        &observations,
+        config.fault,
+        &events,
+        &format!("client {peer}"),
+    )
 }
 
 async fn handle_conn(
@@ -213,7 +285,7 @@ async fn handle_conn(
         let obs = parse_request(node_id, conn_id, index, frame);
         index += 1;
         if let Some(header) = &obs.header {
-            respond(&mut stream, header, &view).await;
+            respond(&mut stream, header, &view, node_id, &obs.routes).await;
         }
         if tx.send(obs).is_err() {
             return;
@@ -386,7 +458,13 @@ fn salvage_header(frame: &Bytes) -> Option<RequestHeader> {
     None
 }
 
-async fn respond(stream: &mut TcpStream, header: &RequestHeader, view: &ClusterView) {
+async fn respond(
+    stream: &mut TcpStream,
+    header: &RequestHeader,
+    view: &ClusterView,
+    node_id: i32,
+    routes: &[(String, i32)],
+) {
     let api_key = header.request_api_key;
     let api_version = header.request_api_version;
 
@@ -395,6 +473,7 @@ async fn respond(stream: &mut TcpStream, header: &RequestHeader, view: &ClusterV
         18 => (encode_api_versions(0, api_version), 0),
         3 => {
             let v = api_version.clamp(0, 13);
+            let leaders = view.leaders.lock().unwrap().clone();
             let resp = MetadataResponse {
                 brokers: view
                     .ports
@@ -412,12 +491,14 @@ async fn respond(stream: &mut TcpStream, header: &RequestHeader, view: &ClusterV
                 topics: vec![MetadataResponseTopic {
                     name: Some(ROUTING_TOPIC.into()),
                     topic_id: ROUTING_TOPIC_ID,
-                    partitions: (0..BROKER_COUNT)
-                        .map(|i| MetadataResponsePartition {
-                            partition_index: i,
-                            leader_id: i,
-                            replica_nodes: vec![i],
-                            isr_nodes: vec![i],
+                    partitions: leaders
+                        .iter()
+                        .enumerate()
+                        .map(|(i, leader)| MetadataResponsePartition {
+                            partition_index: i32::try_from(i).unwrap_or(0),
+                            leader_id: *leader,
+                            replica_nodes: vec![*leader],
+                            isr_nodes: vec![*leader],
                             ..Default::default()
                         })
                         .collect(),
@@ -432,9 +513,46 @@ async fn respond(stream: &mut TcpStream, header: &RequestHeader, view: &ClusterV
             (buf.freeze(), response_header_version(3, v).unwrap_or(0))
         }
         0 => {
+            use odradek_protocol::messages::produce_response::{
+                PartitionProduceResponse, TopicProduceResponse,
+            };
             let v = api_version.clamp(3, 12);
+            // Echo the addressed topics/partitions, judging each against
+            // the current (possibly fault-moved) leadership.
+            let mut responses: Vec<TopicProduceResponse> = Vec::new();
+            for (topic, partition) in routes {
+                let error_code = if topic == ROUTING_TOPIC {
+                    view.produce_error(*partition, node_id)
+                } else {
+                    3 // UNKNOWN_TOPIC_OR_PARTITION
+                };
+                let entry = PartitionProduceResponse {
+                    index: *partition,
+                    error_code,
+                    base_offset: if error_code == 0 { 0 } else { -1 },
+                    log_append_time_ms: -1,
+                    ..Default::default()
+                };
+                match responses.iter_mut().find(|t| &t.name == topic) {
+                    Some(t) => t.partition_responses.push(entry),
+                    None => responses.push(TopicProduceResponse {
+                        name: topic.clone(),
+                        topic_id: if topic == ROUTING_TOPIC {
+                            ROUTING_TOPIC_ID
+                        } else {
+                            [0u8; 16]
+                        },
+                        partition_responses: vec![entry],
+                        ..Default::default()
+                    }),
+                }
+            }
             let mut buf = BytesMut::new();
-            let Ok(()) = ProduceResponse::default().encode(&mut buf, v) else {
+            let Ok(()) = ProduceResponse {
+                responses,
+                ..Default::default()
+            }
+            .encode(&mut buf, v) else {
                 return;
             };
             (buf.freeze(), response_header_version(0, v).unwrap_or(0))
@@ -488,7 +606,12 @@ fn encode_api_versions(error_code: i16, version: i16) -> Bytes {
     buf.freeze()
 }
 
-fn evaluate(observations: &[Observation], subject: &str) -> Report {
+fn evaluate(
+    observations: &[Observation],
+    fault: Option<HarnessFault>,
+    events: &[FaultEvent],
+    subject: &str,
+) -> Report {
     let mut outcomes = Vec::new();
     let none_observed = observations.is_empty();
     let skip = |reason: &str| Verdict::Skipped {
@@ -639,7 +762,15 @@ fn evaluate(observations: &[Observation], subject: &str) -> Report {
     });
 
     // client/routes-to-partition-leader: partition i of the routing topic
-    // is led by broker i; produce/fetch for it must arrive there.
+    // starts led by broker i; a staged fault may move it. A misroute is
+    // an arrival at a broker that was never that partition's advertised
+    // leader.
+    let ever_led = |partition: i32, node: i32| {
+        node == partition
+            || events
+                .iter()
+                .any(|e| e.partition == partition && e.to_node == node)
+    };
     let mut misroutes = Vec::new();
     let mut routed = 0usize;
     for o in observations {
@@ -648,11 +779,12 @@ fn evaluate(observations: &[Observation], subject: &str) -> Report {
                 continue;
             }
             routed += 1;
-            if *partition != o.node_id {
+            if !ever_led(*partition, o.node_id) {
                 misroutes.push(format!(
-                    "{} addresses {topic}[{partition}], whose advertised \
-                     leader is broker {partition}",
-                    describe(o)
+                    "{} addresses {topic}[{partition}], which broker {} \
+                     was never advertised as leading",
+                    describe(o),
+                    o.node_id
                 ));
             }
         }
@@ -668,6 +800,42 @@ fn evaluate(observations: &[Observation], subject: &str) -> Report {
         } else {
             Verdict::Fail {
                 details: misroutes.join("; "),
+            }
+        },
+    });
+
+    // client/recovers-from-leader-change: only meaningful when the
+    // leader-move fault is armed and actually fired.
+    let mut unrecovered = Vec::new();
+    for event in events {
+        let redelivered = observations.iter().any(|o| {
+            o.node_id == event.to_node
+                && o.routes
+                    .iter()
+                    .any(|(t, p)| t == ROUTING_TOPIC && *p == event.partition)
+        });
+        if !redelivered {
+            unrecovered.push(format!(
+                "after NOT_LEADER moved {ROUTING_TOPIC}[{}]'s leadership to \
+                 broker {}, no produce/fetch ever reached it there",
+                event.partition, event.to_node
+            ));
+        }
+    }
+    outcomes.push(CheckOutcome {
+        id: CheckId("client/recovers-from-leader-change".into()),
+        requirement: "after a NOT_LEADER_OR_FOLLOWER answer, the client \
+                      refreshes metadata and re-delivers to the newly \
+                      advertised leader",
+        verdict: if fault != Some(HarnessFault::LeaderMove) {
+            skip("leader-move fault not armed")
+        } else if events.is_empty() {
+            skip("the client sent nothing that triggered the leader move")
+        } else if unrecovered.is_empty() {
+            Verdict::Pass
+        } else {
+            Verdict::Fail {
+                details: unrecovered.join("; "),
             }
         },
     });

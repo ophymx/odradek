@@ -48,18 +48,21 @@ Early but functional end to end:
   `unknown_tagged_fields`.
 - `odradek-client`: framed connection with correlation-id pipelining and
   ApiVersions negotiation (including the `UNSUPPORTED_VERSION` downgrade
-  path), plus the cluster layer: metadata discovery, a per-broker
-  connection pool with per-broker version ranges, and partition-leader
-  routing — tested against in-process fake single- and multi-broker
-  clusters.
+  path); the cluster layer: metadata discovery, a per-broker connection
+  pool with per-broker version ranges, and partition-leader routing; and
+  a minimal producer that encodes record batches and retries through
+  leadership changes by invalidating stale metadata — tested against
+  in-process fake single- and multi-broker clusters.
 - `odradek-acceptance`: conformance checks for **both roles** over raw
   connections independent of the client crate — `api-versions/*`,
   `metadata/*`, `produce/*`, and `fetch/*` server checks (including a
   create → produce → fetch flow that asserts the broker returns the
   produced batch byte-identical in the crc-covered region) and `client/*`
   client checks, where the harness impersonates a three-broker cluster so
-  partition-leader routing is observable — with JSON reports and
-  per-implementation baselines:
+  partition-leader routing is observable and can stage faults
+  (`--fault leader-move` answers a produce with NOT_LEADER and moves
+  leadership, checking the client re-delivers to the new leader) — with
+  JSON reports and per-implementation baselines:
 
   ```sh
   # validate a server
@@ -86,10 +89,9 @@ Early but functional end to end:
   enforced by test: a check no fault can trip, or a fault no check
   detects, fails calibration.
 
-Next: producer/consumer machinery on the client's cluster layer,
-harness fault modes (NOT_LEADER redirects to observe client retries),
-materialize known tagged fields in codegen, and vendor more schemas
-(consumer groups, offsets).
+Next: producer batching/compression and a consumer on the client's
+cluster layer, materialize known tagged fields in codegen, and vendor
+more schemas (consumer groups, offsets).
 
 ```sh
 cargo test --workspace       # everything
