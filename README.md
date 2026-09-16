@@ -44,9 +44,10 @@ Early but functional end to end:
   record batch (v2) encoding with CRC-32C validation — compressed and
   unknown-codec payloads stay raw and re-encode byte-identically (the
   proxy guarantee), verified against a golden segment produced by a real
-  Kafka 4.1 broker. Known limitation: tagged fields are not yet
-  materialized as struct fields — they round-trip losslessly through
-  `unknown_tagged_fields`.
+  Kafka 4.1 broker. Known tagged fields are materialized as typed
+  `Option` struct fields (`None` = absent on the wire, present-null
+  distinguished for nullable ones); unknown tags still round-trip raw
+  through `unknown_tagged_fields`.
 - `odradek-client`: framed connection with correlation-id pipelining and
   ApiVersions negotiation (including the `UNSUPPORTED_VERSION` downgrade
   path); the cluster layer: metadata discovery, a per-broker connection
@@ -94,8 +95,7 @@ Early but functional end to end:
   detects, fails calibration.
 
 Next: producer batching/compression, consumer groups and offset
-commits, materialize known tagged fields in codegen, and vendor the
-group-protocol schemas.
+commits, and vendor the group-protocol schemas.
 
 ```sh
 cargo test --workspace       # everything

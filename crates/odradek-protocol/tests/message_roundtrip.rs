@@ -78,7 +78,7 @@ fn api_versions_response_roundtrip_all_versions() {
             },
         ],
         throttle_time_ms: 0,
-        unknown_tagged_fields: Vec::new(),
+        ..Default::default()
     };
     for version in ApiVersionsResponse::MIN_VERSION..=ApiVersionsResponse::MAX_VERSION {
         // throttle_time_ms only exists from v1; keep it default (0) so
@@ -91,13 +91,91 @@ fn api_versions_response_roundtrip_all_versions() {
 fn unknown_tagged_fields_roundtrip() {
     let resp = ApiVersionsResponse {
         unknown_tagged_fields: vec![RawTaggedField {
-            tag: 1,
+            tag: 99, // no known meaning; must survive raw
             data: Bytes::from_static(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
         }],
         ..Default::default()
     };
     // Flexible version keeps the raw tagged payload byte-for-byte.
     roundtrip!(ApiVersionsResponse, resp, 3);
+}
+
+#[test]
+fn known_tagged_fields_materialize() {
+    // A raw tag 1 payload (int64 -1) decodes into the materialized field,
+    // not into unknown_tagged_fields.
+    let carrier = ApiVersionsResponse {
+        unknown_tagged_fields: vec![RawTaggedField {
+            tag: 1,
+            data: Bytes::from_static(&[0xff; 8]),
+        }],
+        ..Default::default()
+    };
+    let bytes = encode(&carrier, 3, |m, b, v| m.encode(b, v));
+    let decoded = ApiVersionsResponse::decode(&mut bytes.clone(), 3).unwrap();
+    assert_eq!(decoded.finalized_features_epoch, Some(-1));
+    assert!(decoded.unknown_tagged_fields.is_empty());
+    // Re-encoding the materialized form reproduces the same bytes.
+    assert_eq!(encode(&decoded, 3, |m, b, v| m.encode(b, v)), bytes);
+}
+
+#[test]
+fn tagged_struct_fields_roundtrip_mixed_with_unknown() {
+    use odradek_protocol::messages::fetch_response::{
+        FetchResponse, FetchableTopicResponse, LeaderIdAndEpoch, PartitionData,
+    };
+    let resp = FetchResponse {
+        responses: vec![FetchableTopicResponse {
+            topic_id: [7u8; 16],
+            partitions: vec![PartitionData {
+                partition_index: 3,
+                error_code: 6, // NOT_LEADER_OR_FOLLOWER
+                current_leader: Some(LeaderIdAndEpoch {
+                    leader_id: 2,
+                    leader_epoch: 9,
+                    ..Default::default()
+                }),
+                unknown_tagged_fields: vec![RawTaggedField {
+                    tag: 42,
+                    data: Bytes::from_static(b"future"),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    // v16 also exercises the top-level NodeEndpoints tag staying absent.
+    roundtrip!(FetchResponse, resp, 16);
+}
+
+#[test]
+fn tagged_nullable_string_distinguishes_absent_from_null() {
+    use odradek_protocol::messages::fetch_request::FetchRequest;
+    // Absent, present-null, and present-value are three different wire
+    // shapes; each must round-trip.
+    for cluster_id in [None, Some(None), Some(Some("kRaft-cluster".to_owned()))] {
+        let req = FetchRequest {
+            cluster_id: cluster_id.clone(),
+            ..Default::default()
+        };
+        roundtrip!(FetchRequest, req, 13);
+    }
+}
+
+#[test]
+fn tag_data_with_trailing_bytes_is_rejected() {
+    // Tag 3 of ApiVersionsResponse is a bool (1 byte); a 2-byte payload
+    // must error, not silently drop bytes.
+    let resp = ApiVersionsResponse {
+        unknown_tagged_fields: vec![RawTaggedField {
+            tag: 3,
+            data: Bytes::from_static(&[0x01, 0x00]),
+        }],
+        ..Default::default()
+    };
+    let bytes = encode(&resp, 3, |m, b, v| m.encode(b, v));
+    assert!(ApiVersionsResponse::decode(&mut bytes.clone(), 3).is_err());
 }
 
 #[test]
