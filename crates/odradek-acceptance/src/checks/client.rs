@@ -156,6 +156,20 @@ impl ClusterView {
         }
         0
     }
+
+    /// The fetch verdict for `partition` arriving at `node_id`: judged
+    /// against current leadership, never staging moves.
+    fn fetch_error(&self, partition: i32, node_id: i32) -> i16 {
+        let leaders = self.leaders.lock().unwrap();
+        match usize::try_from(partition)
+            .ok()
+            .filter(|&p| p < leaders.len())
+        {
+            Some(slot) if leaders[slot] == node_id => 0,
+            Some(_) => 6, // NOT_LEADER_OR_FOLLOWER
+            None => 3,    // UNKNOWN_TOPIC_OR_PARTITION
+        }
+    }
 }
 
 /// Accept client connections (bootstrap on `listener`, brokers 1+ on
@@ -558,9 +572,48 @@ async fn respond(
             (buf.freeze(), response_header_version(0, v).unwrap_or(0))
         }
         1 => {
+            use odradek_protocol::messages::fetch_response::{
+                FetchableTopicResponse, PartitionData,
+            };
             let v = api_version.clamp(4, 17);
+            // Echo the addressed topics/partitions (empty logs), judged
+            // against current leadership.
+            let mut responses: Vec<FetchableTopicResponse> = Vec::new();
+            for (topic, partition) in routes {
+                let error_code = if topic == ROUTING_TOPIC {
+                    view.fetch_error(*partition, node_id)
+                } else {
+                    3 // UNKNOWN_TOPIC_OR_PARTITION
+                };
+                let entry = PartitionData {
+                    partition_index: *partition,
+                    error_code,
+                    high_watermark: 0,
+                    last_stable_offset: 0,
+                    log_start_offset: 0,
+                    records: Some(Bytes::new()),
+                    ..Default::default()
+                };
+                match responses.iter_mut().find(|t| &t.topic == topic) {
+                    Some(t) => t.partitions.push(entry),
+                    None => responses.push(FetchableTopicResponse {
+                        topic: topic.clone(),
+                        topic_id: if topic == ROUTING_TOPIC {
+                            ROUTING_TOPIC_ID
+                        } else {
+                            [0u8; 16]
+                        },
+                        partitions: vec![entry],
+                        ..Default::default()
+                    }),
+                }
+            }
             let mut buf = BytesMut::new();
-            let Ok(()) = FetchResponse::default().encode(&mut buf, v) else {
+            let Ok(()) = FetchResponse {
+                responses,
+                ..Default::default()
+            }
+            .encode(&mut buf, v) else {
                 return;
             };
             (buf.freeze(), response_header_version(1, v).unwrap_or(0))

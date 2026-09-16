@@ -38,7 +38,8 @@ Early but functional end to end:
 
 - `odradek-protocol`: wire primitives; message types generated from the
   Kafka 4.1.0 schemas vendored in `crates/odradek-protocol/schemas/`
-  (headers, ApiVersions, Metadata, Produce, Fetch) via `cargo xtask codegen`;
+  (headers, ApiVersions, Metadata, Produce, Fetch, CreateTopics,
+  ListOffsets) via `cargo xtask codegen`;
   header-version selection including the ApiVersions response-header quirk;
   record batch (v2) encoding with CRC-32C validation — compressed and
   unknown-codec payloads stay raw and re-encode byte-identically (the
@@ -50,9 +51,12 @@ Early but functional end to end:
   ApiVersions negotiation (including the `UNSUPPORTED_VERSION` downgrade
   path); the cluster layer: metadata discovery, a per-broker connection
   pool with per-broker version ranges, and partition-leader routing; and
-  a minimal producer that encodes record batches and retries through
-  leadership changes by invalidating stale metadata — tested against
-  in-process fake single- and multi-broker clusters.
+  a minimal producer and consumer: the producer encodes record batches
+  and retries through leadership changes by invalidating stale metadata;
+  the consumer fetches and materializes records with absolute offsets,
+  skipping control batches and pre-offset records, with earliest/latest
+  lookup via ListOffsets — tested against in-process fake single- and
+  multi-broker clusters.
 - `odradek-acceptance`: conformance checks for **both roles** over raw
   connections independent of the client crate — `api-versions/*`,
   `metadata/*`, `produce/*`, and `fetch/*` server checks (including a
@@ -89,9 +93,9 @@ Early but functional end to end:
   enforced by test: a check no fault can trip, or a fault no check
   detects, fails calibration.
 
-Next: producer batching/compression and a consumer on the client's
-cluster layer, materialize known tagged fields in codegen, and vendor
-more schemas (consumer groups, offsets).
+Next: producer batching/compression, consumer groups and offset
+commits, materialize known tagged fields in codegen, and vendor the
+group-protocol schemas.
 
 ```sh
 cargo test --workspace       # everything

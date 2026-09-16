@@ -6,7 +6,7 @@ use std::time::Duration;
 use bytes::{BufMut, Bytes, BytesMut};
 use odradek_acceptance::Verdict;
 use odradek_acceptance::checks::client::{HarnessFault, ObserveConfig, ROUTING_TOPIC, run};
-use odradek_client::{ClientConfig, Cluster, Connection, Producer};
+use odradek_client::{ClientConfig, Cluster, Connection, Consumer, Producer};
 use odradek_protocol::messages::produce_request::{
     PartitionProduceData, ProduceRequest, TopicProduceData,
 };
@@ -43,7 +43,8 @@ fn produce_body(partition: i32, version: i16) -> Bytes {
 }
 
 /// The full dogfood: our cluster layer discovers the harness's fake
-/// brokers and routes a produce to each partition's advertised leader.
+/// brokers, routes a produce to each partition's advertised leader, and
+/// the consumer's fetch path routes the same way.
 #[tokio::test]
 async fn odradek_client_passes_the_client_checks() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -65,7 +66,12 @@ async fn odradek_client_passes_the_client_checks() {
         let body = produce_body(partition, version);
         broker.conn.request(0, version, &body).await.unwrap();
     }
-    drop(cluster); // close all connections so the observation session ends
+    // The consumer rides the same cluster; the harness serves empty logs.
+    let mut consumer = Consumer::new(cluster);
+    let result = consumer.fetch(ROUTING_TOPIC, 2, 0).await.unwrap();
+    assert!(result.records.is_empty());
+    assert_eq!(result.next_offset, 0);
+    drop(consumer); // close all connections so the observation session ends
 
     let report = harness.await.unwrap();
     assert!(
