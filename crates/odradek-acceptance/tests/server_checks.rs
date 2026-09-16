@@ -13,7 +13,7 @@ async fn compliant_subject_passes_all_checks() {
     assert!(report.is_conformant(), "false positives:\n{report}");
     assert_eq!(
         report.passed(),
-        4,
+        6,
         "expected every check to run and pass:\n{report}"
     );
 }
@@ -37,7 +37,35 @@ const SENSITIVITY: &[(Fault, &str)] = &[
         "api-versions/unsupported-version-error",
     ),
     (Fault::FlexibleHeaderOnV3, "api-versions/flexible-v3"),
+    (Fault::MetadataEmptyBrokers, "metadata/basic"),
+    (Fault::MetadataUnrequestedTopic, "metadata/basic"),
+    (
+        Fault::MetadataNonFlexibleHeader,
+        "metadata/flexible-response-header",
+    ),
 ];
+
+/// The calibration registry is exhaustive in both directions: a check
+/// without a fault that trips it is unproven (vacuous until shown
+/// otherwise), and a fault no check detects is dead weight.
+#[tokio::test]
+async fn every_check_has_a_fault_and_every_fault_a_check() {
+    let subject = SubjectServer::spawn(vec![]).await.unwrap();
+    let report = checks::server::run(subject.addr()).await;
+    for outcome in &report.outcomes {
+        assert!(
+            SENSITIVITY.iter().any(|(_, t)| *t == outcome.id.0),
+            "check {} has no fault in SENSITIVITY proving it detects anything",
+            outcome.id
+        );
+    }
+    for fault in Fault::ALL {
+        assert!(
+            SENSITIVITY.iter().any(|(f, _)| f == fault),
+            "fault {fault:?} is not mapped to a check in SENSITIVITY"
+        );
+    }
+}
 
 #[tokio::test]
 async fn each_fault_trips_its_targeted_check() {
@@ -60,6 +88,8 @@ async fn isolated_faults_cause_no_collateral_failures() {
         Fault::ErrorBodyNotV0,
         Fault::AdvertiseWrongMaxInError,
         Fault::FlexibleHeaderOnV3,
+        Fault::MetadataEmptyBrokers,
+        Fault::MetadataUnrequestedTopic,
     ];
     for fault in isolated {
         let target = SENSITIVITY

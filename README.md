@@ -46,9 +46,9 @@ Early but functional end to end:
   ApiVersions negotiation (including the `UNSUPPORTED_VERSION` downgrade
   path), tested against an in-process fake broker.
 - `odradek-acceptance`: conformance checks for **both roles** over raw
-  connections independent of the client crate — `api-versions/*` server
-  checks and `client/*` client checks — with JSON reports and per-
-  implementation baselines:
+  connections independent of the client crate — `api-versions/*` and
+  `metadata/*` server checks and `client/*` client checks — with JSON
+  reports and per-implementation baselines:
 
   ```sh
   # validate a server
@@ -67,12 +67,16 @@ Early but functional end to end:
   checks (dogfooding); and real brokers are ground truth — `cargo xtask
   conformance` runs the suite against Apache Kafka and Redpanda in Docker
   and enforces the per-implementation baselines committed in
-  [`conformance/`](conformance/) (both currently pass every check).
+  [`conformance/`](conformance/). Nothing fails today, and the baselines
+  already record one real behavioral difference: Redpanda 25.2 advertises
+  Metadata only up to v8, so the flexible-response-header check skips
+  there. The fault ↔ check registry is enforced by test: a check no fault
+  can trip, or a fault no check detects, fails calibration.
 
-Next: grow the server checks beyond `api-versions/*` (metadata, produce,
-fetch) against the same broker matrix, materialize known tagged fields in
-codegen, vendor more schemas (consumer groups, offsets), the client's
-cluster/metadata layer, and record batch encoding.
+Next: produce/fetch checks (needs record batch encoding in the protocol
+crate first), a richer client harness that impersonates a small cluster,
+materialize known tagged fields in codegen, vendor more schemas (consumer
+groups, offsets), and the client's cluster/metadata layer.
 
 ```sh
 cargo test --workspace       # everything
