@@ -26,4 +26,10 @@ pub enum ClientError {
     /// The broker answered with an error code.
     #[error("broker error: {0}")]
     Broker(ErrorCode),
+    /// No bootstrap server could be reached.
+    #[error("no bootstrap server reachable: {0}")]
+    Bootstrap(String),
+    /// The cluster metadata names no live leader for the partition.
+    #[error("no known leader for {topic}[{partition}]")]
+    UnknownLeader { topic: String, partition: i32 },
 }

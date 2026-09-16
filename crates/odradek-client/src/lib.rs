@@ -14,13 +14,16 @@
 //! 3. `producer` / `consumer`: batching, compression, consumer groups.
 //!
 //! Current state: `conn` (framing, correlation-id pipelining, ApiVersions
-//! negotiation) is implemented; `cluster`, `producer`, and `consumer` are
-//! next.
+//! negotiation) and `cluster` (metadata cache, per-broker connections,
+//! partition-leader routing) are implemented; `producer` and `consumer`
+//! are next.
 
+pub mod cluster;
 pub mod conn;
 pub mod error;
 pub mod negotiate;
 
+pub use cluster::Cluster;
 pub use conn::Connection;
 pub use error::ClientError;
 pub use negotiate::ApiVersionRanges;
