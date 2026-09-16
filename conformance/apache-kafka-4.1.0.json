@@ -4,7 +4,9 @@
     "api-versions/flexible-v3": "pass",
     "api-versions/unsupported-version-error": "pass",
     "api-versions/v0-basic": "pass",
+    "fetch/batch-integrity": "pass",
     "metadata/basic": "pass",
-    "metadata/flexible-response-header": "pass"
+    "metadata/flexible-response-header": "pass",
+    "produce/basic": "pass"
   }
 }

@@ -5,6 +5,8 @@
 
 pub mod api_versions_request;
 pub mod api_versions_response;
+pub mod create_topics_request;
+pub mod create_topics_response;
 pub mod fetch_request;
 pub mod fetch_response;
 pub mod metadata_request;
@@ -16,6 +18,8 @@ pub mod response_header;
 
 pub use api_versions_request::ApiVersionsRequest;
 pub use api_versions_response::ApiVersionsResponse;
+pub use create_topics_request::CreateTopicsRequest;
+pub use create_topics_response::CreateTopicsResponse;
 pub use fetch_request::FetchRequest;
 pub use fetch_response::FetchResponse;
 pub use metadata_request::MetadataRequest;
@@ -31,6 +35,7 @@ pub use response_header::ResponseHeader;
 pub fn request_is_flexible(api_key: i16, api_version: i16) -> Option<bool> {
     match api_key {
         18 => Some(api_versions_request::is_flexible(api_version)),
+        19 => Some(create_topics_request::is_flexible(api_version)),
         1 => Some(fetch_request::is_flexible(api_version)),
         3 => Some(metadata_request::is_flexible(api_version)),
         0 => Some(produce_request::is_flexible(api_version)),

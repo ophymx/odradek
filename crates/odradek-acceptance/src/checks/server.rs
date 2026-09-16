@@ -3,15 +3,25 @@
 //! Every check opens its own connection so subjects are validated from a
 //! clean state, and failures in one check cannot poison another.
 
-use bytes::BytesMut;
-use odradek_protocol::ErrorCode;
+use std::time::Duration;
+
+use bytes::{Bytes, BytesMut};
 use odradek_protocol::messages::api_versions_request::ApiVersionsRequest;
 use odradek_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
+use odradek_protocol::messages::create_topics_request::{CreatableTopic, CreateTopicsRequest};
+use odradek_protocol::messages::create_topics_response::CreateTopicsResponse;
+use odradek_protocol::messages::fetch_request::{FetchPartition, FetchRequest, FetchTopic};
+use odradek_protocol::messages::fetch_response::FetchResponse;
 use odradek_protocol::messages::metadata_request::{self, MetadataRequest};
 use odradek_protocol::messages::metadata_response::MetadataResponse;
+use odradek_protocol::messages::produce_request::{
+    PartitionProduceData, ProduceRequest, TopicProduceData,
+};
+use odradek_protocol::messages::produce_response::ProduceResponse;
 use odradek_protocol::messages::request_header::RequestHeader;
 use odradek_protocol::messages::response_header::ResponseHeader;
-use odradek_protocol::wire;
+use odradek_protocol::records::{Record, RecordBatch, RecordHeader, Records, decode_set};
+use odradek_protocol::{ErrorCode, header, wire};
 
 use crate::raw::RawConnection;
 use crate::report::{CheckOutcome, Report};
@@ -71,6 +81,27 @@ pub async fn run(addr: &str) -> Report {
                       the ApiVersions always-v0 quirk does not apply to \
                       other apis",
         verdict: metadata_flexible_header(addr, metadata_range).await,
+    });
+
+    let create_range = advertised_range(&keys, CreateTopicsRequest::API_KEY);
+    let produce_range = advertised_range(&keys, ProduceRequest::API_KEY);
+    let fetch_range = advertised_range(&keys, FetchRequest::API_KEY);
+
+    outcomes.push(CheckOutcome {
+        id: CheckId("produce/basic".into()),
+        requirement: "accepts a produce (acks=-1) of one well-formed record \
+                      batch to a freshly created topic with error NONE and \
+                      assigns it base offset 0",
+        verdict: produce_basic(addr, create_range, produce_range).await,
+    });
+
+    outcomes.push(CheckOutcome {
+        id: CheckId("fetch/batch-integrity".into()),
+        requirement: "a fetch returns the produced record batch byte-identical \
+                      from the magic byte onward (crc included) — only \
+                      base_offset and partition_leader_epoch, which sit \
+                      outside the crc, may be rewritten",
+        verdict: fetch_batch_integrity(addr, create_range, produce_range, fetch_range).await,
     });
 
     Report {
@@ -261,29 +292,66 @@ async fn unsupported_version(addr: &str, advertised: Option<(i16, i16)>) -> Verd
     }
 }
 
-/// Pick the newest Metadata version both sides speak, requiring at least
-/// `floor`. Returns a skip verdict when there is none.
-fn negotiate_metadata(advertised: Option<(i16, i16)>, floor: i16) -> Result<i16, Verdict> {
+/// Pick the newest version of `api` both sides speak, bounded by what the
+/// check itself can handle. Returns a skip verdict when there is none.
+fn negotiate(
+    api: &'static str,
+    advertised: Option<(i16, i16)>,
+    check_min: i16,
+    check_max: i16,
+) -> Result<i16, Verdict> {
     let Some((min, max)) = advertised else {
         return Err(Verdict::Skipped {
-            reason: "server does not advertise the Metadata api (or discovery failed)".into(),
+            reason: format!("server does not advertise the {api} api (or discovery failed)"),
         });
     };
-    let version = max.min(MetadataRequest::MAX_VERSION);
-    if version < min {
+    let version = max.min(check_max);
+    if version < min || version < check_min {
         return Err(Verdict::Skipped {
             reason: format!(
-                "no common Metadata version: server speaks {min}-{max}, suite up to {}",
-                MetadataRequest::MAX_VERSION
+                "no usable {api} version: server speaks {min}-{max}, check needs \
+                 {check_min}-{check_max}"
             ),
         });
     }
-    if version < floor {
-        return Err(Verdict::Skipped {
-            reason: format!("needs Metadata v{floor}+, best common version is v{version}"),
-        });
-    }
     Ok(version)
+}
+
+/// One request/response exchange on an existing connection: send `body`
+/// framed with the version-appropriate headers, validate the correlation
+/// echo, and return the response body bytes.
+async fn request_response(
+    conn: &mut RawConnection,
+    api_key: i16,
+    version: i16,
+    correlation_id: i32,
+    body: &[u8],
+) -> Result<Bytes, String> {
+    let req_hv = header::request_header_version(api_key, version)
+        .ok_or_else(|| format!("no header version known for api {api_key} v{version}"))?;
+    let resp_hv = header::response_header_version(api_key, version)
+        .expect("request header version implies response header version");
+    let req_header = RequestHeader {
+        request_api_key: api_key,
+        request_api_version: version,
+        correlation_id,
+        client_id: Some(CLIENT_ID.into()),
+        unknown_tagged_fields: Vec::new(),
+    };
+    let mut frame = conn
+        .round_trip(&req_header, req_hv, body)
+        .await
+        .map_err(|e| e.to_string())?;
+    let echoed = wire::get_i32(&mut frame.clone())
+        .map_err(|_| "response frame shorter than a correlation id".to_string())?;
+    if echoed != correlation_id {
+        return Err(format!(
+            "sent correlation id {correlation_id}, response carries {echoed}"
+        ));
+    }
+    ResponseHeader::decode(&mut frame, resp_hv)
+        .map_err(|e| format!("response header (decoded as v{resp_hv}): {e}"))?;
+    Ok(frame)
 }
 
 /// One Metadata exchange naming no topics, validating the correlation
@@ -342,7 +410,7 @@ async fn metadata_exchange(
 }
 
 async fn metadata_basic(addr: &str, advertised: Option<(i16, i16)>) -> Verdict {
-    let version = match negotiate_metadata(advertised, 1) {
+    let version = match negotiate("Metadata", advertised, 1, MetadataRequest::MAX_VERSION) {
         Ok(v) => v,
         Err(skip) => return skip,
     };
@@ -385,7 +453,7 @@ async fn metadata_basic(addr: &str, advertised: Option<(i16, i16)>) -> Verdict {
 }
 
 async fn metadata_flexible_header(addr: &str, advertised: Option<(i16, i16)>) -> Verdict {
-    let version = match negotiate_metadata(advertised, 9) {
+    let version = match negotiate("Metadata", advertised, 9, MetadataRequest::MAX_VERSION) {
         Ok(v) => v,
         Err(skip) => return skip,
     };
@@ -396,4 +464,377 @@ async fn metadata_flexible_header(addr: &str, advertised: Option<(i16, i16)>) ->
         Ok(_) => Verdict::Pass,
         Err(details) => Verdict::Fail { details },
     }
+}
+
+// ---------------------------------------------------------------------------
+// Produce / fetch
+// ---------------------------------------------------------------------------
+
+/// Newest name-addressed Produce/Fetch versions: v13+ addresses topics by
+/// id, which needs a Metadata lookup the flow does not do yet.
+const PRODUCE_CHECK_MAX: i16 = 12;
+const FETCH_CHECK_MAX: i16 = 12;
+
+/// How long the flow tolerates a freshly created topic answering with
+/// retriable errors before calling it a failure.
+const SETTLE_ATTEMPTS: u32 = 50;
+const SETTLE_DELAY: Duration = Duration::from_millis(100);
+
+fn retriable(code: ErrorCode) -> bool {
+    // The topic or its leadership is still materializing after create.
+    code == ErrorCode::UNKNOWN_TOPIC_OR_PARTITION
+        || code == ErrorCode::LEADER_NOT_AVAILABLE
+        || code == ErrorCode::NOT_LEADER_OR_FOLLOWER
+}
+
+/// A topic name unique enough to never collide across runs or checks.
+fn unique_topic(tag: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("odradek-accept-{tag}-{}-{nanos}", std::process::id())
+}
+
+/// The batch every produce/fetch check sends: two records with keys,
+/// values, a header, and a tombstone — enough shape to make byte-level
+/// integrity meaningful.
+fn probe_batch() -> RecordBatch {
+    RecordBatch {
+        base_offset: 0,
+        last_offset_delta: 1,
+        base_timestamp: 1_758_000_000_000,
+        max_timestamp: 1_758_000_000_001,
+        producer_id: -1,
+        producer_epoch: -1,
+        base_sequence: -1,
+        records: Records::Plain(vec![
+            Record {
+                key: Some(Bytes::from_static(b"probe-key")),
+                value: Some(Bytes::from_static(b"odradek conformance probe")),
+                headers: vec![RecordHeader {
+                    key: "origin".into(),
+                    value: Some(Bytes::from_static(b"odradek-accept")),
+                }],
+                ..Default::default()
+            },
+            Record {
+                timestamp_delta: 1,
+                offset_delta: 1,
+                key: Some(Bytes::from_static(b"probe-tombstone")),
+                value: None,
+                ..Default::default()
+            },
+        ]),
+        ..Default::default()
+    }
+}
+
+/// A produced topic: the live connection, its name, and the exact record
+/// set bytes that were sent.
+struct ProducedTopic {
+    conn: RawConnection,
+    topic: String,
+    sent: Bytes,
+    base_offset: i64,
+}
+
+/// Create a unique single-partition topic and produce [`probe_batch`] to
+/// partition 0 with acks=-1, retrying while the topic materializes.
+async fn produce_flow(
+    addr: &str,
+    tag: &str,
+    create_range: Option<(i16, i16)>,
+    produce_range: Option<(i16, i16)>,
+) -> Result<ProducedTopic, Verdict> {
+    let create_version = negotiate(
+        "CreateTopics",
+        create_range,
+        CreateTopicsRequest::MIN_VERSION,
+        CreateTopicsRequest::MAX_VERSION,
+    )?;
+    let produce_version = negotiate(
+        "Produce",
+        produce_range,
+        ProduceRequest::MIN_VERSION,
+        PRODUCE_CHECK_MAX,
+    )?;
+    let fail = |details: String| Verdict::Fail { details };
+
+    let mut conn = RawConnection::connect(addr)
+        .await
+        .map_err(|e| fail(e.to_string()))?;
+    let topic = unique_topic(tag);
+
+    // Create the topic.
+    let create = CreateTopicsRequest {
+        topics: vec![CreatableTopic {
+            name: topic.clone(),
+            num_partitions: 1,
+            replication_factor: 1,
+            ..Default::default()
+        }],
+        timeout_ms: 30_000,
+        validate_only: false,
+        ..Default::default()
+    };
+    let mut body = BytesMut::new();
+    create
+        .encode(&mut body, create_version)
+        .map_err(|e| fail(e.to_string()))?;
+    let mut resp = request_response(
+        &mut conn,
+        CreateTopicsRequest::API_KEY,
+        create_version,
+        10,
+        &body,
+    )
+    .await
+    .map_err(|e| fail(format!("CreateTopics: {e}")))?;
+    let resp = CreateTopicsResponse::decode(&mut resp, create_version)
+        .map_err(|e| fail(format!("CreateTopics response (v{create_version}): {e}")))?;
+    let result = resp
+        .topics
+        .first()
+        .ok_or_else(|| fail("CreateTopics response names no topics".into()))?;
+    let code = ErrorCode(result.error_code);
+    if !code.is_ok() {
+        return Err(fail(format!(
+            "CreateTopics failed with {code}{}",
+            result
+                .error_message
+                .as_deref()
+                .map(|m| format!(": {m}"))
+                .unwrap_or_default()
+        )));
+    }
+
+    // Produce the probe batch, riding out post-create leadership settling.
+    let mut sent = BytesMut::new();
+    probe_batch()
+        .encode(&mut sent)
+        .map_err(|e| fail(e.to_string()))?;
+    let sent = sent.freeze();
+
+    let produce = ProduceRequest {
+        transactional_id: None,
+        acks: -1,
+        timeout_ms: 10_000,
+        topic_data: vec![TopicProduceData {
+            name: topic.clone(),
+            partition_data: vec![PartitionProduceData {
+                index: 0,
+                records: Some(sent.clone()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut body = BytesMut::new();
+    produce
+        .encode(&mut body, produce_version)
+        .map_err(|e| fail(e.to_string()))?;
+
+    let mut last_code = ErrorCode(0);
+    for _ in 0..SETTLE_ATTEMPTS {
+        let mut resp = request_response(
+            &mut conn,
+            ProduceRequest::API_KEY,
+            produce_version,
+            11,
+            &body,
+        )
+        .await
+        .map_err(|e| fail(format!("Produce: {e}")))?;
+        let resp = ProduceResponse::decode(&mut resp, produce_version)
+            .map_err(|e| fail(format!("Produce response (v{produce_version}): {e}")))?;
+        let partition = resp
+            .responses
+            .first()
+            .and_then(|t| t.partition_responses.first())
+            .ok_or_else(|| fail("Produce response names no partitions".into()))?;
+        let code = ErrorCode(partition.error_code);
+        if code.is_ok() {
+            return Ok(ProducedTopic {
+                conn,
+                topic,
+                sent,
+                base_offset: partition.base_offset,
+            });
+        }
+        if !retriable(code) {
+            return Err(fail(format!("Produce failed with {code}")));
+        }
+        last_code = code;
+        tokio::time::sleep(SETTLE_DELAY).await;
+    }
+    Err(fail(format!(
+        "topic never became producible: still {last_code} after {SETTLE_ATTEMPTS} attempts"
+    )))
+}
+
+async fn produce_basic(
+    addr: &str,
+    create_range: Option<(i16, i16)>,
+    produce_range: Option<(i16, i16)>,
+) -> Verdict {
+    let produced = match produce_flow(addr, "produce", create_range, produce_range).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    if produced.base_offset != 0 {
+        return Verdict::Fail {
+            details: format!(
+                "first batch in a fresh topic was assigned base offset {}, expected 0",
+                produced.base_offset
+            ),
+        };
+    }
+    Verdict::Pass
+}
+
+async fn fetch_batch_integrity(
+    addr: &str,
+    create_range: Option<(i16, i16)>,
+    produce_range: Option<(i16, i16)>,
+    fetch_range: Option<(i16, i16)>,
+) -> Verdict {
+    let fetch_version = match negotiate(
+        "Fetch",
+        fetch_range,
+        FetchRequest::MIN_VERSION,
+        FETCH_CHECK_MAX,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    // The flow tolerates a wrong assigned base offset here — that is
+    // produce/basic's finding — and always fetches from offset 0.
+    let mut produced = match produce_flow(addr, "fetch", create_range, produce_range).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+
+    let fetch = FetchRequest {
+        max_wait_ms: 500,
+        min_bytes: 1,
+        max_bytes: 8 << 20,
+        session_id: 0,
+        session_epoch: -1, // sessionless full fetch
+        topics: vec![FetchTopic {
+            topic: produced.topic.clone(),
+            partitions: vec![FetchPartition {
+                partition: 0,
+                current_leader_epoch: -1,
+                fetch_offset: 0,
+                last_fetched_epoch: -1,
+                log_start_offset: -1,
+                partition_max_bytes: 1 << 20,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut body = BytesMut::new();
+    if let Err(e) = fetch.encode(&mut body, fetch_version) {
+        return Verdict::Fail {
+            details: e.to_string(),
+        };
+    }
+
+    // acks=-1 already committed the batch, but give replication internals
+    // a moment anyway rather than failing on an empty first response.
+    let mut last = String::from("fetch returned no records");
+    for _ in 0..SETTLE_ATTEMPTS {
+        let outcome = async {
+            let mut resp = request_response(
+                &mut produced.conn,
+                FetchRequest::API_KEY,
+                fetch_version,
+                12,
+                &body,
+            )
+            .await
+            .map_err(|e| format!("Fetch: {e}"))?;
+            let resp = FetchResponse::decode(&mut resp, fetch_version)
+                .map_err(|e| format!("Fetch response (v{fetch_version}): {e}"))?;
+            let code = ErrorCode(resp.error_code);
+            if !code.is_ok() {
+                return Err(format!("Fetch failed with top-level {code}"));
+            }
+            let partition = resp
+                .responses
+                .first()
+                .and_then(|t| t.partitions.first())
+                .ok_or_else(|| "Fetch response names no partitions".to_string())?;
+            let code = ErrorCode(partition.error_code);
+            if !code.is_ok() {
+                return Err(format!("Fetch failed with {code}"));
+            }
+            Ok(partition.records.clone().unwrap_or_default())
+        }
+        .await;
+        let got = match outcome {
+            Ok(got) if !got.is_empty() => got,
+            Ok(_) => {
+                tokio::time::sleep(SETTLE_DELAY).await;
+                continue;
+            }
+            Err(details) => {
+                if details.contains("UNKNOWN_TOPIC_OR_PARTITION")
+                    || details.contains("NOT_LEADER_OR_FOLLOWER")
+                    || details.contains("LEADER_NOT_AVAILABLE")
+                {
+                    last = details;
+                    tokio::time::sleep(SETTLE_DELAY).await;
+                    continue;
+                }
+                return Verdict::Fail { details };
+            }
+        };
+        return batch_integrity(&produced.sent, &got);
+    }
+    Verdict::Fail { details: last }
+}
+
+/// Compare the fetched record set against the produced bytes: identical
+/// from the magic byte on. Bytes 0-15 (base_offset, batch_length,
+/// partition_leader_epoch) sit outside the crc; base_offset must still be
+/// 0 for the first batch of a fresh topic, and batch_length equality is
+/// implied by the suffix match.
+fn batch_integrity(sent: &Bytes, got: &Bytes) -> Verdict {
+    let fail = |details: String| Verdict::Fail { details };
+    // Decoding first also verifies the crc still matches the contents.
+    let batches = match decode_set(&mut got.clone()) {
+        Ok(b) => b,
+        Err(e) => return fail(format!("fetched record set does not decode: {e}")),
+    };
+    if batches.len() != 1 {
+        return fail(format!(
+            "fetched {} batches where exactly the produced one was expected",
+            batches.len()
+        ));
+    }
+    if got.len() != sent.len() {
+        return fail(format!(
+            "fetched batch is {} byte(s), produced was {}",
+            got.len(),
+            sent.len()
+        ));
+    }
+    if let Some(at) = (16..sent.len()).find(|&i| got[i] != sent[i]) {
+        return fail(format!(
+            "stored batch differs from the produced bytes starting at byte {at} \
+             (crc-covered region)"
+        ));
+    }
+    let base_offset = i64::from_be_bytes(got[..8].try_into().expect("length checked"));
+    if base_offset != 0 {
+        return fail(format!(
+            "fetched batch carries base offset {base_offset}, expected 0"
+        ));
+    }
+    Verdict::Pass
 }

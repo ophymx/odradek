@@ -50,9 +50,11 @@ Early but functional end to end:
   ApiVersions negotiation (including the `UNSUPPORTED_VERSION` downgrade
   path), tested against an in-process fake broker.
 - `odradek-acceptance`: conformance checks for **both roles** over raw
-  connections independent of the client crate — `api-versions/*` and
-  `metadata/*` server checks and `client/*` client checks — with JSON
-  reports and per-implementation baselines:
+  connections independent of the client crate — `api-versions/*`,
+  `metadata/*`, `produce/*`, and `fetch/*` server checks (including a
+  create → produce → fetch flow that asserts the broker returns the
+  produced batch byte-identical in the crc-covered region) and `client/*`
+  client checks — with JSON reports and per-implementation baselines:
 
   ```sh
   # validate a server
@@ -77,8 +79,8 @@ Early but functional end to end:
   there. The fault ↔ check registry is enforced by test: a check no fault
   can trip, or a fault no check detects, fails calibration.
 
-Next: produce/fetch conformance checks on top of the record batch codec,
-a richer client harness that impersonates a small cluster, materialize
+Next: topic-id-addressed Produce/Fetch (v13+) via a Metadata lookup, a
+richer client harness that impersonates a small cluster, materialize
 known tagged fields in codegen, vendor more schemas (consumer groups,
 offsets), and the client's cluster/metadata layer.
 
