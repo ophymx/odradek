@@ -73,6 +73,11 @@ pub enum Fault {
     ProduceWrongBaseOffset,
     /// Corrupt one byte inside stored batches before serving a fetch.
     FetchCorruptBatch,
+    /// Answer a topic-id-addressed produce with UNKNOWN_TOPIC_ID even
+    /// though the id was minted by this subject's CreateTopics.
+    ProduceTopicIdUnknown,
+    /// Echo a different topic id than the fetch requested.
+    FetchWrongTopicId,
 }
 
 impl Fault {
@@ -92,6 +97,8 @@ impl Fault {
         Fault::MetadataNonFlexibleHeader,
         Fault::ProduceWrongBaseOffset,
         Fault::FetchCorruptBatch,
+        Fault::ProduceTopicIdUnknown,
+        Fault::FetchWrongTopicId,
     ];
 }
 
@@ -130,12 +137,11 @@ impl Drop for SubjectServer {
 }
 
 fn advertised_keys() -> Vec<ApiVersion> {
-    // Only versions the subject actually implements: name-addressed
-    // Produce/Fetch (v13+ switch to topic ids).
+    // Only versions the subject actually implements.
     [
         (18, 0, MAX_SUPPORTED_API_VERSIONS),
-        (0, 3, 12),
-        (1, 4, 12),
+        (0, 3, ProduceRequest::MAX_VERSION),
+        (1, 4, FetchRequest::MAX_VERSION),
         (3, 0, 13),
         (19, 2, 7),
     ]
@@ -150,23 +156,41 @@ fn advertised_keys() -> Vec<ApiVersion> {
 }
 
 /// One partition's log: appended record sets and the next offset to
-/// assign. State is per connection — the suite's produce/fetch flow uses
-/// a single connection, and cross-connection state would leak between
-/// concurrently running checks.
+/// assign.
 #[derive(Debug, Default)]
 struct PartitionLog {
     bytes: BytesMut,
     next_offset: i64,
 }
 
-type Store = HashMap<(String, i32), PartitionLog>;
+/// Connection-scoped broker state — the suite's produce/fetch flow uses
+/// a single connection, and cross-connection state would leak between
+/// concurrently running checks.
+#[derive(Debug, Default)]
+struct ConnState {
+    logs: HashMap<(String, i32), PartitionLog>,
+    /// Topic ids minted by CreateTopics, keyed by id.
+    topic_names: HashMap<[u8; 16], String>,
+}
+
+/// A deterministic per-name topic id; never the zero uuid.
+fn mint_topic_id(name: &str) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    let mut acc: u8 = 0x9e;
+    for (i, byte) in name.bytes().enumerate() {
+        acc = acc.wrapping_mul(31).wrapping_add(byte);
+        id[i % 16] ^= acc.rotate_left(u32::try_from(i % 7).unwrap_or(0));
+    }
+    id[0] |= 1;
+    id
+}
 
 async fn handle_connection(mut stream: TcpStream, faults: Vec<Fault>) {
     let local_port = match stream.local_addr() {
         Ok(a) => i32::from(a.port()),
         Err(_) => return,
     };
-    let mut store = Store::new();
+    let mut state = ConnState::default();
     loop {
         let mut len_bytes = [0u8; 4];
         if stream.read_exact(&mut len_bytes).await.is_err() {
@@ -186,9 +210,9 @@ async fn handle_connection(mut stream: TcpStream, faults: Vec<Fault>) {
         let out = match api_key {
             18 => api_versions_exchange(frame, api_version, &faults),
             3 => metadata_exchange(frame, api_version, local_port, &faults),
-            19 => create_topics_exchange(frame, api_version),
-            0 => produce_exchange(frame, api_version, &faults, &mut store),
-            1 => fetch_exchange(frame, api_version, &faults, &store),
+            19 => create_topics_exchange(frame, api_version, &mut state),
+            0 => produce_exchange(frame, api_version, &faults, &mut state),
+            1 => fetch_exchange(frame, api_version, &faults, &state),
             _ => return,
         };
         let Some(out) = out else {
@@ -346,7 +370,11 @@ fn metadata_exchange(
     )
 }
 
-fn create_topics_exchange(mut frame: Bytes, api_version: i16) -> Option<BytesMut> {
+fn create_topics_exchange(
+    mut frame: Bytes,
+    api_version: i16,
+    state: &mut ConnState,
+) -> Option<BytesMut> {
     if !(CreateTopicsRequest::MIN_VERSION..=CreateTopicsRequest::MAX_VERSION).contains(&api_version)
     {
         return None;
@@ -355,18 +383,23 @@ fn create_topics_exchange(mut frame: Bytes, api_version: i16) -> Option<BytesMut
     let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
     let request = CreateTopicsRequest::decode(&mut frame, api_version).ok()?;
 
-    // Every topic creates successfully; produce/fetch state is lazy, so
-    // there is nothing to record here.
+    // Every topic creates successfully (log state itself is lazy) and gets
+    // an id, so id-addressed produce/fetch can resolve it later.
     let resp = CreateTopicsResponse {
         topics: request
             .topics
             .iter()
-            .map(|t| CreatableTopicResult {
-                name: t.name.clone(),
-                error_code: 0,
-                num_partitions: t.num_partitions.max(1),
-                replication_factor: t.replication_factor.max(1),
-                ..Default::default()
+            .map(|t| {
+                let topic_id = mint_topic_id(&t.name);
+                state.topic_names.insert(topic_id, t.name.clone());
+                CreatableTopicResult {
+                    name: t.name.clone(),
+                    topic_id,
+                    error_code: 0,
+                    num_partitions: t.num_partitions.max(1),
+                    replication_factor: t.replication_factor.max(1),
+                    ..Default::default()
+                }
             })
             .collect(),
         ..Default::default()
@@ -383,9 +416,9 @@ fn produce_exchange(
     mut frame: Bytes,
     api_version: i16,
     faults: &[Fault],
-    store: &mut Store,
+    state: &mut ConnState,
 ) -> Option<BytesMut> {
-    if !(ProduceRequest::MIN_VERSION..=12).contains(&api_version) {
+    if !(ProduceRequest::MIN_VERSION..=ProduceRequest::MAX_VERSION).contains(&api_version) {
         return None;
     }
     let hv = header::request_header_version(ProduceRequest::API_KEY, api_version)?;
@@ -394,10 +427,30 @@ fn produce_exchange(
 
     let mut responses = Vec::new();
     for topic in &request.topic_data {
+        // v13+ addresses by id; earlier versions by name.
+        let by_id = topic.name.is_empty();
+        let resolved = if by_id {
+            state.topic_names.get(&topic.topic_id).cloned()
+        } else {
+            Some(topic.name.clone())
+        };
+        let refuse_id = by_id && faults.contains(&Fault::ProduceTopicIdUnknown);
+
         let mut partition_responses = Vec::new();
         for partition in &topic.partition_data {
-            let log = store
-                .entry((topic.name.clone(), partition.index))
+            let (Some(name), false) = (&resolved, refuse_id) else {
+                partition_responses.push(PartitionProduceResponse {
+                    index: partition.index,
+                    error_code: 100, // UNKNOWN_TOPIC_ID
+                    base_offset: -1,
+                    log_append_time_ms: -1,
+                    ..Default::default()
+                });
+                continue;
+            };
+            let log = state
+                .logs
+                .entry((name.clone(), partition.index))
                 .or_default();
             let set = partition.records.clone().unwrap_or_default();
             // Advance the offset by the records just appended.
@@ -423,6 +476,7 @@ fn produce_exchange(
         }
         responses.push(TopicProduceResponse {
             name: topic.name.clone(),
+            topic_id: topic.topic_id,
             partition_responses,
             ..Default::default()
         });
@@ -443,9 +497,9 @@ fn fetch_exchange(
     mut frame: Bytes,
     api_version: i16,
     faults: &[Fault],
-    store: &Store,
+    state: &ConnState,
 ) -> Option<BytesMut> {
-    if !(FetchRequest::MIN_VERSION..=12).contains(&api_version) {
+    if !(FetchRequest::MIN_VERSION..=FetchRequest::MAX_VERSION).contains(&api_version) {
         return None;
     }
     let hv = header::request_header_version(FetchRequest::API_KEY, api_version)?;
@@ -455,36 +509,55 @@ fn fetch_exchange(
     let responses = request
         .topics
         .iter()
-        .map(|topic| FetchableTopicResponse {
-            topic: topic.topic.clone(),
-            partitions: topic
-                .partitions
-                .iter()
-                .map(|p| match store.get(&(topic.topic.clone(), p.partition)) {
-                    Some(log) => {
-                        let mut bytes = log.bytes.clone();
-                        if faults.contains(&Fault::FetchCorruptBatch) && !bytes.is_empty() {
-                            let last = bytes.len() - 1;
-                            bytes[last] ^= 0x01;
+        .map(|topic| {
+            // v13+ addresses by id; earlier versions by name.
+            let resolved = if topic.topic.is_empty() {
+                state.topic_names.get(&topic.topic_id).cloned()
+            } else {
+                Some(topic.topic.clone())
+            };
+            let mut echoed_id = topic.topic_id;
+            if faults.contains(&Fault::FetchWrongTopicId) {
+                echoed_id[0] ^= 0x80;
+            }
+            FetchableTopicResponse {
+                topic: topic.topic.clone(),
+                topic_id: echoed_id,
+                partitions: topic
+                    .partitions
+                    .iter()
+                    .map(|p| {
+                        let log = resolved
+                            .as_ref()
+                            .and_then(|name| state.logs.get(&(name.clone(), p.partition)));
+                        match log {
+                            Some(log) => {
+                                let mut bytes = log.bytes.clone();
+                                if faults.contains(&Fault::FetchCorruptBatch) && !bytes.is_empty() {
+                                    let last = bytes.len() - 1;
+                                    bytes[last] ^= 0x01;
+                                }
+                                PartitionData {
+                                    partition_index: p.partition,
+                                    error_code: 0,
+                                    high_watermark: log.next_offset,
+                                    last_stable_offset: log.next_offset,
+                                    log_start_offset: 0,
+                                    records: Some(bytes.freeze()),
+                                    ..Default::default()
+                                }
+                            }
+                            None => PartitionData {
+                                partition_index: p.partition,
+                                // Unknown id vs unknown name/partition.
+                                error_code: if topic.topic.is_empty() { 100 } else { 3 },
+                                ..Default::default()
+                            },
                         }
-                        PartitionData {
-                            partition_index: p.partition,
-                            error_code: 0,
-                            high_watermark: log.next_offset,
-                            last_stable_offset: log.next_offset,
-                            log_start_offset: 0,
-                            records: Some(bytes.freeze()),
-                            ..Default::default()
-                        }
-                    }
-                    None => PartitionData {
-                        partition_index: p.partition,
-                        error_code: 3, // UNKNOWN_TOPIC_OR_PARTITION
-                        ..Default::default()
-                    },
-                })
-                .collect(),
-            ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }
         })
         .collect();
     let resp = FetchResponse {

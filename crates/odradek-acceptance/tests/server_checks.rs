@@ -13,7 +13,7 @@ async fn compliant_subject_passes_all_checks() {
     assert!(report.is_conformant(), "false positives:\n{report}");
     assert_eq!(
         report.passed(),
-        8,
+        10,
         "expected every check to run and pass:\n{report}"
     );
 }
@@ -45,6 +45,8 @@ const SENSITIVITY: &[(Fault, &str)] = &[
     ),
     (Fault::ProduceWrongBaseOffset, "produce/basic"),
     (Fault::FetchCorruptBatch, "fetch/batch-integrity"),
+    (Fault::ProduceTopicIdUnknown, "produce/topic-id"),
+    (Fault::FetchWrongTopicId, "fetch/topic-id"),
 ];
 
 /// The calibration registry is exhaustive in both directions: a check
@@ -92,11 +94,14 @@ async fn isolated_faults_cause_no_collateral_failures() {
         Fault::FlexibleHeaderOnV3,
         Fault::MetadataEmptyBrokers,
         Fault::MetadataUnrequestedTopic,
-        // The fetch flow deliberately ignores the assigned base offset, so
-        // this stays confined to produce/basic; the corrupt-batch fault
-        // only fires on the fetch path.
+        // The fetch flows deliberately ignore the assigned base offset, so
+        // this stays confined to produce/basic. FetchCorruptBatch is NOT
+        // isolated: both fetch checks read the corrupted log.
         Fault::ProduceWrongBaseOffset,
-        Fault::FetchCorruptBatch,
+        // Each topic-id fault fires only on its own id-addressed path;
+        // the name-addressed checks never see it.
+        Fault::ProduceTopicIdUnknown,
+        Fault::FetchWrongTopicId,
     ];
     for fault in isolated {
         let target = SENSITIVITY

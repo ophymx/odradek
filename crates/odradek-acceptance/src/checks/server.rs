@@ -104,6 +104,21 @@ pub async fn run(addr: &str) -> Report {
         verdict: fetch_batch_integrity(addr, create_range, produce_range, fetch_range).await,
     });
 
+    outcomes.push(CheckOutcome {
+        id: CheckId("produce/topic-id".into()),
+        requirement: "accepts a topic-id-addressed produce (v13+) to a fresh \
+                      topic, the id learned from CreateTopics, with error NONE",
+        verdict: produce_topic_id(addr, create_range, produce_range).await,
+    });
+
+    outcomes.push(CheckOutcome {
+        id: CheckId("fetch/topic-id".into()),
+        requirement: "serves a topic-id-addressed fetch (v13+), echoing the \
+                      requested topic id and returning the produced batch \
+                      intact",
+        verdict: fetch_topic_id(addr, create_range, produce_range, fetch_range).await,
+    });
+
     Report {
         subject: format!("server {addr}"),
         outcomes,
@@ -470,10 +485,13 @@ async fn metadata_flexible_header(addr: &str, advertised: Option<(i16, i16)>) ->
 // Produce / fetch
 // ---------------------------------------------------------------------------
 
-/// Newest name-addressed Produce/Fetch versions: v13+ addresses topics by
-/// id, which needs a Metadata lookup the flow does not do yet.
-const PRODUCE_CHECK_MAX: i16 = 12;
-const FETCH_CHECK_MAX: i16 = 12;
+/// Newest name-addressed Produce/Fetch versions: v13+ switches to topic
+/// ids, which the `*/topic-id` checks exercise separately.
+const PRODUCE_NAME_MAX: i16 = 12;
+const FETCH_NAME_MAX: i16 = 12;
+/// First topic-id-addressed versions.
+const PRODUCE_ID_MIN: i16 = 13;
+const FETCH_ID_MIN: i16 = 13;
 
 /// How long the flow tolerates a freshly created topic answering with
 /// retriable errors before calling it a failure.
@@ -481,10 +499,12 @@ const SETTLE_ATTEMPTS: u32 = 50;
 const SETTLE_DELAY: Duration = Duration::from_millis(100);
 
 fn retriable(code: ErrorCode) -> bool {
-    // The topic or its leadership is still materializing after create.
+    // The topic or its leadership is still materializing after create;
+    // id-addressed requests surface the same lag as UNKNOWN_TOPIC_ID.
     code == ErrorCode::UNKNOWN_TOPIC_OR_PARTITION
         || code == ErrorCode::LEADER_NOT_AVAILABLE
         || code == ErrorCode::NOT_LEADER_OR_FOLLOWER
+        || code == ErrorCode::UNKNOWN_TOPIC_ID
 }
 
 /// A topic name unique enough to never collide across runs or checks.
@@ -530,13 +550,22 @@ fn probe_batch() -> RecordBatch {
     }
 }
 
-/// A produced topic: the live connection, its name, and the exact record
-/// set bytes that were sent.
+/// A produced topic: the live connection, its identity, and the exact
+/// record set bytes that were sent.
 struct ProducedTopic {
     conn: RawConnection,
     topic: String,
+    /// From CreateTopics (v7+ returns it); zero-uuid means unknown.
+    topic_id: [u8; 16],
     sent: Bytes,
     base_offset: i64,
+}
+
+/// How the produce leg of the flow addresses the topic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Addressing {
+    Name,
+    TopicId,
 }
 
 /// Create a unique single-partition topic and produce [`probe_batch`] to
@@ -546,6 +575,7 @@ async fn produce_flow(
     tag: &str,
     create_range: Option<(i16, i16)>,
     produce_range: Option<(i16, i16)>,
+    addressing: Addressing,
 ) -> Result<ProducedTopic, Verdict> {
     let create_version = negotiate(
         "CreateTopics",
@@ -553,12 +583,20 @@ async fn produce_flow(
         CreateTopicsRequest::MIN_VERSION,
         CreateTopicsRequest::MAX_VERSION,
     )?;
-    let produce_version = negotiate(
-        "Produce",
-        produce_range,
-        ProduceRequest::MIN_VERSION,
-        PRODUCE_CHECK_MAX,
-    )?;
+    let produce_version = match addressing {
+        Addressing::Name => negotiate(
+            "Produce",
+            produce_range,
+            ProduceRequest::MIN_VERSION,
+            PRODUCE_NAME_MAX,
+        )?,
+        Addressing::TopicId => negotiate(
+            "Produce",
+            produce_range,
+            PRODUCE_ID_MIN,
+            ProduceRequest::MAX_VERSION,
+        )?,
+    };
     let fail = |details: String| Verdict::Fail { details };
 
     let mut conn = RawConnection::connect(addr)
@@ -608,6 +646,12 @@ async fn produce_flow(
                 .unwrap_or_default()
         )));
     }
+    let topic_id = result.topic_id;
+    if addressing == Addressing::TopicId && topic_id == [0u8; 16] {
+        return Err(Verdict::Skipped {
+            reason: format!("CreateTopics v{create_version} did not return a topic id (needs v7+)"),
+        });
+    }
 
     // Produce the probe batch, riding out post-create leadership settling.
     let mut sent = BytesMut::new();
@@ -621,7 +665,15 @@ async fn produce_flow(
         acks: -1,
         timeout_ms: 10_000,
         topic_data: vec![TopicProduceData {
-            name: topic.clone(),
+            // v13+ drops the name for the id; encode gates pick per version.
+            name: match addressing {
+                Addressing::Name => topic.clone(),
+                Addressing::TopicId => String::new(),
+            },
+            topic_id: match addressing {
+                Addressing::Name => [0u8; 16],
+                Addressing::TopicId => topic_id,
+            },
             partition_data: vec![PartitionProduceData {
                 index: 0,
                 records: Some(sent.clone()),
@@ -659,6 +711,7 @@ async fn produce_flow(
             return Ok(ProducedTopic {
                 conn,
                 topic,
+                topic_id,
                 sent,
                 base_offset: partition.base_offset,
             });
@@ -679,7 +732,15 @@ async fn produce_basic(
     create_range: Option<(i16, i16)>,
     produce_range: Option<(i16, i16)>,
 ) -> Verdict {
-    let produced = match produce_flow(addr, "produce", create_range, produce_range).await {
+    let produced = match produce_flow(
+        addr,
+        "produce",
+        create_range,
+        produce_range,
+        Addressing::Name,
+    )
+    .await
+    {
         Ok(p) => p,
         Err(verdict) => return verdict,
     };
@@ -694,28 +755,33 @@ async fn produce_basic(
     Verdict::Pass
 }
 
-async fn fetch_batch_integrity(
+async fn produce_topic_id(
     addr: &str,
     create_range: Option<(i16, i16)>,
     produce_range: Option<(i16, i16)>,
-    fetch_range: Option<(i16, i16)>,
 ) -> Verdict {
-    let fetch_version = match negotiate(
-        "Fetch",
-        fetch_range,
-        FetchRequest::MIN_VERSION,
-        FETCH_CHECK_MAX,
-    ) {
-        Ok(v) => v,
-        Err(skip) => return skip,
-    };
-    // The flow tolerates a wrong assigned base offset here — that is
-    // produce/basic's finding — and always fetches from offset 0.
-    let mut produced = match produce_flow(addr, "fetch", create_range, produce_range).await {
-        Ok(p) => p,
-        Err(verdict) => return verdict,
-    };
+    match produce_flow(
+        addr,
+        "produce-id",
+        create_range,
+        produce_range,
+        Addressing::TopicId,
+    )
+    .await
+    {
+        Ok(_) => Verdict::Pass,
+        Err(verdict) => verdict,
+    }
+}
 
+/// Fetch partition 0 of the produced topic from offset 0, retrying while
+/// the topic settles, and return the record set bytes. When addressing by
+/// id, also demands the response echo that id — clients correlate by it.
+async fn run_fetch(
+    produced: &mut ProducedTopic,
+    fetch_version: i16,
+    addressing: Addressing,
+) -> Result<Bytes, String> {
     let fetch = FetchRequest {
         max_wait_ms: 500,
         min_bytes: 1,
@@ -723,7 +789,14 @@ async fn fetch_batch_integrity(
         session_id: 0,
         session_epoch: -1, // sessionless full fetch
         topics: vec![FetchTopic {
-            topic: produced.topic.clone(),
+            topic: match addressing {
+                Addressing::Name => produced.topic.clone(),
+                Addressing::TopicId => String::new(),
+            },
+            topic_id: match addressing {
+                Addressing::Name => [0u8; 16],
+                Addressing::TopicId => produced.topic_id,
+            },
             partitions: vec![FetchPartition {
                 partition: 0,
                 current_leader_epoch: -1,
@@ -738,11 +811,9 @@ async fn fetch_batch_integrity(
         ..Default::default()
     };
     let mut body = BytesMut::new();
-    if let Err(e) = fetch.encode(&mut body, fetch_version) {
-        return Verdict::Fail {
-            details: e.to_string(),
-        };
-    }
+    fetch
+        .encode(&mut body, fetch_version)
+        .map_err(|e| e.to_string())?;
 
     // acks=-1 already committed the batch, but give replication internals
     // a moment anyway rather than failing on an empty first response.
@@ -764,10 +835,19 @@ async fn fetch_batch_integrity(
             if !code.is_ok() {
                 return Err(format!("Fetch failed with top-level {code}"));
             }
-            let partition = resp
+            let topic = resp
                 .responses
                 .first()
-                .and_then(|t| t.partitions.first())
+                .ok_or_else(|| "Fetch response names no topics".to_string())?;
+            if addressing == Addressing::TopicId && topic.topic_id != produced.topic_id {
+                return Err(format!(
+                    "response echoes topic id {:02x?}, requested {:02x?}",
+                    topic.topic_id, produced.topic_id
+                ));
+            }
+            let partition = topic
+                .partitions
+                .first()
                 .ok_or_else(|| "Fetch response names no partitions".to_string())?;
             let code = ErrorCode(partition.error_code);
             if !code.is_ok() {
@@ -776,27 +856,93 @@ async fn fetch_batch_integrity(
             Ok(partition.records.clone().unwrap_or_default())
         }
         .await;
-        let got = match outcome {
-            Ok(got) if !got.is_empty() => got,
-            Ok(_) => {
-                tokio::time::sleep(SETTLE_DELAY).await;
-                continue;
-            }
+        match outcome {
+            Ok(got) if !got.is_empty() => return Ok(got),
+            Ok(_) => {}
             Err(details) => {
-                if details.contains("UNKNOWN_TOPIC_OR_PARTITION")
-                    || details.contains("NOT_LEADER_OR_FOLLOWER")
-                    || details.contains("LEADER_NOT_AVAILABLE")
-                {
-                    last = details;
-                    tokio::time::sleep(SETTLE_DELAY).await;
-                    continue;
+                let transient = [
+                    "UNKNOWN_TOPIC_OR_PARTITION",
+                    "NOT_LEADER_OR_FOLLOWER",
+                    "LEADER_NOT_AVAILABLE",
+                    "UNKNOWN_TOPIC_ID",
+                ];
+                if !transient.iter().any(|t| details.contains(t)) {
+                    return Err(details);
                 }
-                return Verdict::Fail { details };
+                last = details;
             }
-        };
-        return batch_integrity(&produced.sent, &got);
+        }
+        tokio::time::sleep(SETTLE_DELAY).await;
     }
-    Verdict::Fail { details: last }
+    Err(last)
+}
+
+async fn fetch_batch_integrity(
+    addr: &str,
+    create_range: Option<(i16, i16)>,
+    produce_range: Option<(i16, i16)>,
+    fetch_range: Option<(i16, i16)>,
+) -> Verdict {
+    let fetch_version = match negotiate(
+        "Fetch",
+        fetch_range,
+        FetchRequest::MIN_VERSION,
+        FETCH_NAME_MAX,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    // The flow tolerates a wrong assigned base offset here — that is
+    // produce/basic's finding — and always fetches from offset 0.
+    let mut produced =
+        match produce_flow(addr, "fetch", create_range, produce_range, Addressing::Name).await {
+            Ok(p) => p,
+            Err(verdict) => return verdict,
+        };
+    match run_fetch(&mut produced, fetch_version, Addressing::Name).await {
+        Ok(got) => batch_integrity(&produced.sent, &got),
+        Err(details) => Verdict::Fail { details },
+    }
+}
+
+async fn fetch_topic_id(
+    addr: &str,
+    create_range: Option<(i16, i16)>,
+    produce_range: Option<(i16, i16)>,
+    fetch_range: Option<(i16, i16)>,
+) -> Verdict {
+    let fetch_version = match negotiate(
+        "Fetch",
+        fetch_range,
+        FETCH_ID_MIN,
+        FetchRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    // Produce by name (that leg has its own checks); the id under test
+    // here is the fetch path's.
+    let mut produced = match produce_flow(
+        addr,
+        "fetch-id",
+        create_range,
+        produce_range,
+        Addressing::Name,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    if produced.topic_id == [0u8; 16] {
+        return Verdict::Skipped {
+            reason: "CreateTopics did not return a topic id (needs v7+)".into(),
+        };
+    }
+    match run_fetch(&mut produced, fetch_version, Addressing::TopicId).await {
+        Ok(got) => batch_integrity(&produced.sent, &got),
+        Err(details) => Verdict::Fail { details },
+    }
 }
 
 /// Compare the fetched record set against the produced bytes: identical

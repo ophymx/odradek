@@ -74,15 +74,16 @@ Early but functional end to end:
   conformance` runs the suite against Apache Kafka and Redpanda in Docker
   and enforces the per-implementation baselines committed in
   [`conformance/`](conformance/). Nothing fails today, and the baselines
-  already record one real behavioral difference: Redpanda 25.2 advertises
-  Metadata only up to v8, so the flexible-response-header check skips
-  there. The fault ↔ check registry is enforced by test: a check no fault
-  can trip, or a fault no check detects, fails calibration.
+  already record real behavioral differences: Redpanda 25.2 advertises
+  Metadata only to v8, Produce to v7, and Fetch to v11 — so the flexible
+  metadata header and topic-id-addressed produce/fetch checks (which
+  Kafka 4.1 passes) skip there, on record. The fault ↔ check registry is
+  enforced by test: a check no fault can trip, or a fault no check
+  detects, fails calibration.
 
-Next: topic-id-addressed Produce/Fetch (v13+) via a Metadata lookup, a
-richer client harness that impersonates a small cluster, materialize
-known tagged fields in codegen, vendor more schemas (consumer groups,
-offsets), and the client's cluster/metadata layer.
+Next: a richer client harness that impersonates a small cluster,
+materialize known tagged fields in codegen, vendor more schemas
+(consumer groups, offsets), and the client's cluster/metadata layer.
 
 ```sh
 cargo test --workspace       # everything
