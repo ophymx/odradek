@@ -32,4 +32,26 @@ pub enum ClientError {
     /// The cluster metadata names no live leader for the partition.
     #[error("no known leader for {topic}[{partition}]")]
     UnknownLeader { topic: String, partition: i32 },
+    /// The fetched data uses a compression codec this client cannot
+    /// materialize yet.
+    #[error("compressed batches are not supported yet ({0})")]
+    UnsupportedCompression(&'static str),
+}
+
+impl ClientError {
+    /// True when retrying after refreshed metadata could plausibly
+    /// succeed: leadership moved, a topic is still materializing, or the
+    /// connection died under us.
+    pub fn is_retriable(&self) -> bool {
+        match self {
+            ClientError::ConnectionClosed | ClientError::Io(_) => true,
+            ClientError::Broker(code) => {
+                *code == ErrorCode::NOT_LEADER_OR_FOLLOWER
+                    || *code == ErrorCode::LEADER_NOT_AVAILABLE
+                    || *code == ErrorCode::UNKNOWN_TOPIC_OR_PARTITION
+                    || *code == ErrorCode::UNKNOWN_TOPIC_ID
+            }
+            _ => false,
+        }
+    }
 }

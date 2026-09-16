@@ -85,7 +85,7 @@ impl Producer {
             }
             match self.try_once(topic, partition, &set).await {
                 Ok(offset) => return Ok(offset),
-                Err(e) if retriable(&e) => {
+                Err(e) if e.is_retriable() => {
                     // Leadership (or the broker itself) may have moved on;
                     // refetch rather than resend into the same wall.
                     self.cluster.mark_stale(topic);
@@ -164,19 +164,6 @@ impl Producer {
         } else {
             Err(ClientError::Broker(code))
         }
-    }
-}
-
-fn retriable(e: &ClientError) -> bool {
-    match e {
-        ClientError::ConnectionClosed | ClientError::Io(_) => true,
-        ClientError::Broker(code) => {
-            *code == ErrorCode::NOT_LEADER_OR_FOLLOWER
-                || *code == ErrorCode::LEADER_NOT_AVAILABLE
-                || *code == ErrorCode::UNKNOWN_TOPIC_OR_PARTITION
-                || *code == ErrorCode::UNKNOWN_TOPIC_ID
-        }
-        _ => false,
     }
 }
 

@@ -92,7 +92,7 @@ async fn serve_conn(
         let body = match api_key {
             18 => {
                 let resp = ApiVersionsResponse {
-                    api_keys: [(18, 0, 4), (3, 0, 13), (0, 3, 12)]
+                    api_keys: [(18, 0, 4), (3, 0, 13), (0, 3, 12), (1, 4, 17), (2, 1, 10)]
                         .into_iter()
                         .map(|(api_key, min_version, max_version)| ApiVersion {
                             api_key,
@@ -173,6 +173,64 @@ async fn serve_conn(
                 }
                 .encode(&mut buf, api_version)
                 .unwrap();
+                buf.freeze()
+            }
+            1 => {
+                use odradek_protocol::messages::fetch_request::FetchRequest;
+                use odradek_protocol::messages::fetch_response::{
+                    FetchResponse, FetchableTopicResponse, PartitionData,
+                };
+                let fetch = FetchRequest::decode(&mut frame, api_version).unwrap();
+                let topic = &fetch.topics[0];
+                assert_eq!(topic.topic, TOPIC);
+                let resp = FetchResponse {
+                    responses: vec![FetchableTopicResponse {
+                        topic: TOPIC.into(),
+                        partitions: vec![PartitionData {
+                            partition_index: topic.partitions[0].partition,
+                            error_code: 0,
+                            high_watermark: 9,
+                            last_stable_offset: 9,
+                            log_start_offset: 5,
+                            records: Some(fake_log()),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                let mut buf = BytesMut::new();
+                resp.encode(&mut buf, api_version).unwrap();
+                buf.freeze()
+            }
+            2 => {
+                use odradek_protocol::messages::list_offsets_request::ListOffsetsRequest;
+                use odradek_protocol::messages::list_offsets_response::{
+                    ListOffsetsPartitionResponse, ListOffsetsResponse, ListOffsetsTopicResponse,
+                };
+                let req = ListOffsetsRequest::decode(&mut frame, api_version).unwrap();
+                let partition = &req.topics[0].partitions[0];
+                let offset = match partition.timestamp {
+                    -2 => 5, // earliest: the log start
+                    -1 => 9, // latest: the log end
+                    other => panic!("fake broker got list offsets timestamp {other}"),
+                };
+                let resp = ListOffsetsResponse {
+                    topics: vec![ListOffsetsTopicResponse {
+                        name: TOPIC.into(),
+                        partitions: vec![ListOffsetsPartitionResponse {
+                            partition_index: partition.partition_index,
+                            error_code: 0,
+                            timestamp: -1,
+                            offset,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                let mut buf = BytesMut::new();
+                resp.encode(&mut buf, api_version).unwrap();
                 buf.freeze()
             }
             other => panic!("fake broker got api key {other}"),
@@ -265,6 +323,69 @@ async fn leaderless_partition_is_an_error_not_a_guess() {
         }
         other => panic!("expected UnknownLeader, got {other:?}"),
     }
+}
+
+/// The fake partition log: a control batch at offset 5 (transaction
+/// marker — not data), then a data batch with offsets 6-8.
+fn fake_log() -> Bytes {
+    use odradek_protocol::records::{Record, RecordBatch, Records, encode_set};
+    let control = RecordBatch {
+        base_offset: 5,
+        attributes: 1 << 5, // control
+        base_timestamp: 900,
+        max_timestamp: 900,
+        records: Records::Plain(vec![Record {
+            value: Some(Bytes::from_static(b"\0\0\0\0")),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    let data = RecordBatch {
+        base_offset: 6,
+        last_offset_delta: 2,
+        base_timestamp: 1_000,
+        max_timestamp: 1_002,
+        records: Records::Plain(
+            [b"a", b"b", b"c"]
+                .iter()
+                .enumerate()
+                .map(|(i, v)| Record {
+                    offset_delta: i32::try_from(i).unwrap(),
+                    timestamp_delta: i64::try_from(i).unwrap(),
+                    value: Some(Bytes::from_static(*v)),
+                    ..Default::default()
+                })
+                .collect(),
+        ),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    encode_set(&mut buf, &[control, data]).unwrap();
+    buf.freeze()
+}
+
+#[tokio::test]
+async fn consumer_fetches_from_an_offset_and_skips_noise() {
+    use odradek_client::Consumer;
+
+    let fake = spawn_fake_cluster(3, &[]).await;
+    let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+    let mut consumer = Consumer::new(cluster);
+
+    // Fetching from 7: the control batch and record 6 are not data the
+    // caller asked for; absolute offsets and timestamps are materialized.
+    let result = consumer.fetch(TOPIC, 1, 7).await.unwrap();
+    let got: Vec<(i64, i64, &[u8])> = result
+        .records
+        .iter()
+        .map(|r| (r.offset, r.timestamp, r.value.as_deref().unwrap()))
+        .collect();
+    assert_eq!(got, vec![(7, 1_001, b"b".as_slice()), (8, 1_002, b"c")]);
+    assert_eq!(result.next_offset, 9);
+    assert_eq!(result.high_watermark, 9);
+
+    assert_eq!(consumer.earliest_offset(TOPIC, 1).await.unwrap(), 5);
+    assert_eq!(consumer.latest_offset(TOPIC, 1).await.unwrap(), 9);
 }
 
 #[tokio::test]

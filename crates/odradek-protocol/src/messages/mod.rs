@@ -9,6 +9,8 @@ pub mod create_topics_request;
 pub mod create_topics_response;
 pub mod fetch_request;
 pub mod fetch_response;
+pub mod list_offsets_request;
+pub mod list_offsets_response;
 pub mod metadata_request;
 pub mod metadata_response;
 pub mod produce_request;
@@ -22,6 +24,8 @@ pub use create_topics_request::CreateTopicsRequest;
 pub use create_topics_response::CreateTopicsResponse;
 pub use fetch_request::FetchRequest;
 pub use fetch_response::FetchResponse;
+pub use list_offsets_request::ListOffsetsRequest;
+pub use list_offsets_response::ListOffsetsResponse;
 pub use metadata_request::MetadataRequest;
 pub use metadata_response::MetadataResponse;
 pub use produce_request::ProduceRequest;
@@ -37,6 +41,7 @@ pub fn request_is_flexible(api_key: i16, api_version: i16) -> Option<bool> {
         18 => Some(api_versions_request::is_flexible(api_version)),
         19 => Some(create_topics_request::is_flexible(api_version)),
         1 => Some(fetch_request::is_flexible(api_version)),
+        2 => Some(list_offsets_request::is_flexible(api_version)),
         3 => Some(metadata_request::is_flexible(api_version)),
         0 => Some(produce_request::is_flexible(api_version)),
         _ => None,

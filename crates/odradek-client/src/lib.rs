@@ -21,12 +21,14 @@
 
 pub mod cluster;
 pub mod conn;
+pub mod consumer;
 pub mod error;
 pub mod negotiate;
 pub mod producer;
 
 pub use cluster::Cluster;
 pub use conn::Connection;
+pub use consumer::{ConsumedRecord, Consumer, ConsumerConfig, FetchResult};
 pub use error::ClientError;
 pub use negotiate::ApiVersionRanges;
 pub use odradek_protocol as protocol;
