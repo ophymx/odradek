@@ -21,6 +21,7 @@ use std::fmt;
 pub mod checks;
 pub mod raw;
 pub mod report;
+pub mod subject;
 
 pub use report::{CheckOutcome, Report};
 
@@ -35,7 +36,8 @@ pub enum SubjectRole {
 }
 
 /// Stable identifier for a check, e.g. `api-versions/flexible-header`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
 pub struct CheckId(pub String);
 
 impl fmt::Display for CheckId {
@@ -45,7 +47,8 @@ impl fmt::Display for CheckId {
 }
 
 /// Result of running a single check against a subject.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
 pub enum Verdict {
     Pass,
     /// The subject violated the protocol; `details` explains the observed

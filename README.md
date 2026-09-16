@@ -45,17 +45,32 @@ Early but functional end to end:
 - `odradek-client`: framed connection with correlation-id pipelining and
   ApiVersions negotiation (including the `UNSUPPORTED_VERSION` downgrade
   path), tested against an in-process fake broker.
-- `odradek-acceptance`: first server-side conformance checks
-  (`api-versions/*`) over a raw connection independent of the client crate,
-  with a CLI:
+- `odradek-acceptance`: conformance checks for **both roles** over raw
+  connections independent of the client crate — `api-versions/*` server
+  checks and `client/*` client checks — with JSON reports and per-
+  implementation baselines:
 
   ```sh
-  cargo run -p odradek-acceptance --bin odradek-accept -- --server localhost:9092
+  # validate a server
+  odradek-accept --server localhost:9092 [--json]
+  # validate a client: listen, point its bootstrap here
+  odradek-accept --client-listen 127.0.0.1:19092
+  # record / enforce expected results per implementation
+  odradek-accept --server ... --write-baseline conformance/kafka.json
+  odradek-accept --server ... --baseline conformance/kafka.json
   ```
 
-Next: materialize known tagged fields in codegen, vendor more schemas
-(consumer groups, offsets), the client's cluster/metadata layer, record
-batch encoding, and client-under-test acceptance checks.
+  The suite is calibrated in both directions: a fault-injectable reference
+  subject (`odradek_acceptance::subject`) proves each check detects exactly
+  the violation it claims to (sensitivity) and that a conformant subject
+  trips nothing (specificity); `odradek-client` itself passes the client
+  checks (dogfooding). Still missing: runs against real brokers (needs a
+  container runtime or JVM) to calibrate against ground truth.
+
+Next: run the suite against Apache Kafka/Redpanda/etc. and commit
+per-implementation baselines, materialize known tagged fields in codegen,
+vendor more schemas (consumer groups, offsets), the client's
+cluster/metadata layer, and record batch encoding.
 
 ```sh
 cargo test --workspace       # everything
