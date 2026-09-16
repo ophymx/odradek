@@ -22,6 +22,7 @@ pub mod error;
 pub mod error_code;
 pub mod header;
 pub mod messages;
+pub mod records;
 pub mod wire;
 
 pub use api_key::ApiKey;

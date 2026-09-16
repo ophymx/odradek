@@ -32,4 +32,7 @@ pub enum DecodeError {
     /// An API key, error code, or other enum discriminant is unknown.
     #[error("unknown {kind} discriminant: {value}")]
     UnknownDiscriminant { kind: &'static str, value: i64 },
+    /// A record batch's stored checksum does not match its contents.
+    #[error("crc mismatch: batch stores {stored:#010x}, contents hash to {computed:#010x}")]
+    CrcMismatch { stored: u32, computed: u32 },
 }

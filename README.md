@@ -39,9 +39,13 @@ Early but functional end to end:
 - `odradek-protocol`: wire primitives; message types generated from the
   Kafka 4.1.0 schemas vendored in `crates/odradek-protocol/schemas/`
   (headers, ApiVersions, Metadata, Produce, Fetch) via `cargo xtask codegen`;
-  header-version selection including the ApiVersions response-header quirk.
-  Known limitation: tagged fields are not yet materialized as struct fields —
-  they round-trip losslessly through `unknown_tagged_fields`.
+  header-version selection including the ApiVersions response-header quirk;
+  record batch (v2) encoding with CRC-32C validation — compressed and
+  unknown-codec payloads stay raw and re-encode byte-identically (the
+  proxy guarantee), verified against a golden segment produced by a real
+  Kafka 4.1 broker. Known limitation: tagged fields are not yet
+  materialized as struct fields — they round-trip losslessly through
+  `unknown_tagged_fields`.
 - `odradek-client`: framed connection with correlation-id pipelining and
   ApiVersions negotiation (including the `UNSUPPORTED_VERSION` downgrade
   path), tested against an in-process fake broker.
@@ -73,10 +77,10 @@ Early but functional end to end:
   there. The fault ↔ check registry is enforced by test: a check no fault
   can trip, or a fault no check detects, fails calibration.
 
-Next: produce/fetch checks (needs record batch encoding in the protocol
-crate first), a richer client harness that impersonates a small cluster,
-materialize known tagged fields in codegen, vendor more schemas (consumer
-groups, offsets), and the client's cluster/metadata layer.
+Next: produce/fetch conformance checks on top of the record batch codec,
+a richer client harness that impersonates a small cluster, materialize
+known tagged fields in codegen, vendor more schemas (consumer groups,
+offsets), and the client's cluster/metadata layer.
 
 ```sh
 cargo test --workspace       # everything
