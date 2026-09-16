@@ -48,13 +48,18 @@ Early but functional end to end:
   `unknown_tagged_fields`.
 - `odradek-client`: framed connection with correlation-id pipelining and
   ApiVersions negotiation (including the `UNSUPPORTED_VERSION` downgrade
-  path), tested against an in-process fake broker.
+  path), plus the cluster layer: metadata discovery, a per-broker
+  connection pool with per-broker version ranges, and partition-leader
+  routing — tested against in-process fake single- and multi-broker
+  clusters.
 - `odradek-acceptance`: conformance checks for **both roles** over raw
   connections independent of the client crate — `api-versions/*`,
   `metadata/*`, `produce/*`, and `fetch/*` server checks (including a
   create → produce → fetch flow that asserts the broker returns the
   produced batch byte-identical in the crc-covered region) and `client/*`
-  client checks — with JSON reports and per-implementation baselines:
+  client checks, where the harness impersonates a three-broker cluster so
+  partition-leader routing is observable — with JSON reports and
+  per-implementation baselines:
 
   ```sh
   # validate a server
@@ -81,9 +86,10 @@ Early but functional end to end:
   enforced by test: a check no fault can trip, or a fault no check
   detects, fails calibration.
 
-Next: a richer client harness that impersonates a small cluster,
-materialize known tagged fields in codegen, vendor more schemas
-(consumer groups, offsets), and the client's cluster/metadata layer.
+Next: producer/consumer machinery on the client's cluster layer,
+harness fault modes (NOT_LEADER redirects to observe client retries),
+materialize known tagged fields in codegen, and vendor more schemas
+(consumer groups, offsets).
 
 ```sh
 cargo test --workspace       # everything

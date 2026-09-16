@@ -1,11 +1,16 @@
 //! Checks that run against a client under test (the suite acts as server).
 //!
-//! The harness accepts one client connection, answers just enough of the
-//! protocol to keep a real client talking (ApiVersions, Metadata, and empty
-//! Produce/Fetch successes), and records every frame the client sends.
-//! Checks are then evaluated over the recorded observations.
+//! The harness impersonates a small cluster: the bootstrap listener plus
+//! two more ephemeral listeners, presented in Metadata as brokers 0-2.
+//! One topic ([`ROUTING_TOPIC`]) spans three partitions, partition `i`
+//! led by broker `i`, so leader routing is observable. Every broker
+//! answers just enough of the protocol to keep a real client talking
+//! (ApiVersions, Metadata, and empty Produce/Fetch successes) and records
+//! every frame; checks are evaluated over the recorded observations.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -15,13 +20,16 @@ use odradek_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsR
 use odradek_protocol::messages::fetch_request::FetchRequest;
 use odradek_protocol::messages::fetch_response::FetchResponse;
 use odradek_protocol::messages::metadata_request::MetadataRequest;
-use odradek_protocol::messages::metadata_response::{MetadataResponse, MetadataResponseBroker};
+use odradek_protocol::messages::metadata_response::{
+    MetadataResponse, MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
+};
 use odradek_protocol::messages::produce_request::ProduceRequest;
 use odradek_protocol::messages::produce_response::ProduceResponse;
 use odradek_protocol::messages::request_header::RequestHeader;
 use odradek_protocol::messages::response_header::ResponseHeader;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 
 use crate::report::{CheckOutcome, Report};
 use crate::{CheckId, Verdict};
@@ -32,12 +40,22 @@ const ADVERTISED: &[(i16, i16, i16)] = &[(18, 0, 4), (0, 3, 12), (1, 4, 17), (3,
 
 const MAX_API_VERSIONS: i16 = 4;
 
+/// How many brokers the harness impersonates.
+pub const BROKER_COUNT: i32 = 3;
+
+/// The topic the harness advertises for routing observation: one
+/// partition per broker, partition `i` led by broker `i`.
+pub const ROUTING_TOPIC: &str = "odradek-routing";
+
+/// The routing topic's id, for id-addressed clients (16 bytes).
+pub const ROUTING_TOPIC_ID: [u8; 16] = *b"odradek-routing!";
+
 /// Limits for one observation session.
 #[derive(Debug, Clone)]
 pub struct ObserveConfig {
     /// Stop after this many requests (the checks need finite input).
     pub max_requests: usize,
-    /// Stop when the client goes quiet for this long.
+    /// Stop when every connection goes quiet for this long.
     pub idle_timeout: Duration,
 }
 
@@ -53,6 +71,12 @@ impl Default for ObserveConfig {
 /// What the harness saw in one request frame.
 #[derive(Debug)]
 struct Observation {
+    /// Which impersonated broker received the frame.
+    node_id: i32,
+    /// Connection ordinal (correlation ids and handshakes are per
+    /// connection).
+    conn_id: usize,
+    /// Position within its connection.
     index: usize,
     api_key: i16,
     api_version: i16,
@@ -63,45 +87,138 @@ struct Observation {
     /// Body checking does not apply (unknown api, or an ApiVersions probe
     /// above our max — the probe dance is legal).
     body_exempt: bool,
+    /// (topic, partition) pairs this produce/fetch addressed.
+    routes: Vec<(String, i32)>,
 }
 
-/// Accept one client connection on `listener`, observe it, and evaluate
-/// the client checks.
+/// The impersonated cluster's endpoints; broker `i` listens on
+/// `ports[i]`.
+struct ClusterView {
+    ports: Vec<u16>,
+}
+
+/// Accept client connections (bootstrap on `listener`, brokers 1+ on
+/// internal listeners), observe every frame, and evaluate the checks.
 pub async fn run(listener: &TcpListener, config: &ObserveConfig) -> Report {
-    let (stream, peer) = match listener.accept().await {
-        Ok(ok) => ok,
+    let fail_report = |details: String| Report {
+        subject: "client <none>".into(),
+        outcomes: vec![CheckOutcome {
+            id: CheckId("client/session".into()),
+            requirement: "a client connects to the harness",
+            verdict: Verdict::Fail { details },
+        }],
+    };
+
+    // Brokers 1..N listen on ephemeral ports next to the bootstrap.
+    let mut extra = Vec::new();
+    for _ in 1..BROKER_COUNT {
+        match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => extra.push(l),
+            Err(e) => return fail_report(format!("cannot bind harness broker: {e}")),
+        }
+    }
+    let mut ports = vec![match listener.local_addr() {
+        Ok(a) => a.port(),
+        Err(e) => return fail_report(format!("bootstrap listener: {e}")),
+    }];
+    ports.extend(
+        extra
+            .iter()
+            .filter_map(|l| l.local_addr().ok().map(|a| a.port())),
+    );
+    let view = Arc::new(ClusterView { ports });
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let conn_counter = Arc::new(AtomicUsize::new(0));
+    let mut accept_tasks = Vec::new();
+    for (i, l) in extra.into_iter().enumerate() {
+        let node_id = i32::try_from(i).unwrap_or(0) + 1;
+        let view = Arc::clone(&view);
+        let tx = tx.clone();
+        let conn_counter = Arc::clone(&conn_counter);
+        accept_tasks.push(tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = l.accept().await else {
+                    return;
+                };
+                let conn_id = conn_counter.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(handle_conn(
+                    stream,
+                    node_id,
+                    conn_id,
+                    Arc::clone(&view),
+                    tx.clone(),
+                ));
+            }
+        }));
+    }
+
+    // Wait (without a deadline, as ever) for the client's first
+    // connection — necessarily to the bootstrap, the only address it has.
+    let peer = match listener.accept().await {
+        Ok((stream, peer)) => {
+            let conn_id = conn_counter.fetch_add(1, Ordering::Relaxed);
+            tokio::spawn(handle_conn(
+                stream,
+                0,
+                conn_id,
+                Arc::clone(&view),
+                tx.clone(),
+            ));
+            peer
+        }
         Err(e) => {
-            return Report {
-                subject: "client <none>".into(),
-                outcomes: vec![CheckOutcome {
-                    id: CheckId("client/session".into()),
-                    requirement: "a client connects to the harness",
-                    verdict: Verdict::Fail {
-                        details: format!("accept failed: {e}"),
-                    },
-                }],
-            };
+            for t in &accept_tasks {
+                t.abort();
+            }
+            return fail_report(format!("accept failed: {e}"));
         }
     };
-    let observations = observe_session(stream, config).await;
+
+    // Collect observations until the whole session goes idle.
+    let mut observations = Vec::new();
+    while observations.len() < config.max_requests {
+        tokio::select! {
+            accepted = listener.accept() => {
+                if let Ok((stream, _)) = accepted {
+                    let conn_id = conn_counter.fetch_add(1, Ordering::Relaxed);
+                    tokio::spawn(handle_conn(stream, 0, conn_id, Arc::clone(&view), tx.clone()));
+                }
+            }
+            obs = rx.recv() => match obs {
+                Some(obs) => observations.push(obs),
+                None => break,
+            },
+            () = tokio::time::sleep(config.idle_timeout) => break,
+        }
+    }
+    for t in &accept_tasks {
+        t.abort();
+    }
     evaluate(&observations, &format!("client {peer}"))
 }
 
-async fn observe_session(mut stream: TcpStream, config: &ObserveConfig) -> Vec<Observation> {
-    let mut observations = Vec::new();
-    while observations.len() < config.max_requests {
-        let frame = match tokio::time::timeout(config.idle_timeout, read_frame(&mut stream)).await {
-            Ok(Some(frame)) => frame,
-            // Idle or closed: the session is over, not an error.
-            Ok(None) | Err(_) => break,
+async fn handle_conn(
+    mut stream: TcpStream,
+    node_id: i32,
+    conn_id: usize,
+    view: Arc<ClusterView>,
+    tx: mpsc::UnboundedSender<Observation>,
+) {
+    let mut index = 0;
+    loop {
+        let Some(frame) = read_frame(&mut stream).await else {
+            return;
         };
-        let obs = parse_request(observations.len(), frame);
+        let obs = parse_request(node_id, conn_id, index, frame);
+        index += 1;
         if let Some(header) = &obs.header {
-            respond(&mut stream, header).await;
+            respond(&mut stream, header, &view).await;
         }
-        observations.push(obs);
+        if tx.send(obs).is_err() {
+            return;
+        }
     }
-    observations
 }
 
 async fn read_frame(stream: &mut TcpStream) -> Option<Bytes> {
@@ -116,23 +233,29 @@ async fn read_frame(stream: &mut TcpStream) -> Option<Bytes> {
     Some(Bytes::from(frame))
 }
 
-fn parse_request(index: usize, frame: Bytes) -> Observation {
+fn parse_request(node_id: i32, conn_id: usize, index: usize, frame: Bytes) -> Observation {
+    let mut obs = Observation {
+        node_id,
+        conn_id,
+        index,
+        api_key: -1,
+        api_version: -1,
+        header: None,
+        header_error: None,
+        body_error: None,
+        body_exempt: true,
+        routes: Vec::new(),
+    };
     if frame.len() < 8 {
-        return Observation {
-            index,
-            api_key: -1,
-            api_version: -1,
-            header: None,
-            header_error: Some(format!(
-                "frame of {} byte(s) cannot hold a header",
-                frame.len()
-            )),
-            body_error: None,
-            body_exempt: true,
-        };
+        obs.header_error = Some(format!(
+            "frame of {} byte(s) cannot hold a header",
+            frame.len()
+        ));
+        return obs;
     }
-    let api_key = i16::from_be_bytes([frame[0], frame[1]]);
-    let api_version = i16::from_be_bytes([frame[2], frame[3]]);
+    obs.api_key = i16::from_be_bytes([frame[0], frame[1]]);
+    obs.api_version = i16::from_be_bytes([frame[2], frame[3]]);
+    let (api_key, api_version) = (obs.api_key, obs.api_version);
 
     let known_probe_version = if api_key == 18 {
         // ApiVersions probes above our max are legal; parse at our newest.
@@ -143,46 +266,78 @@ fn parse_request(index: usize, frame: Bytes) -> Observation {
     let header_version =
         request_header_version(api_key, known_probe_version.unwrap_or(api_version));
 
-    let (header, header_error, mut body) = match header_version {
+    let mut body = None;
+    match header_version {
         Some(hv) => {
             let mut buf = frame.clone();
             match RequestHeader::decode(&mut buf, hv) {
-                Ok(h) => (Some(h), None, Some(buf)),
-                Err(e) => (
-                    salvage_header(&frame),
-                    Some(format!("header (v{hv}): {e}")),
-                    None,
-                ),
+                Ok(h) => {
+                    obs.header = Some(h);
+                    body = Some(buf);
+                }
+                Err(e) => {
+                    obs.header = salvage_header(&frame);
+                    obs.header_error = Some(format!("header (v{hv}): {e}"));
+                }
             }
         }
         // Unknown api key: no defined header version. Salvage for the
         // correlation id; the advertised-apis check reports the violation.
-        None => (salvage_header(&frame), None, None),
-    };
-
-    let mut body_error = None;
-    let mut body_exempt = false;
-    match (api_key, &mut body) {
-        (_, None) => body_exempt = true,
-        (18, Some(buf)) if api_version > MAX_API_VERSIONS => {
-            let _ = buf;
-            body_exempt = true;
-        }
-        (18, Some(buf)) => body_error = decode_fully::<ApiVersionsRequest>(buf, api_version),
-        (0, Some(buf)) => body_error = decode_fully::<ProduceRequest>(buf, api_version),
-        (1, Some(buf)) => body_error = decode_fully::<FetchRequest>(buf, api_version),
-        (3, Some(buf)) => body_error = decode_fully::<MetadataRequest>(buf, api_version),
-        _ => body_exempt = true,
+        None => obs.header = salvage_header(&frame),
     }
 
-    Observation {
-        index,
-        api_key,
-        api_version,
-        header,
-        header_error,
-        body_error,
-        body_exempt,
+    match (api_key, &mut body) {
+        (_, None) => {}
+        (18, Some(_)) if api_version > MAX_API_VERSIONS => {}
+        (18, Some(buf)) => {
+            obs.body_exempt = false;
+            obs.body_error = decode_fully::<ApiVersionsRequest>(buf, api_version).err();
+        }
+        (0, Some(buf)) => {
+            obs.body_exempt = false;
+            match decode_fully::<ProduceRequest>(buf, api_version) {
+                Err(e) => obs.body_error = Some(e),
+                Ok(req) => {
+                    for topic in &req.topic_data {
+                        let name = resolve_topic(&topic.name, topic.topic_id);
+                        for p in &topic.partition_data {
+                            obs.routes.push((name.clone(), p.index));
+                        }
+                    }
+                }
+            }
+        }
+        (1, Some(buf)) => {
+            obs.body_exempt = false;
+            match decode_fully::<FetchRequest>(buf, api_version) {
+                Err(e) => obs.body_error = Some(e),
+                Ok(req) => {
+                    for topic in &req.topics {
+                        let name = resolve_topic(&topic.topic, topic.topic_id);
+                        for p in &topic.partitions {
+                            obs.routes.push((name.clone(), p.partition));
+                        }
+                    }
+                }
+            }
+        }
+        (3, Some(buf)) => {
+            obs.body_exempt = false;
+            obs.body_error = decode_fully::<MetadataRequest>(buf, api_version).err();
+        }
+        _ => {}
+    }
+    obs
+}
+
+/// Map a request's topic reference (name, or id for v13+) back to a name.
+fn resolve_topic(name: &str, topic_id: [u8; 16]) -> String {
+    if !name.is_empty() {
+        name.to_owned()
+    } else if topic_id == ROUTING_TOPIC_ID {
+        ROUTING_TOPIC.to_owned()
+    } else {
+        format!("<topic id {topic_id:02x?}>")
     }
 }
 
@@ -209,14 +364,14 @@ impl_decode_body!(
     MetadataRequest
 );
 
-fn decode_fully<T: DecodeBody>(buf: &mut Bytes, version: i16) -> Option<String> {
+fn decode_fully<T: DecodeBody>(buf: &mut Bytes, version: i16) -> Result<T, String> {
     match T::decode_body(buf, version) {
-        Err(e) => Some(format!("body: {e}")),
-        Ok(_) if !buf.is_empty() => Some(format!(
+        Err(e) => Err(format!("body: {e}")),
+        Ok(_) if !buf.is_empty() => Err(format!(
             "body leaves {} undecoded trailing byte(s)",
             buf.len()
         )),
-        Ok(_) => None,
+        Ok(v) => Ok(v),
     }
 }
 
@@ -231,7 +386,7 @@ fn salvage_header(frame: &Bytes) -> Option<RequestHeader> {
     None
 }
 
-async fn respond(stream: &mut TcpStream, header: &RequestHeader) {
+async fn respond(stream: &mut TcpStream, header: &RequestHeader, view: &ClusterView) {
     let api_key = header.request_api_key;
     let api_version = header.request_api_version;
 
@@ -241,15 +396,33 @@ async fn respond(stream: &mut TcpStream, header: &RequestHeader) {
         3 => {
             let v = api_version.clamp(0, 13);
             let resp = MetadataResponse {
-                brokers: vec![MetadataResponseBroker {
-                    node_id: 0,
-                    host: "127.0.0.1".into(),
-                    port: 0,
-                    rack: None,
-                    unknown_tagged_fields: Vec::new(),
-                }],
+                brokers: view
+                    .ports
+                    .iter()
+                    .enumerate()
+                    .map(|(i, port)| MetadataResponseBroker {
+                        node_id: i32::try_from(i).unwrap_or(0),
+                        host: "127.0.0.1".into(),
+                        port: i32::from(*port),
+                        ..Default::default()
+                    })
+                    .collect(),
                 cluster_id: Some("odradek-harness".into()),
                 controller_id: 0,
+                topics: vec![MetadataResponseTopic {
+                    name: Some(ROUTING_TOPIC.into()),
+                    topic_id: ROUTING_TOPIC_ID,
+                    partitions: (0..BROKER_COUNT)
+                        .map(|i| MetadataResponsePartition {
+                            partition_index: i,
+                            leader_id: i,
+                            replica_nodes: vec![i],
+                            isr_nodes: vec![i],
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }],
                 ..Default::default()
             };
             let mut buf = BytesMut::new();
@@ -321,17 +494,20 @@ fn evaluate(observations: &[Observation], subject: &str) -> Report {
     let skip = |reason: &str| Verdict::Skipped {
         reason: reason.into(),
     };
+    let describe = |o: &Observation| {
+        format!(
+            "conn #{} request #{} to broker {} (api {} v{})",
+            o.conn_id, o.index, o.node_id, o.api_key, o.api_version
+        )
+    };
 
     // client/header-well-formed
     let header_failures: Vec<String> = observations
         .iter()
         .filter_map(|o| {
-            o.header_error.as_ref().map(|e| {
-                format!(
-                    "request #{} (api {} v{}): {e}",
-                    o.index, o.api_key, o.api_version
-                )
-            })
+            o.header_error
+                .as_ref()
+                .map(|e| format!("{}: {e}", describe(o)))
         })
         .collect();
     outcomes.push(CheckOutcome {
@@ -349,29 +525,42 @@ fn evaluate(observations: &[Observation], subject: &str) -> Report {
         },
     });
 
-    // client/starts-with-api-versions
+    // client/starts-with-api-versions: per connection — negotiation is a
+    // per-connection handshake, not a per-session one.
+    let mut handshake_failures = Vec::new();
+    for o in observations.iter().filter(|o| o.index == 0) {
+        if o.api_key != 18 {
+            handshake_failures.push(format!(
+                "{}: first request on the connection is not ApiVersions",
+                describe(o)
+            ));
+        }
+    }
     outcomes.push(CheckOutcome {
         id: CheckId("client/starts-with-api-versions".into()),
-        requirement: "the first request on a connection is ApiVersions, so \
+        requirement: "the first request on every connection is ApiVersions, so \
                       versions are negotiated before anything else is sent",
-        verdict: match observations.first() {
-            None => skip("client sent no requests"),
-            Some(first) if first.api_key == 18 => Verdict::Pass,
-            Some(first) => Verdict::Fail {
-                details: format!("first request was api key {}", first.api_key),
-            },
+        verdict: if none_observed {
+            skip("client sent no requests")
+        } else if handshake_failures.is_empty() {
+            Verdict::Pass
+        } else {
+            Verdict::Fail {
+                details: handshake_failures.join("; "),
+            }
         },
     });
 
-    // client/correlation-ids-unique
-    let mut seen = HashSet::new();
+    // client/correlation-ids-unique (scoped per connection).
+    let mut seen: HashMap<usize, HashSet<i32>> = HashMap::new();
     let mut duplicates = Vec::new();
     for o in observations {
         if let Some(h) = &o.header {
-            if !seen.insert(h.correlation_id) {
+            if !seen.entry(o.conn_id).or_default().insert(h.correlation_id) {
                 duplicates.push(format!(
-                    "request #{} reuses correlation id {}",
-                    o.index, h.correlation_id
+                    "{} reuses correlation id {}",
+                    describe(o),
+                    h.correlation_id
                 ));
             }
         }
@@ -399,13 +588,13 @@ fn evaluate(observations: &[Observation], subject: &str) -> Report {
         applicable += 1;
         match ADVERTISED.iter().find(|(k, _, _)| *k == o.api_key) {
             None => range_violations.push(format!(
-                "request #{} uses api key {} the harness never advertised",
-                o.index, o.api_key
+                "{} uses an api key the harness never advertised",
+                describe(o)
             )),
             Some(&(_, min, max)) if o.api_version < min || o.api_version > max => range_violations
                 .push(format!(
-                    "request #{} uses api {} v{}, outside advertised {min}-{max}",
-                    o.index, o.api_key, o.api_version
+                    "{} is outside the advertised {min}-{max}",
+                    describe(o)
                 )),
             Some(_) => {}
         }
@@ -431,10 +620,7 @@ fn evaluate(observations: &[Observation], subject: &str) -> Report {
     for o in observations.iter().filter(|o| !o.body_exempt) {
         body_applicable += 1;
         if let Some(e) = &o.body_error {
-            body_failures.push(format!(
-                "request #{} (api {} v{}): {e}",
-                o.index, o.api_key, o.api_version
-            ));
+            body_failures.push(format!("{}: {e}", describe(o)));
         }
     }
     outcomes.push(CheckOutcome {
@@ -448,6 +634,40 @@ fn evaluate(observations: &[Observation], subject: &str) -> Report {
         } else {
             Verdict::Fail {
                 details: body_failures.join("; "),
+            }
+        },
+    });
+
+    // client/routes-to-partition-leader: partition i of the routing topic
+    // is led by broker i; produce/fetch for it must arrive there.
+    let mut misroutes = Vec::new();
+    let mut routed = 0usize;
+    for o in observations {
+        for (topic, partition) in &o.routes {
+            if topic != ROUTING_TOPIC {
+                continue;
+            }
+            routed += 1;
+            if *partition != o.node_id {
+                misroutes.push(format!(
+                    "{} addresses {topic}[{partition}], whose advertised \
+                     leader is broker {partition}",
+                    describe(o)
+                ));
+            }
+        }
+    }
+    outcomes.push(CheckOutcome {
+        id: CheckId("client/routes-to-partition-leader".into()),
+        requirement: "produce and fetch requests go to the broker the \
+                      metadata advertises as the partition's leader",
+        verdict: if routed == 0 {
+            skip("no produce/fetch for the routing topic observed")
+        } else if misroutes.is_empty() {
+            Verdict::Pass
+        } else {
+            Verdict::Fail {
+                details: misroutes.join("; "),
             }
         },
     });
