@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["kafka", "sse", "server-sent-events", "axum", "streaming"]
+categories = ["web-programming::http-server", "network-programming", "asynchronous"]
 
 [dependencies]
 odradek-web-core = { workspace = true }

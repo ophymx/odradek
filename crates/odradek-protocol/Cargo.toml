@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["kafka", "protocol", "sans-io", "wire", "codec"]
+categories = ["network-programming", "encoding", "parser-implementations"]
 
 [dependencies]
 bytes = { workspace = true }

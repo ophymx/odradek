@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["kafka", "protocol", "conformance", "testing"]
+categories = ["development-tools::testing", "network-programming"]
 
 [dependencies]
 odradek-protocol = { workspace = true }
