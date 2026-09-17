@@ -29,11 +29,15 @@ type Offsets = Arc<Mutex<std::collections::HashMap<(String, String, i32), (i64, 
 /// The fake group coordinator's node id.
 const COORDINATOR: i32 = 1;
 
+/// Stored record sets per (topic, partition), verbatim as produced.
+type Logs = Arc<Mutex<std::collections::HashMap<(String, i32), BytesMut>>>;
+
 struct FakeCluster {
     /// node_id -> host:port
     endpoints: Vec<(i32, String)>,
     arrivals: Arrivals,
     offsets: Offsets,
+    logs: Logs,
 }
 
 /// Spawn `n` fake brokers. Every broker answers ApiVersions and full
@@ -50,11 +54,13 @@ async fn spawn_fake_cluster(n: i32, no_leader: &'static [i32]) -> FakeCluster {
     }
     let arrivals: Arrivals = Arc::new(Mutex::new(Vec::new()));
     let offsets: Offsets = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let logs: Logs = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
     for (node_id, listener) in listeners {
         let endpoints = endpoints.clone();
         let arrivals = Arc::clone(&arrivals);
         let offsets = Arc::clone(&offsets);
+        let logs = Arc::clone(&logs);
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -66,6 +72,7 @@ async fn spawn_fake_cluster(n: i32, no_leader: &'static [i32]) -> FakeCluster {
                     endpoints.clone(),
                     Arc::clone(&arrivals),
                     Arc::clone(&offsets),
+                    Arc::clone(&logs),
                     no_leader,
                 ));
             }
@@ -75,6 +82,7 @@ async fn spawn_fake_cluster(n: i32, no_leader: &'static [i32]) -> FakeCluster {
         endpoints,
         arrivals,
         offsets,
+        logs,
     }
 }
 
@@ -84,6 +92,7 @@ async fn serve_conn(
     endpoints: Vec<(i32, String)>,
     arrivals: Arrivals,
     offsets: Offsets,
+    logs: Logs,
     no_leader: &'static [i32],
 ) {
     loop {
@@ -174,6 +183,13 @@ async fn serve_conn(
                     let mut partitions = Vec::new();
                     for p in &topic.partition_data {
                         arrivals.lock().unwrap().push((node_id, p.index));
+                        if let Some(records) = &p.records {
+                            logs.lock()
+                                .unwrap()
+                                .entry((topic.name.clone(), p.index))
+                                .or_default()
+                                .extend_from_slice(records);
+                        }
                         partitions.push(PartitionProduceResponse {
                             index: p.index,
                             error_code: 0,
@@ -205,16 +221,23 @@ async fn serve_conn(
                 let fetch = FetchRequest::decode(&mut frame, api_version).unwrap();
                 let topic = &fetch.topics[0];
                 assert_eq!(topic.topic, TOPIC);
+                let partition = topic.partitions[0].partition;
+                // Serve whatever was produced; the canned log otherwise.
+                let stored = logs
+                    .lock()
+                    .unwrap()
+                    .get(&(TOPIC.to_owned(), partition))
+                    .map(|b| b.clone().freeze());
                 let resp = FetchResponse {
                     responses: vec![FetchableTopicResponse {
                         topic: TOPIC.into(),
                         partitions: vec![PartitionData {
-                            partition_index: topic.partitions[0].partition,
+                            partition_index: partition,
                             error_code: 0,
                             high_watermark: 9,
                             last_stable_offset: 9,
                             log_start_offset: 5,
-                            records: Some(fake_log()),
+                            records: Some(stored.unwrap_or_else(fake_log)),
                             ..Default::default()
                         }],
                         ..Default::default()
@@ -511,6 +534,124 @@ async fn producer_delivers_a_batch_and_returns_the_offset() {
         .unwrap();
     assert_eq!(offset, 7); // the fake's fixed base offset
     assert!(fake.arrivals.lock().unwrap().contains(&(2, 2)));
+}
+
+#[tokio::test]
+async fn enqueue_batches_until_flush_or_size_trigger() {
+    use odradek_client::{Producer, ProducerConfig};
+    use odradek_protocol::records::Record;
+
+    let fake = spawn_fake_cluster(3, &[]).await;
+    let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+    let mut producer = Producer::with_config(
+        cluster,
+        ProducerConfig {
+            batch_max_bytes: 200,
+            ..Default::default()
+        },
+    );
+    let record = |v: &'static str| Record {
+        value: Some(Bytes::from_static(v.as_bytes())),
+        ..Default::default()
+    };
+
+    // Two small records buffer without delivering.
+    assert!(
+        producer
+            .enqueue(TOPIC, 0, record("one"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        producer
+            .enqueue(TOPIC, 1, record("two"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(producer.buffered(), 2);
+    assert!(fake.arrivals.lock().unwrap().is_empty());
+
+    // Flush delivers one batch per partition, to each partition's leader.
+    let deliveries = producer.flush().await.unwrap();
+    assert_eq!(deliveries.len(), 2);
+    assert!(deliveries.iter().all(|d| d.records == 1));
+    assert_eq!(producer.buffered(), 0);
+    let mut arrivals = fake.arrivals.lock().unwrap().clone();
+    arrivals.sort_unstable();
+    assert_eq!(arrivals, vec![(0, 0), (1, 1)]);
+
+    // A fat record blows the 200-byte threshold: immediate delivery of
+    // the partition's whole buffer as one batch.
+    producer.enqueue(TOPIC, 2, record("small")).await.unwrap();
+    let fat = Record {
+        value: Some(Bytes::from(vec![0x55; 300])),
+        ..Default::default()
+    };
+    let delivery = producer.enqueue(TOPIC, 2, fat).await.unwrap().unwrap();
+    assert_eq!(delivery.records, 2);
+    assert_eq!(producer.buffered(), 0);
+}
+
+#[tokio::test]
+async fn compressed_batches_roundtrip_end_to_end() {
+    use odradek_client::{Consumer, Producer, ProducerConfig};
+    use odradek_protocol::records::{Compression, Record, decode_set};
+
+    for codec in [Compression::Gzip, Compression::Lz4] {
+        let fake = spawn_fake_cluster(1, &[]).await;
+        let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+        let mut producer = Producer::with_config(
+            cluster,
+            ProducerConfig {
+                compression: codec,
+                ..Default::default()
+            },
+        );
+        for i in 0..3 {
+            producer
+                .enqueue(
+                    TOPIC,
+                    0,
+                    Record {
+                        key: Some(Bytes::from(format!("k{i}"))),
+                        value: Some(Bytes::from(format!("compressed value {i}"))),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        producer.flush().await.unwrap();
+
+        // The wire really carried a compressed batch...
+        let stored = fake.logs.lock().unwrap()[&(TOPIC.to_owned(), 0)]
+            .clone()
+            .freeze();
+        let batches = decode_set(&mut stored.clone()).unwrap();
+        assert_eq!(batches.len(), 1, "{codec:?}");
+        assert_eq!(batches[0].compression(), codec);
+
+        // ...and the consumer materializes it back into the records.
+        let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+        let mut consumer = Consumer::new(cluster);
+        let result = consumer.fetch(TOPIC, 0, 0).await.unwrap();
+        let values: Vec<String> = result
+            .records
+            .iter()
+            .map(|r| String::from_utf8(r.value.clone().unwrap().to_vec()).unwrap())
+            .collect();
+        assert_eq!(
+            values,
+            vec![
+                "compressed value 0",
+                "compressed value 1",
+                "compressed value 2"
+            ],
+            "{codec:?}"
+        );
+    }
 }
 
 #[tokio::test]

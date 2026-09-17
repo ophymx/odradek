@@ -155,6 +155,12 @@ impl Cluster {
         Ok(())
     }
 
+    /// The negotiated bootstrap connection, for requests that need no
+    /// routing (admin calls, probes).
+    pub fn bootstrap_broker(&self) -> &Broker {
+        &self.bootstrap
+    }
+
     /// Known brokers, as of the last metadata refresh.
     pub fn brokers(&self) -> impl Iterator<Item = &BrokerInfo> {
         self.brokers.values()

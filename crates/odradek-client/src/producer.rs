@@ -1,12 +1,15 @@
-//! Minimal producer: encode records as one batch, route it to the
-//! partition leader, and retry through leadership changes.
+//! Producer: batch records per partition, optionally compress, route to
+//! the partition leader, and retry through leadership changes.
 //!
-//! No batching-across-calls or compression yet — each call produces one
-//! record batch synchronously. What it does own is delivery: version
-//! selection per broker, leader routing via the [`Cluster`] cache, and
-//! retries that invalidate stale leadership rather than hammering the
-//! same broker.
+//! Two delivery styles share one path: [`Producer::produce`] sends the
+//! given records as one batch immediately, while [`Producer::enqueue`]
+//! buffers per partition and delivers when a partition's buffer exceeds
+//! [`ProducerConfig::batch_max_bytes`] or on [`Producer::flush`]. What
+//! this layer owns is delivery: version selection per broker, leader
+//! routing via the [`Cluster`] cache, and retries that invalidate stale
+//! leadership rather than hammering the same broker.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use bytes::BytesMut;
@@ -15,9 +18,10 @@ use odradek_protocol::messages::produce_request::{
     PartitionProduceData, ProduceRequest, TopicProduceData,
 };
 use odradek_protocol::messages::produce_response::ProduceResponse;
-use odradek_protocol::records::{Record, RecordBatch, Records};
+use odradek_protocol::records::{Compression, Record, RecordBatch, Records};
 
 use crate::cluster::Cluster;
+use crate::compression::{attribute_bits, compress};
 use crate::error::ClientError;
 
 /// Produce versions this producer speaks: name-addressed (v13+ switches
@@ -35,6 +39,11 @@ pub struct ProducerConfig {
     pub max_attempts: u32,
     /// Pause between attempts.
     pub retry_backoff: Duration,
+    /// Codec for produced batches (gzip and lz4 supported).
+    pub compression: Compression,
+    /// [`Producer::enqueue`] delivers a partition's buffer once its
+    /// estimated size passes this (pre-compression bytes).
+    pub batch_max_bytes: usize,
 }
 
 impl Default for ProducerConfig {
@@ -42,10 +51,28 @@ impl Default for ProducerConfig {
         ProducerConfig {
             acks: -1,
             request_timeout_ms: 10_000,
-            max_attempts: 5,
-            retry_backoff: Duration::from_millis(100),
+            // Fresh topics can take seconds to elect leaders; budget for it.
+            max_attempts: 20,
+            retry_backoff: Duration::from_millis(250),
+            compression: Compression::None,
+            batch_max_bytes: 16 * 1024,
         }
     }
+}
+
+/// One delivered batch: where it landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delivery {
+    pub topic: String,
+    pub partition: i32,
+    pub base_offset: i64,
+    pub records: usize,
+}
+
+#[derive(Debug, Default)]
+struct PendingBatch {
+    records: Vec<Record>,
+    estimated_bytes: usize,
 }
 
 /// A producer over a connected [`Cluster`].
@@ -53,6 +80,7 @@ impl Default for ProducerConfig {
 pub struct Producer {
     cluster: Cluster,
     config: ProducerConfig,
+    pending: HashMap<(String, i32), PendingBatch>,
 }
 
 impl Producer {
@@ -61,7 +89,11 @@ impl Producer {
     }
 
     pub fn with_config(cluster: Cluster, config: ProducerConfig) -> Producer {
-        Producer { cluster, config }
+        Producer {
+            cluster,
+            config,
+            pending: HashMap::new(),
+        }
     }
 
     /// The underlying cluster, e.g. for metadata queries.
@@ -69,15 +101,90 @@ impl Producer {
         &mut self.cluster
     }
 
-    /// Produce `records` as one batch to `topic[partition]`; returns the
-    /// broker-assigned base offset.
+    /// Buffer one record for `topic[partition]`. Delivers the partition's
+    /// whole buffer (as one batch) when it passes
+    /// [`ProducerConfig::batch_max_bytes`]; otherwise records wait for
+    /// [`Producer::flush`].
+    pub async fn enqueue(
+        &mut self,
+        topic: &str,
+        partition: i32,
+        record: Record,
+    ) -> Result<Option<Delivery>, ClientError> {
+        let pending = self
+            .pending
+            .entry((topic.to_owned(), partition))
+            .or_default();
+        pending.estimated_bytes += estimate_record_size(&record);
+        pending.records.push(record);
+        if pending.estimated_bytes >= self.config.batch_max_bytes {
+            return Ok(Some(self.flush_partition(topic, partition).await?));
+        }
+        Ok(None)
+    }
+
+    /// Records currently buffered across all partitions.
+    pub fn buffered(&self) -> usize {
+        self.pending.values().map(|p| p.records.len()).sum()
+    }
+
+    /// Deliver every buffered partition, one batch each. On error,
+    /// undelivered partitions keep their buffers.
+    pub async fn flush(&mut self) -> Result<Vec<Delivery>, ClientError> {
+        let mut keys: Vec<(String, i32)> = self.pending.keys().cloned().collect();
+        keys.sort();
+        let mut deliveries = Vec::new();
+        for (topic, partition) in keys {
+            deliveries.push(self.flush_partition(&topic, partition).await?);
+        }
+        Ok(deliveries)
+    }
+
+    async fn flush_partition(
+        &mut self,
+        topic: &str,
+        partition: i32,
+    ) -> Result<Delivery, ClientError> {
+        let pending = self
+            .pending
+            .remove(&(topic.to_owned(), partition))
+            .unwrap_or_default();
+        let count = pending.records.len();
+        match self
+            .produce(topic, partition, pending.records.clone())
+            .await
+        {
+            Ok(base_offset) => Ok(Delivery {
+                topic: topic.to_owned(),
+                partition,
+                base_offset,
+                records: count,
+            }),
+            Err(e) => {
+                // Put the batch back so a caller-level retry or later
+                // flush does not lose it.
+                let slot = self
+                    .pending
+                    .entry((topic.to_owned(), partition))
+                    .or_default();
+                slot.estimated_bytes += pending.estimated_bytes;
+                let mut records = pending.records;
+                records.append(&mut slot.records);
+                slot.records = records;
+                Err(e)
+            }
+        }
+    }
+
+    /// Produce `records` as one batch to `topic[partition]`, compressed
+    /// per the config; returns the broker-assigned base offset.
     pub async fn produce(
         &mut self,
         topic: &str,
         partition: i32,
         records: Vec<Record>,
     ) -> Result<i64, ClientError> {
-        let set = encode_batch(records)?;
+        let set = encode_batch(records, self.config.compression)?;
         let mut last = None;
         for attempt in 0..self.config.max_attempts {
             if attempt > 0 {
@@ -167,9 +274,22 @@ impl Producer {
     }
 }
 
+/// Rough wire footprint of one record, for the batch-size trigger.
+fn estimate_record_size(record: &Record) -> usize {
+    let payload = record.key.as_ref().map_or(0, |k| k.len())
+        + record.value.as_ref().map_or(0, |v| v.len())
+        + record
+            .headers
+            .iter()
+            .map(|h| h.key.len() + h.value.as_ref().map_or(0, |v| v.len()) + 8)
+            .sum::<usize>();
+    payload + 24
+}
+
 /// Assemble one record batch: offset deltas by position, timestamps
-/// anchored at now, producer id -1 (not idempotent).
-fn encode_batch(mut records: Vec<Record>) -> Result<Vec<u8>, ClientError> {
+/// anchored at now, producer id -1 (not idempotent), records compressed
+/// with `codec`.
+fn encode_batch(mut records: Vec<Record>, codec: Compression) -> Result<Vec<u8>, ClientError> {
     if records.is_empty() {
         return Err(ClientError::ProtocolViolation(
             "cannot produce an empty record set".into(),
@@ -186,15 +306,30 @@ fn encode_batch(mut records: Vec<Record>) -> Result<Vec<u8>, ClientError> {
     }
     let max_delta = records.iter().map(|r| r.timestamp_delta).max().unwrap_or(0);
     let last = records.len() - 1;
+    let batch_records = if codec == Compression::None {
+        Records::Plain(records)
+    } else {
+        // Compression covers the serialized records, not the count.
+        let count = i32::try_from(records.len()).unwrap_or(i32::MAX);
+        let mut payload = BytesMut::new();
+        for record in &records {
+            record.encode(&mut payload)?;
+        }
+        Records::Compressed {
+            count,
+            payload: compress(codec, &payload)?,
+        }
+    };
     let batch = RecordBatch {
         base_offset: 0,
+        attributes: attribute_bits(codec),
         last_offset_delta: i32::try_from(last).unwrap_or(i32::MAX),
         base_timestamp: now_ms,
         max_timestamp: now_ms + max_delta,
         producer_id: -1,
         producer_epoch: -1,
         base_sequence: -1,
-        records: Records::Plain(records),
+        records: batch_records,
         ..Default::default()
     };
     let mut out = BytesMut::new();

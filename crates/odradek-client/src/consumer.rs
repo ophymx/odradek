@@ -26,7 +26,7 @@ use odradek_protocol::messages::offset_fetch_request::{
     OffsetFetchRequest, OffsetFetchRequestTopic,
 };
 use odradek_protocol::messages::offset_fetch_response::OffsetFetchResponse;
-use odradek_protocol::records::{Compression, RecordHeader, Records, decode_set};
+use odradek_protocol::records::{Record, RecordHeader, Records, decode_set};
 
 use crate::cluster::Cluster;
 use crate::error::ClientError;
@@ -72,8 +72,10 @@ impl Default for ConsumerConfig {
             max_wait_ms: 500,
             min_bytes: 1,
             partition_max_bytes: 1 << 20,
-            max_attempts: 5,
-            retry_backoff: Duration::from_millis(100),
+            // Coordinator bootstrap (the broker creating its internal
+            // offsets topic on first use) can take seconds; budget for it.
+            max_attempts: 20,
+            retry_backoff: Duration::from_millis(250),
         }
     }
 }
@@ -419,18 +421,23 @@ impl Consumer {
             if batch.is_control() {
                 continue;
             }
-            let plain = match &batch.records {
+            let materialized;
+            let plain: &[Record] = match &batch.records {
                 Records::Plain(records) => records,
-                Records::Compressed { .. } => {
-                    return Err(ClientError::UnsupportedCompression(
-                        match batch.compression() {
-                            Compression::Gzip => "gzip",
-                            Compression::Snappy => "snappy",
-                            Compression::Lz4 => "lz4",
-                            Compression::Zstd => "zstd",
-                            _ => "unknown codec",
-                        },
-                    ));
+                Records::Compressed { count, payload } => {
+                    let mut data = crate::compression::decompress(batch.compression(), payload)?;
+                    let mut records = Vec::new();
+                    for _ in 0..*count {
+                        records.push(Record::decode(&mut data)?);
+                    }
+                    if !data.is_empty() {
+                        return Err(ClientError::ProtocolViolation(format!(
+                            "{} byte(s) left after the batch's {count} compressed records",
+                            data.len()
+                        )));
+                    }
+                    materialized = records;
+                    &materialized
                 }
             };
             for record in plain {

@@ -20,6 +20,7 @@
 //! compression, and `consumer` are next.
 
 pub mod cluster;
+mod compression;
 pub mod conn;
 pub mod consumer;
 pub mod error;
@@ -32,7 +33,7 @@ pub use consumer::{ConsumedRecord, Consumer, ConsumerConfig, FetchResult};
 pub use error::ClientError;
 pub use negotiate::ApiVersionRanges;
 pub use odradek_protocol as protocol;
-pub use producer::{Producer, ProducerConfig};
+pub use producer::{Delivery, Producer, ProducerConfig};
 
 /// Configuration shared by every entry point of the client.
 #[derive(Debug, Clone)]

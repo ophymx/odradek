@@ -53,9 +53,12 @@ Early but functional end to end:
   ApiVersions negotiation (including the `UNSUPPORTED_VERSION` downgrade
   path); the cluster layer: metadata discovery, a per-broker connection
   pool with per-broker version ranges, and partition-leader routing; and
-  a minimal producer and consumer: the producer encodes record batches
-  and retries through leadership changes by invalidating stale metadata;
-  the consumer fetches and materializes records with absolute offsets,
+  a producer and consumer: the producer batches records per partition
+  (size-triggered or explicit flush), compresses with gzip or lz4 (pure
+  Rust codecs; compression is a client concern — the protocol crate
+  carries payloads raw), and retries through leadership changes by
+  invalidating stale metadata; the consumer fetches, decompresses, and
+  materializes records with absolute offsets,
   skipping control batches and pre-offset records, with earliest/latest
   lookup via ListOffsets and durable positions as a simple (non-member)
   consumer — coordinator discovery plus offset commit/fetch under a
@@ -97,8 +100,8 @@ Early but functional end to end:
   enforced by test: a check no fault can trip, or a fault no check
   detects, fails calibration.
 
-Next: producer batching/compression, and full consumer-group
-membership (join/sync/heartbeat) on top of the coordinator layer.
+Next: full consumer-group membership (join/sync/heartbeat) on top of
+the coordinator layer, and snappy/zstd codecs.
 
 ```sh
 cargo test --workspace       # everything
