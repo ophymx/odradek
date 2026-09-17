@@ -54,6 +54,7 @@ async fn odradek_client_passes_the_client_checks() {
     let mut cluster = Cluster::connect(ClientConfig {
         bootstrap_servers: vec![addr],
         client_id: "odradek".into(),
+        ..Default::default()
     })
     .await
     .unwrap();
@@ -142,6 +143,7 @@ async fn odradek_client_recovers_from_leader_change() {
     let cluster = Cluster::connect(ClientConfig {
         bootstrap_servers: vec![addr],
         client_id: "odradek".into(),
+        ..Default::default()
     })
     .await
     .unwrap();

@@ -19,6 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: ClientConfig {
             bootstrap_servers: vec![bootstrap.clone()],
             client_id: "odradek-sse".into(),
+            ..Default::default()
         },
     };
     let app = router(SseState::new(factory, PumpConfig::default()));

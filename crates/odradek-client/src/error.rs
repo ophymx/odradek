@@ -36,6 +36,13 @@ pub enum ClientError {
     /// materialize yet.
     #[error("compressed batches are not supported yet ({0})")]
     UnsupportedCompression(&'static str),
+    /// TLS configuration or handshake failure.
+    #[error("tls: {0}")]
+    Tls(String),
+    /// SASL authentication failure (bad credentials, unsupported
+    /// mechanism, or a malformed exchange).
+    #[error("sasl: {0}")]
+    Sasl(String),
 }
 
 impl ClientError {

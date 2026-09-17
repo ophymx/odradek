@@ -289,5 +289,8 @@ impl Cluster {
 async fn dial(addr: &str, config: &ClientConfig) -> Result<Broker, ClientError> {
     let conn = Connection::connect(addr, config).await?;
     let ranges = conn.negotiate().await?;
+    if let Some(sasl) = &config.sasl {
+        crate::sasl::authenticate(&conn, &ranges, sasl).await?;
+    }
     Ok(Broker { conn, ranges })
 }

@@ -27,6 +27,8 @@ pub mod error;
 pub mod group;
 pub mod negotiate;
 pub mod producer;
+pub mod sasl;
+pub mod tls;
 
 pub use cluster::Cluster;
 pub use conn::Connection;
@@ -36,6 +38,8 @@ pub use group::{GroupConfig, GroupMember, HeartbeatStatus};
 pub use negotiate::ApiVersionRanges;
 pub use odradek_protocol as protocol;
 pub use producer::{Delivery, Producer, ProducerConfig};
+pub use sasl::{Mechanism, SaslConfig};
+pub use tls::Tls;
 
 /// Configuration shared by every entry point of the client.
 #[derive(Debug, Clone)]
@@ -44,6 +48,11 @@ pub struct ClientConfig {
     pub bootstrap_servers: Vec<String>,
     /// Client id reported to the broker in every request header.
     pub client_id: String,
+    /// TLS for every broker connection (default: plaintext).
+    pub tls: Tls,
+    /// SASL credentials, authenticated on every connection right after
+    /// version negotiation (default: none).
+    pub sasl: Option<SaslConfig>,
 }
 
 impl Default for ClientConfig {
@@ -51,6 +60,8 @@ impl Default for ClientConfig {
         Self {
             bootstrap_servers: vec!["localhost:9092".to_owned()],
             client_id: "odradek".to_owned(),
+            tls: Tls::None,
+            sasl: None,
         }
     }
 }

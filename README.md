@@ -17,8 +17,8 @@ the protocol as the first-class artifact and builds outward from it.
 | [`odradek-web-sse`](crates/odradek-web-sse) | Server-Sent Events transport over the bridge: an embeddable axum router with `Last-Event-ID` resume — a reconnecting `EventSource` never misses or repeats a record. |
 | [`odradek-web-ws`](crates/odradek-web-ws) | WebSocket transport over the bridge: the same streams as JSON text frames, offset-resumable via `from=`. |
 
-Next in the constellation: TLS/SASL in the client — the last gate
-before real-world clusters.
+With TLS and SASL in the client, the whole constellation — client,
+bridge, and transports — can face real-world clusters.
 
 ## Design principles
 
@@ -53,7 +53,10 @@ Early but functional end to end:
   through `unknown_tagged_fields`.
 - `odradek-client`: framed connection with correlation-id pipelining and
   ApiVersions negotiation (including the `UNSUPPORTED_VERSION` downgrade
-  path); the cluster layer: metadata discovery, a per-broker connection
+  path), over plaintext or TLS (rustls; Mozilla roots, custom CA, or a
+  caller-built config), with optional SASL — PLAIN and
+  SCRAM-SHA-256/512 per RFC 5802, server signature verified, checked
+  against the RFC 7677 vector — authenticated on every connection; the cluster layer: metadata discovery, a per-broker connection
   pool with per-broker version ranges, and partition-leader routing; and
   a producer and consumer: the producer batches records per partition
   (size-triggered or explicit flush), compresses with gzip or lz4 (pure
@@ -135,8 +138,13 @@ Early but functional end to end:
   every event's id, so `Last-Event-ID` reconnects resume all
   partitions loss-free (unseen partitions replay from earliest).
 
-Next: TLS/SASL in the client, snappy/zstd codecs, and the KIP-848
-consumer protocol.
+TLS and SASL are validated live (`secure_smoke` example) against
+Kafka's SASL_PLAINTEXT, SSL, and SASL_SSL listeners: PLAIN and both
+SCRAM variants authenticate, wrong passwords and untrusted
+certificates fail cleanly.
+
+Next: snappy/zstd codecs, the KIP-848 consumer protocol, and
+crates.io publication.
 
 ```sh
 cargo test --workspace       # everything

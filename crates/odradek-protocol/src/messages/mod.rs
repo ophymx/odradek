@@ -31,6 +31,10 @@ pub mod produce_request;
 pub mod produce_response;
 pub mod request_header;
 pub mod response_header;
+pub mod sasl_authenticate_request;
+pub mod sasl_authenticate_response;
+pub mod sasl_handshake_request;
+pub mod sasl_handshake_response;
 pub mod sync_group_request;
 pub mod sync_group_response;
 
@@ -62,6 +66,10 @@ pub use produce_request::ProduceRequest;
 pub use produce_response::ProduceResponse;
 pub use request_header::RequestHeader;
 pub use response_header::ResponseHeader;
+pub use sasl_authenticate_request::SaslAuthenticateRequest;
+pub use sasl_authenticate_response::SaslAuthenticateResponse;
+pub use sasl_handshake_request::SaslHandshakeRequest;
+pub use sasl_handshake_response::SaslHandshakeResponse;
 pub use sync_group_request::SyncGroupRequest;
 pub use sync_group_response::SyncGroupResponse;
 
@@ -82,6 +90,8 @@ pub fn request_is_flexible(api_key: i16, api_version: i16) -> Option<bool> {
         8 => Some(offset_commit_request::is_flexible(api_version)),
         9 => Some(offset_fetch_request::is_flexible(api_version)),
         0 => Some(produce_request::is_flexible(api_version)),
+        36 => Some(sasl_authenticate_request::is_flexible(api_version)),
+        17 => Some(sasl_handshake_request::is_flexible(api_version)),
         14 => Some(sync_group_request::is_flexible(api_version)),
         _ => None,
     }

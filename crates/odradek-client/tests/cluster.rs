@@ -514,6 +514,7 @@ fn config_for(cluster: &FakeCluster) -> ClientConfig {
     ClientConfig {
         bootstrap_servers: vec![cluster.endpoints[0].1.clone()],
         client_id: "odradek".into(),
+        ..Default::default()
     }
 }
 
@@ -888,6 +889,7 @@ async fn bootstrap_falls_through_dead_servers() {
     let config = ClientConfig {
         bootstrap_servers: vec![dead_addr, fake.endpoints[0].1.clone()],
         client_id: "odradek".into(),
+        ..Default::default()
     };
     let mut cluster = Cluster::connect(config).await.unwrap();
     cluster.refresh_metadata(&[TOPIC]).await.unwrap();

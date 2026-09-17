@@ -23,6 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ClientConfig {
         bootstrap_servers: vec![bootstrap],
         client_id: "odradek-group-example".into(),
+        ..Default::default()
     };
     let topic = format!(
         "odradek-group-{}-{}",

@@ -20,6 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: ClientConfig {
             bootstrap_servers: vec![bootstrap.clone()],
             client_id: "odradek-bridge".into(),
+            ..Default::default()
         },
     };
     // Each transport keeps its own hub (and thus its own pumps); one

@@ -13,19 +13,74 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use bytes::{BufMut, Bytes, BytesMut};
 use odradek_protocol::header::{request_header_version, response_header_version};
 use odradek_protocol::messages::request_header::RequestHeader;
 use odradek_protocol::messages::response_header::ResponseHeader;
 use odradek_protocol::wire;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::pki_types::ServerName;
+
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::ClientConfig;
 use crate::error::ClientError;
+use crate::tls::Tls;
+
+/// The wire under a connection: plaintext TCP or TLS over it.
+enum Transport {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for Transport {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Transport::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            Transport::Tls(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Transport {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Transport::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            Transport::Tls(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Transport::Plain(s) => Pin::new(s).poll_flush(cx),
+            Transport::Tls(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Transport::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            Transport::Tls(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+type ReadHalf = tokio::io::ReadHalf<Transport>;
+type WriteHalf = tokio::io::WriteHalf<Transport>;
 
 /// Refuse frames larger than this (64 MiB) as a protocol violation rather
 /// than attempting the allocation.
@@ -53,7 +108,7 @@ impl Shared {
 
 struct Inner {
     shared: Arc<Shared>,
-    writer: AsyncMutex<OwnedWriteHalf>,
+    writer: AsyncMutex<WriteHalf>,
     next_correlation: AtomicI32,
     client_id: String,
     reader: JoinHandle<()>,
@@ -79,13 +134,27 @@ impl std::fmt::Debug for Connection {
 }
 
 impl Connection {
-    /// Open a TCP connection to `addr` (`host:port`). No handshake is
-    /// performed here; call [`Connection::negotiate`] to exchange
-    /// ApiVersions.
+    /// Open a connection to `addr` (`host:port`), wrapped in TLS when
+    /// the config says so. No Kafka handshake is performed here; call
+    /// [`Connection::negotiate`] to exchange ApiVersions.
     pub async fn connect(addr: &str, config: &ClientConfig) -> Result<Connection, ClientError> {
         let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
-        let (read_half, write_half) = stream.into_split();
+        let transport = match &config.tls {
+            Tls::None => Transport::Plain(stream),
+            Tls::Rustls(tls_config) => {
+                let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
+                let server_name = ServerName::try_from(host.to_owned())
+                    .map_err(|e| ClientError::Tls(format!("bad server name {host:?}: {e}")))?;
+                let connector = TlsConnector::from(Arc::clone(tls_config));
+                let tls = connector
+                    .connect(server_name, stream)
+                    .await
+                    .map_err(|e| ClientError::Tls(format!("handshake with {addr}: {e}")))?;
+                Transport::Tls(Box::new(tls))
+            }
+        };
+        let (read_half, write_half) = tokio::io::split(transport);
 
         let shared = Arc::new(Shared {
             in_flight: StdMutex::new(HashMap::new()),
@@ -164,7 +233,7 @@ impl Connection {
     }
 }
 
-async fn reader_loop(mut read_half: OwnedReadHalf, shared: Arc<Shared>) {
+async fn reader_loop(mut read_half: ReadHalf, shared: Arc<Shared>) {
     loop {
         match read_response(&mut read_half, &shared).await {
             Ok(()) => {}
@@ -176,7 +245,7 @@ async fn reader_loop(mut read_half: OwnedReadHalf, shared: Arc<Shared>) {
     }
 }
 
-async fn read_response(read_half: &mut OwnedReadHalf, shared: &Shared) -> Result<(), ClientError> {
+async fn read_response(read_half: &mut ReadHalf, shared: &Shared) -> Result<(), ClientError> {
     let mut len_bytes = [0u8; 4];
     read_half.read_exact(&mut len_bytes).await?;
     let len = i32::from_be_bytes(len_bytes);
