@@ -10,8 +10,8 @@
 use std::collections::HashMap;
 use std::io;
 
-use bytes::{BufMut, Bytes, BytesMut};
-use odradek_protocol::header;
+use bytes::{Bytes, BytesMut};
+use odradek_protocol::messages::api_versions_request::ApiVersionsRequest;
 use odradek_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
 use odradek_protocol::messages::create_topics_request::CreateTopicsRequest;
 use odradek_protocol::messages::create_topics_response::{
@@ -32,12 +32,13 @@ use odradek_protocol::messages::produce_response::{
 use odradek_protocol::messages::request_header::RequestHeader;
 use odradek_protocol::messages::response_header::ResponseHeader;
 use odradek_protocol::records;
+use odradek_protocol::{ErrorCode, frame, header};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
 /// The newest ApiVersions version the subject supports.
-pub const MAX_SUPPORTED_API_VERSIONS: i16 = 4;
+pub const MAX_SUPPORTED_API_VERSIONS: i16 = ApiVersionsRequest::MAX_VERSION;
 
 /// A single deliberate protocol violation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,13 +144,35 @@ impl Drop for SubjectServer {
 }
 
 fn advertised_keys() -> Vec<ApiVersion> {
-    // Only versions the subject actually implements.
+    // Only versions the subject actually implements — the full schema
+    // ranges: its produce/fetch handlers resolve topic ids, so even the
+    // id-addressed (v13+) versions are served.
     [
-        (18, 0, MAX_SUPPORTED_API_VERSIONS),
-        (0, 3, ProduceRequest::MAX_VERSION),
-        (1, 4, FetchRequest::MAX_VERSION),
-        (3, 0, 13),
-        (19, 2, 7),
+        (
+            ApiVersionsRequest::API_KEY,
+            ApiVersionsRequest::MIN_VERSION,
+            MAX_SUPPORTED_API_VERSIONS,
+        ),
+        (
+            ProduceRequest::API_KEY,
+            ProduceRequest::MIN_VERSION,
+            ProduceRequest::MAX_VERSION,
+        ),
+        (
+            FetchRequest::API_KEY,
+            FetchRequest::MIN_VERSION,
+            FetchRequest::MAX_VERSION,
+        ),
+        (
+            MetadataRequest::API_KEY,
+            MetadataRequest::MIN_VERSION,
+            MetadataRequest::MAX_VERSION,
+        ),
+        (
+            CreateTopicsRequest::API_KEY,
+            CreateTopicsRequest::MIN_VERSION,
+            CreateTopicsRequest::MAX_VERSION,
+        ),
     ]
     .into_iter()
     .map(|(api_key, min_version, max_version)| {
@@ -203,7 +226,11 @@ async fn handle_connection(mut stream: TcpStream, faults: Vec<Fault>) {
         if stream.read_exact(&mut len_bytes).await.is_err() {
             return;
         }
-        let len = i32::from_be_bytes(len_bytes).max(0) as usize;
+        // A negative or implausibly large length prefix is a wire
+        // violation: close the connection, never clamp.
+        let Ok(len) = frame::check_len(len_bytes, frame::DEFAULT_MAX_FRAME) else {
+            return;
+        };
         let mut frame = vec![0u8; len];
         if stream.read_exact(&mut frame).await.is_err() {
             return;
@@ -215,11 +242,11 @@ async fn handle_connection(mut stream: TcpStream, faults: Vec<Fault>) {
         let api_key = i16::from_be_bytes([frame[0], frame[1]]);
         let api_version = i16::from_be_bytes([frame[2], frame[3]]);
         let out = match api_key {
-            18 => api_versions_exchange(frame, api_version, &faults),
-            3 => metadata_exchange(frame, api_version, local_port, &faults),
-            19 => create_topics_exchange(frame, api_version, &mut state),
-            0 => produce_exchange(frame, api_version, &faults, &mut state),
-            1 => fetch_exchange(frame, api_version, &faults, &state),
+            ApiVersionsRequest::API_KEY => api_versions_exchange(frame, api_version, &faults),
+            MetadataRequest::API_KEY => metadata_exchange(frame, api_version, local_port, &faults),
+            CreateTopicsRequest::API_KEY => create_topics_exchange(frame, api_version, &mut state),
+            ProduceRequest::API_KEY => produce_exchange(frame, api_version, &faults, &mut state),
+            FetchRequest::API_KEY => fetch_exchange(frame, api_version, &faults, &state),
             _ => return,
         };
         let Some(out) = out else {
@@ -247,14 +274,15 @@ fn frame_response(
     let mut resp_header = ResponseHeader::default();
     resp_header.correlation_id = correlation_id;
     let mut out = BytesMut::new();
-    out.put_i32(0);
-    resp_header.encode(&mut out, header_version).ok()?;
-    body(&mut out);
-    if trailing_garbage {
-        out.extend_from_slice(&[0xde, 0xad, 0xbe]);
-    }
-    let frame_len = i32::try_from(out.len() - 4).unwrap();
-    out[..4].copy_from_slice(&frame_len.to_be_bytes());
+    frame::frame(&mut out, |out| {
+        resp_header.encode(out, header_version)?;
+        body(out);
+        if trailing_garbage {
+            out.extend_from_slice(&[0xde, 0xad, 0xbe]);
+        }
+        Ok(())
+    })
+    .ok()?;
     Some(out)
 }
 
@@ -262,33 +290,40 @@ fn api_versions_exchange(mut frame: Bytes, api_version: i16, faults: &[Fault]) -
     let has = |f: Fault| faults.contains(&f);
     let supported = api_version <= MAX_SUPPORTED_API_VERSIONS;
 
-    // For unknown future versions, parse the header at our newest known
-    // header version — the same rule real brokers apply.
-    let header_version = if supported && api_version < 3 { 1 } else { 2 };
+    // For unknown future versions this parses the header at our newest
+    // known header version — the same rule real brokers apply, and the
+    // shared table's answer for any v3+ request.
+    let header_version = header::request_header_version(ApiVersionsRequest::API_KEY, api_version)?;
     let header = RequestHeader::decode(&mut frame, header_version).ok()?;
 
     let mut keys = advertised_keys();
     if has(Fault::OmitApiVersionsKey) {
-        keys.retain(|k| k.api_key != 18);
+        keys.retain(|k| k.api_key != ApiVersionsRequest::API_KEY);
     }
     if has(Fault::InvertedVersionRange) {
-        if let Some(k) = keys.iter_mut().find(|k| k.api_key == 0) {
+        if let Some(k) = keys
+            .iter_mut()
+            .find(|k| k.api_key == ProduceRequest::API_KEY)
+        {
             (k.min_version, k.max_version) = (12, 3);
         }
     }
 
     let (error_code, encode_at) = if supported {
-        (0, api_version)
+        (ErrorCode::NONE.0, api_version)
     } else {
         if has(Fault::AdvertiseWrongMaxInError) {
-            if let Some(k) = keys.iter_mut().find(|k| k.api_key == 18) {
+            if let Some(k) = keys
+                .iter_mut()
+                .find(|k| k.api_key == ApiVersionsRequest::API_KEY)
+            {
                 k.max_version += 1;
             }
         }
         let error_code = if has(Fault::WrongErrorOnUnsupportedVersion) {
-            0
+            ErrorCode::NONE.0
         } else {
-            35
+            ErrorCode::UNSUPPORTED_VERSION.0
         };
         let encode_at = if has(Fault::ErrorBodyNotV0) { 3 } else { 0 };
         (error_code, encode_at)
@@ -327,7 +362,7 @@ fn metadata_exchange(
         return None;
     }
     let flexible = metadata_request::is_flexible(api_version);
-    let header_version = if flexible { 2 } else { 1 };
+    let header_version = header::request_header_version(MetadataRequest::API_KEY, api_version)?;
     let header = RequestHeader::decode(&mut frame, header_version).ok()?;
     let request = MetadataRequest::decode(&mut frame, api_version).ok()?;
 
@@ -437,7 +472,7 @@ fn produce_exchange(
             let (Some(name), false) = (&resolved, refuse_id) else {
                 let mut entry = PartitionProduceResponse::default();
                 entry.index = partition.index;
-                entry.error_code = 100; // UNKNOWN_TOPIC_ID
+                entry.error_code = ErrorCode::UNKNOWN_TOPIC_ID.0;
                 entry.base_offset = -1;
                 entry.log_append_time_ms = -1;
                 partition_responses.push(entry);
@@ -541,7 +576,11 @@ fn fetch_exchange(
                             let mut data = PartitionData::default();
                             data.partition_index = p.partition;
                             // Unknown id vs unknown name/partition.
-                            data.error_code = if topic.topic.is_empty() { 100 } else { 3 };
+                            data.error_code = if topic.topic.is_empty() {
+                                ErrorCode::UNKNOWN_TOPIC_ID.0
+                            } else {
+                                ErrorCode::UNKNOWN_TOPIC_OR_PARTITION.0
+                            };
                             data
                         }
                     }

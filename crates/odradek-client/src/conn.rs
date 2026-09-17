@@ -16,11 +16,11 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
+use odradek_protocol::frame;
 use odradek_protocol::header::{request_header_version, response_header_version};
 use odradek_protocol::messages::request_header::RequestHeader;
 use odradek_protocol::messages::response_header::ResponseHeader;
-use odradek_protocol::wire;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 #[cfg(feature = "tls")]
@@ -89,10 +89,6 @@ impl AsyncWrite for Transport {
 
 type ReadHalf = tokio::io::ReadHalf<Transport>;
 type WriteHalf = tokio::io::WriteHalf<Transport>;
-
-/// Refuse frames larger than this (64 MiB) as a protocol violation rather
-/// than attempting the allocation.
-const MAX_FRAME_SIZE: i32 = 64 * 1024 * 1024;
 
 struct Pending {
     response_header_version: i16,
@@ -237,12 +233,12 @@ impl Connection {
         header.request_api_version = api_version;
         header.correlation_id = correlation_id;
         header.client_id = Some(inner.client_id.clone());
-        let mut frame = BytesMut::new();
-        frame.put_i32(0); // frame length, patched below
-        header.encode(&mut frame, header_version)?;
-        frame.extend_from_slice(body);
-        let frame_len = i32::try_from(frame.len() - 4).expect("frame length fits i32");
-        frame[..4].copy_from_slice(&frame_len.to_be_bytes());
+        let mut framed = BytesMut::new();
+        frame::frame(&mut framed, |buf| {
+            header.encode(buf, header_version)?;
+            buf.extend_from_slice(body);
+            Ok(())
+        })?;
 
         let (reply_tx, reply_rx) = oneshot::channel();
         inner.shared.in_flight.lock().unwrap().insert(
@@ -256,7 +252,7 @@ impl Connection {
         // Register-then-write: the response cannot beat the table entry.
         {
             let mut writer = inner.writer.lock().await;
-            if let Err(e) = writer.write_all(&frame).await {
+            if let Err(e) = writer.write_all(&framed).await {
                 inner
                     .shared
                     .in_flight
@@ -286,19 +282,17 @@ async fn reader_loop(mut read_half: ReadHalf, shared: Arc<Shared>) {
 async fn read_response(read_half: &mut ReadHalf, shared: &Shared) -> Result<(), ClientError> {
     let mut len_bytes = [0u8; 4];
     read_half.read_exact(&mut len_bytes).await?;
-    let len = i32::from_be_bytes(len_bytes);
-    if !(0..=MAX_FRAME_SIZE).contains(&len) {
-        return Err(ClientError::ProtocolViolation(format!(
-            "response frame length {len} out of range"
-        )));
-    }
-    let mut frame = vec![0u8; len as usize];
+    // Refuse hostile length prefixes (negative, or above 64 MiB) as a
+    // protocol violation rather than attempting the allocation.
+    let len = frame::check_len(len_bytes, frame::DEFAULT_MAX_FRAME)
+        .map_err(|e| ClientError::ProtocolViolation(format!("response frame: {e}")))?;
+    let mut frame = vec![0u8; len];
     read_half.read_exact(&mut frame).await?;
     let mut frame = Bytes::from(frame);
 
     // Correlation id leads every response header version; peek it, then
     // decode the header at the version recorded for that request.
-    let correlation_id = wire::get_i32(&mut frame.clone())
+    let correlation_id = frame::peek_correlation_id(&frame)
         .map_err(|e| ClientError::ProtocolViolation(format!("short response header: {e}")))?;
     let pending = shared.in_flight.lock().unwrap().remove(&correlation_id);
     let Some(pending) = pending else {

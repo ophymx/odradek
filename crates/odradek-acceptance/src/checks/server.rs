@@ -19,7 +19,7 @@ use odradek_protocol::messages::create_topics_request::{CreatableTopic, CreateTo
 use odradek_protocol::messages::create_topics_response::CreateTopicsResponse;
 use odradek_protocol::messages::fetch_request::{FetchPartition, FetchRequest, FetchTopic};
 use odradek_protocol::messages::fetch_response::FetchResponse;
-use odradek_protocol::messages::metadata_request::{self, MetadataRequest};
+use odradek_protocol::messages::metadata_request::MetadataRequest;
 use odradek_protocol::messages::metadata_response::MetadataResponse;
 use odradek_protocol::messages::produce_request::{
     PartitionProduceData, ProduceRequest, TopicProduceData,
@@ -28,7 +28,7 @@ use odradek_protocol::messages::produce_response::ProduceResponse;
 use odradek_protocol::messages::request_header::RequestHeader;
 use odradek_protocol::messages::response_header::ResponseHeader;
 use odradek_protocol::records::{Record, RecordBatch, RecordHeader, Records, decode_set};
-use odradek_protocol::{ErrorCode, header, wire};
+use odradek_protocol::{ErrorCode, Message, frame, header};
 
 use crate::checks::{Check, Runner};
 use crate::raw::{RawConnection, WireError};
@@ -223,34 +223,6 @@ fn advertised_range(keys: &[ApiVersion], api_key: i16) -> Option<(i16, i16)> {
         .map(|v| (v.min_version, v.max_version))
 }
 
-/// Response types [`checked_call`] can decode.
-trait DecodeResponse: Sized {
-    fn decode_response(
-        buf: &mut Bytes,
-        version: i16,
-    ) -> Result<Self, odradek_protocol::DecodeError>;
-}
-
-macro_rules! impl_decode_response {
-    ($($ty:ty),+ $(,)?) => {
-        $(impl DecodeResponse for $ty {
-            fn decode_response(
-                buf: &mut Bytes,
-                version: i16,
-            ) -> Result<Self, odradek_protocol::DecodeError> {
-                Self::decode(buf, version)
-            }
-        })+
-    };
-}
-impl_decode_response!(
-    ApiVersionsResponse,
-    MetadataResponse,
-    CreateTopicsResponse,
-    ProduceResponse,
-    FetchResponse,
-);
-
 /// The wire coordinates of one exchange.
 struct Call {
     api_key: i16,
@@ -267,7 +239,7 @@ struct Call {
 /// request, validate the correlation echo, decode the response header and
 /// body, and reject trailing bytes. Produce, Fetch, and CreateTopics
 /// responses get exactly the same scrutiny as ApiVersions and Metadata.
-async fn checked_call<T: DecodeResponse>(
+async fn checked_call<T: Message>(
     conn: &mut RawConnection,
     call: Call,
     body: &[u8],
@@ -281,7 +253,7 @@ async fn checked_call<T: DecodeResponse>(
     let mut frame = conn
         .round_trip(&req_header, call.request_header_version, body)
         .await?;
-    let echoed = wire::get_i32(&mut frame.clone()).map_err(|_| {
+    let echoed = frame::peek_correlation_id(&frame).map_err(|_| {
         CheckError::Violation("response frame shorter than a correlation id".into())
     })?;
     if echoed != call.correlation_id {
@@ -293,7 +265,7 @@ async fn checked_call<T: DecodeResponse>(
     let hv = call.response_header_version;
     ResponseHeader::decode(&mut frame, hv)
         .map_err(|e| CheckError::Violation(format!("response header (decoded as v{hv}): {e}")))?;
-    let resp = T::decode_response(&mut frame, call.decode_at).map_err(|e| {
+    let resp = T::decode(&mut frame, call.decode_at).map_err(|e| {
         CheckError::Violation(format!(
             "response body (decoded as v{}): {e}",
             call.decode_at
@@ -310,7 +282,7 @@ async fn checked_call<T: DecodeResponse>(
 
 /// One exchange at a negotiated version on an existing connection, header
 /// versions derived from the api tables.
-async fn api_call<T: DecodeResponse>(
+async fn api_call<T: Message>(
     conn: &mut RawConnection,
     api_key: i16,
     version: i16,
@@ -530,17 +502,13 @@ async fn metadata_exchange(
     req.encode(&mut body, version)
         .map_err(|e| CheckError::Infra(e.to_string()))?;
 
-    let flexible = metadata_request::is_flexible(version);
-    checked_call(
+    // Header versions come from the shared tables: request header v2 and
+    // response header v1 for flexible (v9+) versions, v1/v0 below.
+    api_call(
         &mut conn,
-        Call {
-            api_key: MetadataRequest::API_KEY,
-            api_version: version,
-            request_header_version: if flexible { 2 } else { 1 },
-            response_header_version: if flexible { 1 } else { 0 },
-            correlation_id,
-            decode_at: version,
-        },
+        MetadataRequest::API_KEY,
+        version,
+        correlation_id,
         &body,
     )
     .await

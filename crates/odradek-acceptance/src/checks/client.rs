@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use odradek_protocol::header::{request_header_version, response_header_version};
 use odradek_protocol::messages::api_versions_request::ApiVersionsRequest;
 use odradek_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
@@ -32,6 +32,7 @@ use odradek_protocol::messages::produce_request::ProduceRequest;
 use odradek_protocol::messages::produce_response::ProduceResponse;
 use odradek_protocol::messages::request_header::RequestHeader;
 use odradek_protocol::messages::response_header::ResponseHeader;
+use odradek_protocol::{ErrorCode, Message, frame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -42,10 +43,33 @@ use crate::report::{CheckOutcome, Report};
 use crate::{CheckId, SubjectRole, Verdict};
 
 /// (api key, min, max) the harness advertises — exactly the apis it can
-/// parse, so version discipline is checkable.
-const ADVERTISED: &[(i16, i16, i16)] = &[(18, 0, 4), (0, 3, 12), (1, 4, 17), (3, 0, 13)];
+/// parse and answer, so version discipline is checkable. Produce and
+/// fetch are served across the full schema range: the harness resolves
+/// the id-addressed (v13+) forms through [`ROUTING_TOPIC_ID`].
+const ADVERTISED: &[(i16, i16, i16)] = &[
+    (
+        ApiVersionsRequest::API_KEY,
+        ApiVersionsRequest::MIN_VERSION,
+        MAX_API_VERSIONS,
+    ),
+    (
+        ProduceRequest::API_KEY,
+        ProduceRequest::MIN_VERSION,
+        ProduceRequest::MAX_VERSION,
+    ),
+    (
+        FetchRequest::API_KEY,
+        FetchRequest::MIN_VERSION,
+        FetchRequest::MAX_VERSION,
+    ),
+    (
+        MetadataRequest::API_KEY,
+        MetadataRequest::MIN_VERSION,
+        MetadataRequest::MAX_VERSION,
+    ),
+];
 
-const MAX_API_VERSIONS: i16 = 4;
+const MAX_API_VERSIONS: i16 = ApiVersionsRequest::MAX_VERSION;
 
 /// How many brokers the harness impersonates.
 pub const BROKER_COUNT: i32 = 3;
@@ -202,10 +226,10 @@ impl ClusterView {
             .ok()
             .filter(|&p| p < leaders.len())
         else {
-            return 3; // UNKNOWN_TOPIC_OR_PARTITION
+            return ErrorCode::UNKNOWN_TOPIC_OR_PARTITION.0;
         };
         if leaders[slot] != node_id {
-            return 6; // NOT_LEADER_OR_FOLLOWER
+            return ErrorCode::NOT_LEADER_OR_FOLLOWER.0;
         }
         if self.fault == Some(HarnessFault::LeaderMove) {
             let already_moved = self
@@ -221,10 +245,10 @@ impl ClusterView {
                     .lock()
                     .unwrap()
                     .push(FaultEvent { partition, to_node });
-                return 6;
+                return ErrorCode::NOT_LEADER_OR_FOLLOWER.0;
             }
         }
-        0
+        ErrorCode::NONE.0
     }
 
     /// The fetch verdict for `partition` arriving at `node_id`: judged
@@ -235,9 +259,9 @@ impl ClusterView {
             .ok()
             .filter(|&p| p < leaders.len())
         {
-            Some(slot) if leaders[slot] == node_id => 0,
-            Some(_) => 6, // NOT_LEADER_OR_FOLLOWER
-            None => 3,    // UNKNOWN_TOPIC_OR_PARTITION
+            Some(slot) if leaders[slot] == node_id => ErrorCode::NONE.0,
+            Some(_) => ErrorCode::NOT_LEADER_OR_FOLLOWER.0,
+            None => ErrorCode::UNKNOWN_TOPIC_OR_PARTITION.0,
         }
     }
 }
@@ -387,11 +411,8 @@ async fn handle_conn(
 async fn read_frame(stream: &mut TcpStream) -> Option<Bytes> {
     let mut len_bytes = [0u8; 4];
     stream.read_exact(&mut len_bytes).await.ok()?;
-    let len = i32::from_be_bytes(len_bytes);
-    if !(0..=crate::raw::MAX_FRAME_SIZE).contains(&len) {
-        return None;
-    }
-    let mut frame = vec![0u8; len as usize];
+    let len = frame::check_len(len_bytes, frame::DEFAULT_MAX_FRAME).ok()?;
+    let mut frame = vec![0u8; len];
     stream.read_exact(&mut frame).await.ok()?;
     Some(Bytes::from(frame))
 }
@@ -420,7 +441,7 @@ fn parse_request(node_id: i32, conn_id: usize, index: usize, frame: Bytes) -> Ob
     obs.api_version = i16::from_be_bytes([frame[2], frame[3]]);
     let (api_key, api_version) = (obs.api_key, obs.api_version);
 
-    let known_probe_version = if api_key == 18 {
+    let known_probe_version = if api_key == ApiVersionsRequest::API_KEY {
         // ApiVersions probes above our max are legal; parse at our newest.
         Some(api_version.min(MAX_API_VERSIONS))
     } else {
@@ -451,12 +472,12 @@ fn parse_request(node_id: i32, conn_id: usize, index: usize, frame: Bytes) -> Ob
 
     match (api_key, &mut body) {
         (_, None) => {}
-        (18, Some(_)) if api_version > MAX_API_VERSIONS => {}
-        (18, Some(buf)) => {
+        (ApiVersionsRequest::API_KEY, Some(_)) if api_version > MAX_API_VERSIONS => {}
+        (ApiVersionsRequest::API_KEY, Some(buf)) => {
             obs.body_exempt = false;
             obs.body_error = decode_fully::<ApiVersionsRequest>(buf, api_version).err();
         }
-        (0, Some(buf)) => {
+        (ProduceRequest::API_KEY, Some(buf)) => {
             obs.body_exempt = false;
             match decode_fully::<ProduceRequest>(buf, api_version) {
                 Err(e) => obs.body_error = Some(e),
@@ -470,7 +491,7 @@ fn parse_request(node_id: i32, conn_id: usize, index: usize, frame: Bytes) -> Ob
                 }
             }
         }
-        (1, Some(buf)) => {
+        (FetchRequest::API_KEY, Some(buf)) => {
             obs.body_exempt = false;
             match decode_fully::<FetchRequest>(buf, api_version) {
                 Err(e) => obs.body_error = Some(e),
@@ -484,7 +505,7 @@ fn parse_request(node_id: i32, conn_id: usize, index: usize, frame: Bytes) -> Ob
                 }
             }
         }
-        (3, Some(buf)) => {
+        (MetadataRequest::API_KEY, Some(buf)) => {
             obs.body_exempt = false;
             obs.body_error = decode_fully::<MetadataRequest>(buf, api_version).err();
         }
@@ -504,31 +525,8 @@ fn resolve_topic(name: &str, topic_id: [u8; 16]) -> String {
     }
 }
 
-trait DecodeBody: Sized {
-    fn decode_body(buf: &mut Bytes, version: i16) -> Result<Self, odradek_protocol::DecodeError>;
-}
-
-macro_rules! impl_decode_body {
-    ($($ty:ty),+) => {
-        $(impl DecodeBody for $ty {
-            fn decode_body(
-                buf: &mut Bytes,
-                version: i16,
-            ) -> Result<Self, odradek_protocol::DecodeError> {
-                Self::decode(buf, version)
-            }
-        })+
-    };
-}
-impl_decode_body!(
-    ApiVersionsRequest,
-    ProduceRequest,
-    FetchRequest,
-    MetadataRequest
-);
-
-fn decode_fully<T: DecodeBody>(buf: &mut Bytes, version: i16) -> Result<T, String> {
-    match T::decode_body(buf, version) {
+fn decode_fully<T: Message>(buf: &mut Bytes, version: i16) -> Result<T, String> {
+    match T::decode(buf, version) {
         Err(e) => Err(format!("body: {e}")),
         Ok(_) if !buf.is_empty() => Err(format!(
             "body leaves {} undecoded trailing byte(s)",
@@ -560,10 +558,12 @@ async fn respond(
     let api_version = header.request_api_version;
 
     let (body, header_version) = match api_key {
-        18 if api_version > MAX_API_VERSIONS => (encode_api_versions(35, 0), 0),
-        18 => (encode_api_versions(0, api_version), 0),
-        3 => {
-            let v = api_version.clamp(0, 13);
+        ApiVersionsRequest::API_KEY if api_version > MAX_API_VERSIONS => {
+            (encode_api_versions(ErrorCode::UNSUPPORTED_VERSION.0, 0), 0)
+        }
+        ApiVersionsRequest::API_KEY => (encode_api_versions(ErrorCode::NONE.0, api_version), 0),
+        MetadataRequest::API_KEY => {
+            let v = api_version.clamp(MetadataRequest::MIN_VERSION, MetadataRequest::MAX_VERSION);
             let leaders = view.leaders.lock().unwrap().clone();
             let mut resp = MetadataResponse::default();
             resp.brokers = view
@@ -600,13 +600,16 @@ async fn respond(
             let Ok(()) = resp.encode(&mut buf, v) else {
                 return;
             };
-            (buf.freeze(), response_header_version(3, v).unwrap_or(0))
+            (
+                buf.freeze(),
+                response_header_version(MetadataRequest::API_KEY, v).unwrap_or(0),
+            )
         }
-        0 => {
+        ProduceRequest::API_KEY => {
             use odradek_protocol::messages::produce_response::{
                 PartitionProduceResponse, TopicProduceResponse,
             };
-            let v = api_version.clamp(3, 12);
+            let v = api_version.clamp(ProduceRequest::MIN_VERSION, ProduceRequest::MAX_VERSION);
             // Echo the addressed topics/partitions, judging each against
             // the current (possibly fault-moved) leadership.
             let mut responses: Vec<TopicProduceResponse> = Vec::new();
@@ -614,7 +617,7 @@ async fn respond(
                 let error_code = if topic == ROUTING_TOPIC {
                     view.produce_error(*partition, node_id)
                 } else {
-                    3 // UNKNOWN_TOPIC_OR_PARTITION
+                    ErrorCode::UNKNOWN_TOPIC_OR_PARTITION.0
                 };
                 let mut entry = PartitionProduceResponse::default();
                 entry.index = *partition;
@@ -642,13 +645,16 @@ async fn respond(
             let Ok(()) = resp.encode(&mut buf, v) else {
                 return;
             };
-            (buf.freeze(), response_header_version(0, v).unwrap_or(0))
+            (
+                buf.freeze(),
+                response_header_version(ProduceRequest::API_KEY, v).unwrap_or(0),
+            )
         }
-        1 => {
+        FetchRequest::API_KEY => {
             use odradek_protocol::messages::fetch_response::{
                 FetchableTopicResponse, PartitionData,
             };
-            let v = api_version.clamp(4, 17);
+            let v = api_version.clamp(FetchRequest::MIN_VERSION, FetchRequest::MAX_VERSION);
             // Echo the addressed topics/partitions (empty logs), judged
             // against current leadership.
             let mut responses: Vec<FetchableTopicResponse> = Vec::new();
@@ -656,7 +662,7 @@ async fn respond(
                 let error_code = if topic == ROUTING_TOPIC {
                     view.fetch_error(*partition, node_id)
                 } else {
-                    3 // UNKNOWN_TOPIC_OR_PARTITION
+                    ErrorCode::UNKNOWN_TOPIC_OR_PARTITION.0
                 };
                 let mut entry = PartitionData::default();
                 entry.partition_index = *partition;
@@ -686,7 +692,10 @@ async fn respond(
             let Ok(()) = resp.encode(&mut buf, v) else {
                 return;
             };
-            (buf.freeze(), response_header_version(1, v).unwrap_or(0))
+            (
+                buf.freeze(),
+                response_header_version(FetchRequest::API_KEY, v).unwrap_or(0),
+            )
         }
         // Unknown api: nothing sensible to say; stay silent.
         _ => return,
@@ -695,15 +704,13 @@ async fn respond(
     let mut resp_header = ResponseHeader::default();
     resp_header.correlation_id = header.correlation_id;
     let mut out = BytesMut::new();
-    out.put_i32(0);
-    let Ok(()) = resp_header.encode(&mut out, header_version) else {
+    let Ok(()) = frame::frame(&mut out, |out| {
+        resp_header.encode(out, header_version)?;
+        out.extend_from_slice(&body);
+        Ok(())
+    }) else {
         return;
     };
-    out.extend_from_slice(&body);
-    let Ok(len) = i32::try_from(out.len() - 4) else {
-        return;
-    };
-    out[..4].copy_from_slice(&len.to_be_bytes());
     let _ = stream.write_all(&out).await;
 }
 
@@ -784,7 +791,7 @@ fn header_well_formed(s: &Session) -> Verdict {
 fn starts_with_api_versions(s: &Session) -> Verdict {
     let mut failures = Vec::new();
     for o in s.observations.iter().filter(|o| o.index == 0) {
-        if o.api_key != 18 {
+        if o.api_key != ApiVersionsRequest::API_KEY {
             failures.push(format!(
                 "{}: first request on the connection is not ApiVersions",
                 describe(o)
@@ -833,7 +840,11 @@ fn correlation_ids_unique(s: &Session) -> Verdict {
 fn respects_advertised_versions(s: &Session) -> Verdict {
     let mut violations = Vec::new();
     let mut applicable = 0usize;
-    for o in s.observations.iter().filter(|o| o.api_key != 18) {
+    for o in s
+        .observations
+        .iter()
+        .filter(|o| o.api_key != ApiVersionsRequest::API_KEY)
+    {
         applicable += 1;
         match ADVERTISED.iter().find(|(k, _, _)| *k == o.api_key) {
             None => violations.push(format!(

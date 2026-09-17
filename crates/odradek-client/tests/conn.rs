@@ -1,8 +1,9 @@
 //! End-to-end tests of the connection layer against an in-process fake
 //! broker speaking real wire bytes through the same protocol crate.
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use odradek_client::{ClientConfig, ClientError, Connection};
+use odradek_protocol::frame;
 use odradek_protocol::header::{request_header_version, response_header_version};
 use odradek_protocol::messages::api_versions_request::ApiVersionsRequest;
 use odradek_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
@@ -21,7 +22,7 @@ struct Request {
 async fn read_request(stream: &mut TcpStream) -> Request {
     let mut len_bytes = [0u8; 4];
     stream.read_exact(&mut len_bytes).await.expect("frame len");
-    let len = i32::from_be_bytes(len_bytes) as usize;
+    let len = frame::check_len(len_bytes, frame::DEFAULT_MAX_FRAME).expect("frame length");
     let mut frame = vec![0u8; len];
     stream.read_exact(&mut frame).await.expect("frame body");
     let mut frame = Bytes::from(frame);
@@ -41,13 +42,14 @@ async fn write_response(stream: &mut TcpStream, req: &RequestHeader, body: &[u8]
         response_header_version(req.request_api_key, req.request_api_version).unwrap();
     let mut header = ResponseHeader::default();
     header.correlation_id = req.correlation_id;
-    let mut frame = BytesMut::new();
-    frame.put_i32(0);
-    header.encode(&mut frame, header_version).unwrap();
-    frame.extend_from_slice(body);
-    let len = i32::try_from(frame.len() - 4).unwrap();
-    frame[..4].copy_from_slice(&len.to_be_bytes());
-    stream.write_all(&frame).await.unwrap();
+    let mut framed = BytesMut::new();
+    frame::frame(&mut framed, |buf| {
+        header.encode(buf, header_version)?;
+        buf.extend_from_slice(body);
+        Ok(())
+    })
+    .unwrap();
+    stream.write_all(&framed).await.unwrap();
 }
 
 fn api_versions_body(version: i16, error_code: i16, keys: &[(i16, i16, i16)]) -> Bytes {

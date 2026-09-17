@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use odradek_client::{ClientConfig, ClientError, Cluster};
 use odradek_protocol::header::{request_header_version, response_header_version};
 use odradek_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
@@ -14,6 +14,12 @@ use odradek_protocol::messages::produce_request::ProduceRequest;
 use odradek_protocol::messages::produce_response::ProduceResponse;
 use odradek_protocol::messages::request_header::RequestHeader;
 use odradek_protocol::messages::response_header::ResponseHeader;
+use odradek_protocol::messages::{
+    ApiVersionsRequest, ConsumerGroupHeartbeatRequest, CreateTopicsRequest, FetchRequest,
+    FindCoordinatorRequest, HeartbeatRequest, JoinGroupRequest, LeaveGroupRequest,
+    ListOffsetsRequest, MetadataRequest, OffsetCommitRequest, OffsetFetchRequest, SyncGroupRequest,
+};
+use odradek_protocol::{ErrorCode, frame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -198,7 +204,9 @@ async fn serve_conn(
         if stream.read_exact(&mut len_bytes).await.is_err() {
             return;
         }
-        let len = i32::from_be_bytes(len_bytes).max(0) as usize;
+        let Ok(len) = frame::check_len(len_bytes, frame::DEFAULT_MAX_FRAME) else {
+            return;
+        };
         let mut frame = vec![0u8; len];
         if stream.read_exact(&mut frame).await.is_err() {
             return;
@@ -213,20 +221,71 @@ async fn serve_conn(
             18 => {
                 let mut resp = ApiVersionsResponse::default();
                 resp.api_keys = [
-                    (18, 0, 4),
-                    (3, 0, 13),
-                    (0, 3, 12),
-                    (1, 4, 17),
-                    (2, 1, 10),
-                    (10, 0, 6),
-                    (8, 2, 10),
-                    (9, 1, 10),
-                    (11, 4, 9),
-                    (14, 3, 5),
-                    (12, 0, 4),
-                    (13, 0, 5),
-                    (19, 2, 7),
-                    (68, 0, 1),
+                    (
+                        ApiVersionsRequest::API_KEY,
+                        ApiVersionsRequest::MIN_VERSION,
+                        ApiVersionsRequest::MAX_VERSION,
+                    ),
+                    (
+                        MetadataRequest::API_KEY,
+                        MetadataRequest::MIN_VERSION,
+                        MetadataRequest::MAX_VERSION,
+                    ),
+                    // v13 produce and v13+ fetch address topics by id;
+                    // this fake's handlers serve names, so both cap
+                    // below the schema's max.
+                    (ProduceRequest::API_KEY, ProduceRequest::MIN_VERSION, 12),
+                    (FetchRequest::API_KEY, FetchRequest::MIN_VERSION, 12),
+                    (
+                        ListOffsetsRequest::API_KEY,
+                        ListOffsetsRequest::MIN_VERSION,
+                        ListOffsetsRequest::MAX_VERSION,
+                    ),
+                    (
+                        FindCoordinatorRequest::API_KEY,
+                        FindCoordinatorRequest::MIN_VERSION,
+                        FindCoordinatorRequest::MAX_VERSION,
+                    ),
+                    (
+                        OffsetCommitRequest::API_KEY,
+                        OffsetCommitRequest::MIN_VERSION,
+                        OffsetCommitRequest::MAX_VERSION,
+                    ),
+                    (
+                        OffsetFetchRequest::API_KEY,
+                        OffsetFetchRequest::MIN_VERSION,
+                        OffsetFetchRequest::MAX_VERSION,
+                    ),
+                    (
+                        JoinGroupRequest::API_KEY,
+                        JoinGroupRequest::MIN_VERSION,
+                        JoinGroupRequest::MAX_VERSION,
+                    ),
+                    (
+                        SyncGroupRequest::API_KEY,
+                        SyncGroupRequest::MIN_VERSION,
+                        SyncGroupRequest::MAX_VERSION,
+                    ),
+                    (
+                        HeartbeatRequest::API_KEY,
+                        HeartbeatRequest::MIN_VERSION,
+                        HeartbeatRequest::MAX_VERSION,
+                    ),
+                    (
+                        LeaveGroupRequest::API_KEY,
+                        LeaveGroupRequest::MIN_VERSION,
+                        LeaveGroupRequest::MAX_VERSION,
+                    ),
+                    (
+                        CreateTopicsRequest::API_KEY,
+                        CreateTopicsRequest::MIN_VERSION,
+                        CreateTopicsRequest::MAX_VERSION,
+                    ),
+                    (
+                        ConsumerGroupHeartbeatRequest::API_KEY,
+                        ConsumerGroupHeartbeatRequest::MIN_VERSION,
+                        ConsumerGroupHeartbeatRequest::MAX_VERSION,
+                    ),
                 ]
                 .into_iter()
                 .map(|(api_key, min_version, max_version)| {
@@ -407,9 +466,9 @@ async fn serve_conn(
                     } else {
                         let state = group.lock().unwrap();
                         if !state.members.iter().any(|(id, _)| *id == req.member_id) {
-                            25 // UNKNOWN_MEMBER_ID
+                            ErrorCode::UNKNOWN_MEMBER_ID.0
                         } else if req.generation_id_or_member_epoch != state.generation {
-                            22 // ILLEGAL_GENERATION
+                            ErrorCode::ILLEGAL_GENERATION.0
                         } else {
                             0
                         }
@@ -472,7 +531,7 @@ async fn serve_conn(
                 let resp = if req.member_id.is_empty() {
                     state.next_member += 1;
                     let mut resp = JoinGroupResponse::default();
-                    resp.error_code = 79; // MEMBER_ID_REQUIRED
+                    resp.error_code = ErrorCode::MEMBER_ID_REQUIRED.0;
                     resp.member_id = format!("member-{}", state.next_member);
                     resp
                 } else {
@@ -532,9 +591,9 @@ async fn serve_conn(
                 let known = state.members.iter().any(|(id, _)| *id == req.member_id);
                 let mut resp = HeartbeatResponse::default();
                 resp.error_code = if !known {
-                    25 // UNKNOWN_MEMBER_ID
+                    ErrorCode::UNKNOWN_MEMBER_ID.0
                 } else if state.rebalancing {
-                    27 // REBALANCE_IN_PROGRESS
+                    ErrorCode::REBALANCE_IN_PROGRESS.0
                 } else {
                     0
                 };
@@ -568,11 +627,11 @@ async fn serve_conn(
                     resp.member_epoch = epoch;
                     resp.assignment = Some(assignment_for(&g, &req.member_id, n_partitions));
                 } else if !g.members.contains(&req.member_id) {
-                    resp.error_code = 25; // UNKNOWN_MEMBER_ID
+                    resp.error_code = ErrorCode::UNKNOWN_MEMBER_ID.0;
                 } else if req.member_epoch != g.group_epoch
                     && g.told.get(&req.member_id) != Some(&req.member_epoch)
                 {
-                    resp.error_code = 110; // FENCED_MEMBER_EPOCH
+                    resp.error_code = ErrorCode::FENCED_MEMBER_EPOCH.0;
                 } else {
                     let epoch = g.group_epoch;
                     let stale = g.told.get(&req.member_id) != Some(&epoch);
@@ -630,7 +689,11 @@ async fn serve_conn(
                     let fresh = created.lock().unwrap().insert(t.name.clone());
                     let mut tresp = CreatableTopicResult::default();
                     tresp.name = t.name.clone();
-                    tresp.error_code = if fresh { 0 } else { 36 }; // TOPIC_ALREADY_EXISTS
+                    tresp.error_code = if fresh {
+                        0
+                    } else {
+                        ErrorCode::TOPIC_ALREADY_EXISTS.0
+                    };
                     resp.topics.push(tresp);
                 }
                 let mut buf = BytesMut::new();
@@ -643,16 +706,12 @@ async fn serve_conn(
         let mut resp_header = ResponseHeader::default();
         resp_header.correlation_id = header.correlation_id;
         let mut out = BytesMut::new();
-        out.put_i32(0);
-        resp_header
-            .encode(
-                &mut out,
-                response_header_version(api_key, api_version).unwrap(),
-            )
-            .unwrap();
-        out.extend_from_slice(&body);
-        let frame_len = i32::try_from(out.len() - 4).unwrap();
-        out[..4].copy_from_slice(&frame_len.to_be_bytes());
+        frame::frame(&mut out, |out| {
+            resp_header.encode(out, response_header_version(api_key, api_version).unwrap())?;
+            out.extend_from_slice(&body);
+            Ok(())
+        })
+        .unwrap();
         if stream.write_all(&out).await.is_err() {
             return;
         }

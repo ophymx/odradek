@@ -6,15 +6,16 @@
 
 use std::time::Duration;
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use odradek_protocol::EncodeError;
+use odradek_protocol::frame;
 use odradek_protocol::messages::request_header::RequestHeader;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// Frames larger than this are treated as a subject failure, not a reason
 /// to allocate unboundedly.
-pub const MAX_FRAME_SIZE: i32 = 64 * 1024 * 1024;
+pub use odradek_protocol::frame::DEFAULT_MAX_FRAME as MAX_FRAME_SIZE;
 
 /// How long a check waits for the subject to produce a frame.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -48,11 +49,12 @@ impl RawConnection {
 
     /// Write one length-prefixed frame.
     pub async fn send_frame(&mut self, payload: &[u8]) -> Result<(), WireError> {
-        let len = i32::try_from(payload.len()).map_err(|_| WireError::BadFrameLength(i32::MAX))?;
-        let mut frame = BytesMut::with_capacity(payload.len() + 4);
-        frame.put_i32(len);
-        frame.extend_from_slice(payload);
-        self.stream.write_all(&frame).await?;
+        let mut framed = BytesMut::with_capacity(payload.len() + 4);
+        frame::frame(&mut framed, |buf| {
+            buf.extend_from_slice(payload);
+            Ok(())
+        })?;
+        self.stream.write_all(&framed).await?;
         Ok(())
     }
 
@@ -66,11 +68,9 @@ impl RawConnection {
     async fn read_frame_inner(&mut self) -> Result<Bytes, WireError> {
         let mut len_bytes = [0u8; 4];
         self.stream.read_exact(&mut len_bytes).await?;
-        let len = i32::from_be_bytes(len_bytes);
-        if !(0..=MAX_FRAME_SIZE).contains(&len) {
-            return Err(WireError::BadFrameLength(len));
-        }
-        let mut frame = vec![0u8; len as usize];
+        let len = frame::check_len(len_bytes, MAX_FRAME_SIZE)
+            .map_err(|_| WireError::BadFrameLength(i32::from_be_bytes(len_bytes)))?;
+        let mut frame = vec![0u8; len];
         self.stream.read_exact(&mut frame).await?;
         Ok(Bytes::from(frame))
     }
