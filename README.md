@@ -17,8 +17,8 @@ the protocol as the first-class artifact and builds outward from it.
 | [`odradek-web-sse`](crates/odradek-web-sse) | Server-Sent Events transport over the bridge: an embeddable axum router with `Last-Event-ID` resume — a reconnecting `EventSource` never misses or repeats a record. |
 | [`odradek-web-ws`](crates/odradek-web-ws) | WebSocket transport over the bridge: the same streams as JSON text frames, offset-resumable via `from=`. |
 
-Next in the constellation: topic-level subscriptions (across
-partitions) and TLS/SASL in the client.
+Next in the constellation: TLS/SASL in the client — the last gate
+before real-world clusters.
 
 ## Design principles
 
@@ -128,9 +128,15 @@ Early but functional end to end:
   upgrade, resume via `from=<offset>`. Tested with a hand-rolled
   WebSocket client (upgrade handshake + frame parser); its `serve`
   example mounts both transports on one router.
+- Topic-level subscriptions on all of the above: `GET /topics/{t}/events`
+  (SSE) and `/topics/{t}/ws` merge every partition into one stream —
+  order holds within partitions — with a multi-partition cursor
+  (`partition:next_offset,...`) as the resume token; SSE carries it as
+  every event's id, so `Last-Event-ID` reconnects resume all
+  partitions loss-free (unseen partitions replay from earliest).
 
-Next: topic-level subscriptions, TLS/SASL in the client, snappy/zstd
-codecs, and the KIP-848 consumer protocol.
+Next: TLS/SASL in the client, snappy/zstd codecs, and the KIP-848
+consumer protocol.
 
 ```sh
 cargo test --workspace       # everything

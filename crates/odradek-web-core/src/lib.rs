@@ -23,6 +23,7 @@
 //! against an in-memory log; [`KafkaSource`] adapts
 //! [`odradek_client::Consumer`] for production.
 
+pub mod cursor;
 pub mod event;
 pub mod hub;
 pub mod json;
@@ -30,8 +31,8 @@ pub mod memory;
 pub mod pump;
 pub mod source;
 
-pub use event::{Event, Filter, Position};
-pub use hub::Hub;
+pub use event::{Event, Filter, Position, TopicPosition};
+pub use hub::{Hub, TopicSubscription};
 pub use pump::{HubError, PumpConfig, PumpHandle, Subscription};
 pub use source::{
     KafkaSource, KafkaSourceFactory, RecordSource, SourceBatch, SourceError, SourceFactory,

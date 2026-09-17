@@ -60,6 +60,10 @@ pub trait SourceFactory: Send + Sync + 'static {
         topic: &str,
         partition: i32,
     ) -> impl Future<Output = Result<Self::Source, SourceError>> + Send;
+
+    /// The partitions `topic` currently has, for topic-level subscribes.
+    fn partitions(&self, topic: &str)
+    -> impl Future<Output = Result<Vec<i32>, SourceError>> + Send;
 }
 
 /// A [`RecordSource`] over a real Kafka cluster.
@@ -134,5 +138,23 @@ impl SourceFactory for KafkaSourceFactory {
             .await
             .map_err(|e| SourceError(e.to_string()))?;
         Ok(KafkaSource::new(Consumer::new(cluster)))
+    }
+
+    async fn partitions(&self, topic: &str) -> Result<Vec<i32>, SourceError> {
+        let mut cluster = Cluster::connect(self.config.clone())
+            .await
+            .map_err(|e| SourceError(e.to_string()))?;
+        cluster
+            .refresh_metadata(&[topic])
+            .await
+            .map_err(|e| SourceError(e.to_string()))?;
+        let mut partitions: Vec<i32> = cluster
+            .partitions(topic)
+            .ok_or_else(|| SourceError(format!("unknown topic {topic}")))?
+            .iter()
+            .map(|p| p.index)
+            .collect();
+        partitions.sort_unstable();
+        Ok(partitions)
     }
 }

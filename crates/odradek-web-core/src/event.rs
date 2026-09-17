@@ -29,6 +29,19 @@ pub enum Position {
     Offset(i64),
 }
 
+/// Where a topic-level subscription starts, across all partitions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TopicPosition {
+    /// Every partition from its oldest record.
+    Earliest,
+    /// Every partition from now on.
+    Latest,
+    /// Resume: the next offset owed per partition. A partition absent
+    /// from the map replays from earliest — loss-free beats
+    /// duplicate-free, so consumers should be idempotent.
+    Offsets(std::collections::BTreeMap<i32, i64>),
+}
+
 /// A per-subscriber selection over the partition's records. Empty
 /// matches everything.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

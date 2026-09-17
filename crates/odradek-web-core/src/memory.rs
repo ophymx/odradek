@@ -1,8 +1,9 @@
-//! An in-memory [`RecordSource`]: a shared, appendable partition log.
+//! An in-memory [`RecordSource`]: a shared, appendable multi-partition
+//! log.
 //!
 //! For tests and examples — both this crate's and those of anything
-//! built on top: transports can exercise replay, live tailing, and
-//! backpressure without a broker.
+//! built on top: transports can exercise replay, live tailing,
+//! topic-level merges, and backpressure without a broker.
 
 use std::sync::{Arc, Mutex};
 
@@ -11,37 +12,52 @@ use bytes::Bytes;
 use crate::event::Event;
 use crate::source::{RecordSource, SourceBatch, SourceError, SourceFactory};
 
-/// A shared in-memory log; offsets are indexes. Every partition of
-/// every topic reads the same log, which is plenty for tests.
-#[derive(Debug, Clone, Default)]
+/// A shared in-memory topic; offsets are per-partition indexes. Every
+/// topic name reads the same log, which is plenty for tests.
+#[derive(Debug, Clone)]
 pub struct MemoryLog {
-    events: Arc<Mutex<Vec<Event>>>,
+    partitions: Arc<Vec<Mutex<Vec<Event>>>>,
     /// Events returned per fetch, so catch-up takes several rounds like
     /// a real broker's bounded fetches.
     batch_limit: usize,
 }
 
+impl Default for MemoryLog {
+    fn default() -> Self {
+        MemoryLog::new()
+    }
+}
+
 impl MemoryLog {
+    /// A single-partition log.
     pub fn new() -> MemoryLog {
+        MemoryLog::with_partitions(1)
+    }
+
+    /// A log with `count` partitions.
+    pub fn with_partitions(count: usize) -> MemoryLog {
         MemoryLog {
-            events: Arc::default(),
+            partitions: Arc::new((0..count.max(1)).map(|_| Mutex::new(Vec::new())).collect()),
             batch_limit: 3,
         }
     }
 
-    /// Append one record; returns its offset.
+    /// Append one record to `partition`; returns its offset.
     pub fn append(
         &self,
         topic: &str,
+        partition: i32,
         key: Option<&[u8]>,
         value: &[u8],
         headers: Vec<(String, Option<Bytes>)>,
     ) -> i64 {
-        let mut events = self.events.lock().unwrap();
+        let mut events = self.partitions[usize::try_from(partition).unwrap_or(0)]
+            .lock()
+            .unwrap();
         let offset = i64::try_from(events.len()).unwrap_or(i64::MAX);
         events.push(Event {
             topic: topic.to_owned(),
-            partition: 0,
+            partition,
             offset,
             timestamp: 1_000 + offset,
             key: key.map(Bytes::copy_from_slice),
@@ -56,12 +72,16 @@ impl MemoryLog {
         MemorySource { log: self.clone() }
     }
 
-    pub fn len(&self) -> usize {
-        self.events.lock().unwrap().len()
+    /// Records in `partition`.
+    pub fn len(&self, partition: i32) -> usize {
+        self.partitions[usize::try_from(partition).unwrap_or(0)]
+            .lock()
+            .unwrap()
+            .len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    pub fn is_empty(&self, partition: i32) -> bool {
+        self.len(partition) == 0
     }
 }
 
@@ -71,14 +91,23 @@ pub struct MemorySource {
     log: MemoryLog,
 }
 
+impl MemorySource {
+    fn partition(&self, partition: i32) -> Result<&Mutex<Vec<Event>>, SourceError> {
+        usize::try_from(partition)
+            .ok()
+            .and_then(|p| self.log.partitions.get(p))
+            .ok_or_else(|| SourceError(format!("no partition {partition}")))
+    }
+}
+
 impl RecordSource for MemorySource {
     async fn fetch(
         &mut self,
-        _topic: &str,
+        topic: &str,
         partition: i32,
         offset: i64,
     ) -> Result<SourceBatch, SourceError> {
-        let events = self.log.events.lock().unwrap();
+        let events = self.partition(partition)?.lock().unwrap();
         let len = i64::try_from(events.len()).unwrap_or(i64::MAX);
         let start = usize::try_from(offset.clamp(0, len)).unwrap_or(usize::MAX);
         let batch: Vec<Event> = events
@@ -86,7 +115,7 @@ impl RecordSource for MemorySource {
             .skip(start)
             .take(self.log.batch_limit)
             .map(|e| Event {
-                partition,
+                topic: topic.to_owned(),
                 ..e.clone()
             })
             .collect();
@@ -98,12 +127,13 @@ impl RecordSource for MemorySource {
         })
     }
 
-    async fn earliest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
+    async fn earliest_offset(&mut self, _topic: &str, partition: i32) -> Result<i64, SourceError> {
+        self.partition(partition)?;
         Ok(0)
     }
 
-    async fn latest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
-        Ok(i64::try_from(self.log.events.lock().unwrap().len()).unwrap_or(i64::MAX))
+    async fn latest_offset(&mut self, _topic: &str, partition: i32) -> Result<i64, SourceError> {
+        Ok(i64::try_from(self.partition(partition)?.lock().unwrap().len()).unwrap_or(i64::MAX))
     }
 }
 
@@ -117,8 +147,10 @@ impl SourceFactory for MemoryFactory {
     type Source = MemorySource;
 
     async fn create(&self, _topic: &str, _partition: i32) -> Result<MemorySource, SourceError> {
-        Ok(MemorySource {
-            log: self.log.clone(),
-        })
+        Ok(self.log.source())
+    }
+
+    async fn partitions(&self, _topic: &str) -> Result<Vec<i32>, SourceError> {
+        Ok((0..i32::try_from(self.log.partitions.len()).unwrap_or(1)).collect())
     }
 }

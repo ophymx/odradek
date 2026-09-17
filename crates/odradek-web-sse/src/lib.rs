@@ -36,7 +36,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
 use odradek_web_core::json::event_json;
-use odradek_web_core::{Filter, Hub, Position, PumpConfig, SourceFactory};
+use odradek_web_core::{Filter, Hub, Position, PumpConfig, SourceFactory, TopicPosition, cursor};
 
 /// Shared state behind the routes: the hub, guarded for subscribe-time
 /// mutation only (streams run lock-free once created).
@@ -60,6 +60,7 @@ pub fn router<F: SourceFactory>(state: Arc<SseState<F>>) -> Router {
             "/topics/{topic}/partitions/{partition}/events",
             get(stream_partition::<F>),
         )
+        .route("/topics/{topic}/events", get(stream_topic::<F>))
         .with_state(state)
 }
 
@@ -138,4 +139,58 @@ async fn stream_partition<F: SourceFactory>(
             .data(event_json(&event).to_string()))
     });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// The whole topic, all partitions merged. The event id is the
+/// multi-partition cursor (`partition:next_offset,...`), updated per
+/// event, so `Last-Event-ID` on reconnect resumes every partition
+/// loss-free (partitions the cursor has not seen replay from earliest).
+async fn stream_topic<F: SourceFactory>(
+    State(state): State<Arc<SseState<F>>>,
+    Path(topic): Path<String>,
+    Query(params): Query<StreamParams>,
+    headers: HeaderMap,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>>, (StatusCode, String)>
+{
+    let position = topic_position(&params, &headers).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let filter = params.filter().map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    // Seed the running cursor from the resume point, so an id always
+    // carries every partition the client has a position for.
+    let mut running = match &position {
+        TopicPosition::Offsets(cursor) => cursor.clone(),
+        _ => std::collections::BTreeMap::new(),
+    };
+    let subscription = state
+        .hub
+        .lock()
+        .await
+        .subscribe_topic(&topic, position, filter)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+
+    let stream = ReceiverStream::new(subscription.into_receiver()).map(move |event| {
+        running.insert(event.partition, event.offset + 1);
+        Ok(SseEvent::default()
+            .event("record")
+            .id(cursor::encode(&running))
+            .data(event_json(&event).to_string()))
+    });
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// `Last-Event-ID` (a cursor) wins over `from`; `from` accepts
+/// `earliest`, `latest`, or a cursor.
+fn topic_position(params: &StreamParams, headers: &HeaderMap) -> Result<TopicPosition, String> {
+    if let Some(last) = headers.get("last-event-id") {
+        let raw = last
+            .to_str()
+            .map_err(|_| "Last-Event-ID must be a cursor".to_owned())?;
+        return Ok(TopicPosition::Offsets(cursor::parse(raw)?));
+    }
+    match params.from.as_deref() {
+        None | Some("latest") => Ok(TopicPosition::Latest),
+        Some("earliest") => Ok(TopicPosition::Earliest),
+        Some(raw) => Ok(TopicPosition::Offsets(cursor::parse(raw)?)),
+    }
 }

@@ -4,17 +4,19 @@
 //! own service and layer your own auth/middleware over it:
 //!
 //! ```text
-//! GET /topics/{topic}/partitions/{partition}/ws
-//!     ?from=earliest|latest|<offset>     start position (default: latest)
+//! GET /topics/{topic}/partitions/{partition}/ws   one partition
+//! GET /topics/{topic}/ws                          all partitions, merged
+//!     ?from=earliest|latest|<offset or cursor>   start (default: latest)
 //!     &key_prefix=<utf8>                 only records whose key starts so
 //!     &header=<name>:<value>             only records with this header
 //! ```
 //!
 //! Each record arrives as one JSON text frame (the same shape as the
-//! SSE transport's `data`), carrying its offset. WebSocket has no
-//! `Last-Event-ID`, so resume is explicit: reconnect with
-//! `from=<last offset + 1>`. Parameter errors are rejected as plain
-//! HTTP responses before the upgrade.
+//! SSE transport's `data`), carrying its partition and offset.
+//! WebSocket has no `Last-Event-ID`, so resume is explicit: reconnect
+//! with `from=<last offset + 1>` (partition streams) or
+//! `from=<partition:next_offset,...>` (topic streams). Parameter
+//! errors are rejected as plain HTTP responses before the upgrade.
 
 use std::sync::Arc;
 
@@ -28,7 +30,9 @@ use bytes::Bytes;
 use serde::Deserialize;
 
 use odradek_web_core::json::event_json;
-use odradek_web_core::{Filter, Hub, Position, PumpConfig, SourceFactory, Subscription};
+use odradek_web_core::{
+    Event, Filter, Hub, Position, PumpConfig, SourceFactory, TopicPosition, cursor,
+};
 
 /// Shared state behind the routes: the hub, guarded for subscribe-time
 /// mutation only (each socket runs lock-free once subscribed).
@@ -52,6 +56,7 @@ pub fn router<F: SourceFactory>(state: Arc<WsState<F>>) -> Router {
             "/topics/{topic}/partitions/{partition}/ws",
             get(upgrade_partition::<F>),
         )
+        .route("/topics/{topic}/ws", get(upgrade_topic::<F>))
         .with_state(state)
 }
 
@@ -114,13 +119,41 @@ async fn upgrade_partition<F: SourceFactory>(
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
 
-    Ok(ws.on_upgrade(move |socket| stream_events(socket, subscription)))
+    Ok(ws.on_upgrade(move |socket| stream_events(socket, subscription.into_receiver())))
 }
 
-async fn stream_events(mut socket: WebSocket, mut subscription: Subscription) {
+/// The whole topic, all partitions merged as one frame stream. Resume
+/// is `from=<partition:next_offset,...>` — each frame carries its
+/// partition and offset, so the client tracks its own cursor.
+async fn upgrade_topic<F: SourceFactory>(
+    State(state): State<Arc<WsState<F>>>,
+    Path(topic): Path<String>,
+    Query(params): Query<StreamParams>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, (StatusCode, String)> {
+    let position = match params.from.as_deref() {
+        None | Some("latest") => TopicPosition::Latest,
+        Some("earliest") => TopicPosition::Earliest,
+        Some(raw) => {
+            TopicPosition::Offsets(cursor::parse(raw).map_err(|e| (StatusCode::BAD_REQUEST, e))?)
+        }
+    };
+    let filter = params.filter().map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let subscription = state
+        .hub
+        .lock()
+        .await
+        .subscribe_topic(&topic, position, filter)
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+
+    Ok(ws.on_upgrade(move |socket| stream_events(socket, subscription.into_receiver())))
+}
+
+async fn stream_events(mut socket: WebSocket, mut events: tokio::sync::mpsc::Receiver<Event>) {
     loop {
         tokio::select! {
-            event = subscription.recv() => match event {
+            event = events.recv() => match event {
                 Some(event) => {
                     let frame = Message::Text(event_json(&event).to_string().into());
                     if socket.send(frame).await.is_err() {
