@@ -729,7 +729,12 @@ async fn compressed_batches_roundtrip_end_to_end() {
     use odradek_client::{Consumer, Producer, ProducerConfig};
     use odradek_protocol::records::{Compression, Record, decode_set};
 
-    for codec in [Compression::Gzip, Compression::Lz4] {
+    for codec in [
+        Compression::Gzip,
+        Compression::Lz4,
+        Compression::Snappy,
+        Compression::Zstd,
+    ] {
         let fake = spawn_fake_cluster(1, &[]).await;
         let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
         let mut producer = Producer::with_config(

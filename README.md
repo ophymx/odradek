@@ -59,9 +59,10 @@ Early but functional end to end:
   against the RFC 7677 vector — authenticated on every connection; the cluster layer: metadata discovery, a per-broker connection
   pool with per-broker version ranges, and partition-leader routing; and
   a producer and consumer: the producer batches records per partition
-  (size-triggered or explicit flush), compresses with gzip or lz4 (pure
-  Rust codecs; compression is a client concern — the protocol crate
-  carries payloads raw), and retries through leadership changes by
+  (size-triggered or explicit flush), compresses with gzip, lz4,
+  snappy (xerial framing), or zstd (compression is a client concern —
+  the protocol crate carries payloads raw; interop for all four codecs
+  is verified in both directions against Kafka's Java tools), and retries through leadership changes by
   invalidating stale metadata; the consumer fetches, decompresses, and
   materializes records with absolute offsets,
   skipping control batches and pre-offset records, with earliest/latest
@@ -143,8 +144,7 @@ Kafka's SASL_PLAINTEXT, SSL, and SASL_SSL listeners: PLAIN and both
 SCRAM variants authenticate, wrong passwords and untrusted
 certificates fail cleanly.
 
-Next: snappy/zstd codecs, the KIP-848 consumer protocol, and
-crates.io publication.
+Next: the KIP-848 consumer protocol and crates.io publication.
 
 ```sh
 cargo test --workspace       # everything

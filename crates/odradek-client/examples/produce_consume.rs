@@ -2,7 +2,7 @@
 //! a compressed batch, fetch it back, and commit/read an offset.
 //!
 //! ```sh
-//! cargo run -p odradek-client --example produce_consume -- localhost:9092 [gzip|lz4|none]
+//! cargo run -p odradek-client --example produce_consume -- localhost:9092 [gzip|lz4|snappy|zstd|none]
 //! ```
 
 use bytes::{Bytes, BytesMut};
@@ -18,6 +18,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let codec = match args.next().as_deref() {
         Some("gzip") => Compression::Gzip,
         Some("lz4") => Compression::Lz4,
+        Some("snappy") => Compression::Snappy,
+        Some("zstd") => Compression::Zstd,
         Some("none") | None => Compression::None,
         Some(other) => return Err(format!("unknown codec {other}").into()),
     };

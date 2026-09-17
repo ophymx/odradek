@@ -39,7 +39,7 @@ pub struct ProducerConfig {
     pub max_attempts: u32,
     /// Pause between attempts.
     pub retry_backoff: Duration,
-    /// Codec for produced batches (gzip and lz4 supported).
+    /// Codec for produced batches (gzip, lz4, snappy, zstd).
     pub compression: Compression,
     /// [`Producer::enqueue`] delivers a partition's buffer once its
     /// estimated size passes this (pre-compression bytes).
