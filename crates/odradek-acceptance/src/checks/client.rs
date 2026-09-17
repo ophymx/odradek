@@ -6,9 +6,14 @@
 //! led by broker `i`, so leader routing is observable. Every broker
 //! answers just enough of the protocol to keep a real client talking
 //! (ApiVersions, Metadata, and empty Produce/Fetch successes) and records
-//! every frame; checks are evaluated over the recorded observations.
+//! every frame; the catalogued checks ([`CLIENT_CHECKS`]) are evaluated
+//! over the recorded [`Session`]. When the harness itself cannot run —
+//! a listener fails to bind, or no client ever connects before the
+//! [`ObserveConfig::accept_timeout`] deadline — [`run`] returns an
+//! infrastructure error instead of fabricating check outcomes.
 
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -30,9 +35,11 @@ use odradek_protocol::messages::response_header::ResponseHeader;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
+use crate::checks::{Check, Runner};
 use crate::report::{CheckOutcome, Report};
-use crate::{CheckId, Verdict};
+use crate::{CheckId, SubjectRole, Verdict};
 
 /// (api key, min, max) the harness advertises — exactly the apis it can
 /// parse, so version discipline is checkable.
@@ -49,6 +56,54 @@ pub const ROUTING_TOPIC: &str = "odradek-routing";
 
 /// The routing topic's id, for id-addressed clients (16 bytes).
 pub const ROUTING_TOPIC_ID: [u8; 16] = *b"odradek-routing!";
+
+/// Every client-side check, in run order. Ids are stable; baselines and
+/// the calibration tests cite them verbatim.
+pub static CLIENT_CHECKS: &[Check] = &[
+    Check {
+        id: "client/header-well-formed",
+        requirement: "every request carries a decodable header at the version \
+                      implied by its (api key, api version)",
+        runner: Runner::Client(header_well_formed),
+    },
+    Check {
+        id: "client/starts-with-api-versions",
+        requirement: "the first request on every connection is ApiVersions, so \
+                      versions are negotiated before anything else is sent",
+        runner: Runner::Client(starts_with_api_versions),
+    },
+    Check {
+        id: "client/correlation-ids-unique",
+        requirement: "correlation ids are not reused within a connection, so \
+                      responses are unambiguously attributable",
+        runner: Runner::Client(correlation_ids_unique),
+    },
+    Check {
+        id: "client/respects-advertised-versions",
+        requirement: "after negotiation the client only sends apis and \
+                      versions the server advertised",
+        runner: Runner::Client(respects_advertised_versions),
+    },
+    Check {
+        id: "client/body-decodes",
+        requirement: "request bodies decode per the message schema at the \
+                      claimed version, with no trailing bytes",
+        runner: Runner::Client(body_decodes),
+    },
+    Check {
+        id: "client/routes-to-partition-leader",
+        requirement: "produce and fetch requests go to the broker the \
+                      metadata advertises as the partition's leader",
+        runner: Runner::Client(routes_to_partition_leader),
+    },
+    Check {
+        id: "client/recovers-from-leader-change",
+        requirement: "after a NOT_LEADER_OR_FOLLOWER answer, the client \
+                      refreshes metadata and re-delivers to the newly \
+                      advertised leader",
+        runner: Runner::Client(recovers_from_leader_change),
+    },
+];
 
 /// A deliberate misbehavior the harness can stage to observe how the
 /// client copes.
@@ -69,6 +124,10 @@ pub struct ObserveConfig {
     pub max_requests: usize,
     /// Stop when every connection goes quiet for this long.
     pub idle_timeout: Duration,
+    /// How long to wait for the client's *first* connection before giving
+    /// up with an infrastructure error — the harness must not hang
+    /// forever on a client that never dials.
+    pub accept_timeout: Duration,
     /// Optional staged misbehavior.
     pub fault: Option<HarnessFault>,
 }
@@ -78,6 +137,7 @@ impl Default for ObserveConfig {
         ObserveConfig {
             max_requests: 32,
             idle_timeout: Duration::from_secs(3),
+            accept_timeout: Duration::from_secs(60),
             fault: None,
         }
     }
@@ -111,6 +171,15 @@ struct Observation {
 struct FaultEvent {
     partition: i32,
     to_node: i32,
+}
+
+/// One recorded observation session: everything the client-side checks
+/// judge.
+#[derive(Debug)]
+pub(crate) struct Session {
+    observations: Vec<Observation>,
+    fault: Option<HarnessFault>,
+    events: Vec<FaultEvent>,
 }
 
 /// The impersonated cluster: endpoints (broker `i` on `ports[i]`) and
@@ -174,29 +243,26 @@ impl ClusterView {
 }
 
 /// Accept client connections (bootstrap on `listener`, brokers 1+ on
-/// internal listeners), observe every frame, and evaluate the checks.
-pub async fn run(listener: &TcpListener, config: &ObserveConfig) -> Report {
-    let fail_report = |details: String| Report {
-        subject: "client <none>".into(),
-        outcomes: vec![CheckOutcome {
-            id: CheckId("client/session".into()),
-            requirement: "a client connects to the harness",
-            verdict: Verdict::Fail { details },
-        }],
-    };
-
+/// internal listeners), observe every frame, and evaluate the catalogued
+/// Client-role checks.
+///
+/// An `Err` means the harness itself could not run — an infrastructure
+/// finding about the run, never a statement about the subject.
+pub async fn run(listener: &TcpListener, config: &ObserveConfig) -> io::Result<Report> {
     // Brokers 1..N listen on ephemeral ports next to the bootstrap.
     let mut extra = Vec::new();
     for _ in 1..BROKER_COUNT {
-        match TcpListener::bind("127.0.0.1:0").await {
-            Ok(l) => extra.push(l),
-            Err(e) => return fail_report(format!("cannot bind harness broker: {e}")),
-        }
+        let l = TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| io::Error::new(e.kind(), format!("cannot bind harness broker: {e}")))?;
+        extra.push(l);
     }
-    let mut ports = vec![match listener.local_addr() {
-        Ok(a) => a.port(),
-        Err(e) => return fail_report(format!("bootstrap listener: {e}")),
-    }];
+    let mut ports = vec![
+        listener
+            .local_addr()
+            .map_err(|e| io::Error::new(e.kind(), format!("bootstrap listener: {e}")))?
+            .port(),
+    ];
     ports.extend(
         extra
             .iter()
@@ -234,10 +300,22 @@ pub async fn run(listener: &TcpListener, config: &ObserveConfig) -> Report {
         }));
     }
 
-    // Wait (without a deadline, as ever) for the client's first
-    // connection — necessarily to the bootstrap, the only address it has.
-    let peer = match listener.accept().await {
-        Ok((stream, peer)) => {
+    // Wait — with a deadline — for the client's first connection,
+    // necessarily to the bootstrap, the only address it has.
+    let first = tokio::time::timeout(config.accept_timeout, listener.accept()).await;
+    let peer = match first {
+        Err(_) => {
+            abort_all(&accept_tasks);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("no client connected within {:?}", config.accept_timeout),
+            ));
+        }
+        Ok(Err(e)) => {
+            abort_all(&accept_tasks);
+            return Err(io::Error::new(e.kind(), format!("accept failed: {e}")));
+        }
+        Ok(Ok((stream, peer))) => {
             let conn_id = conn_counter.fetch_add(1, Ordering::Relaxed);
             tokio::spawn(handle_conn(
                 stream,
@@ -247,12 +325,6 @@ pub async fn run(listener: &TcpListener, config: &ObserveConfig) -> Report {
                 tx.clone(),
             ));
             peer
-        }
-        Err(e) => {
-            for t in &accept_tasks {
-                t.abort();
-            }
-            return fail_report(format!("accept failed: {e}"));
         }
     };
 
@@ -273,16 +345,20 @@ pub async fn run(listener: &TcpListener, config: &ObserveConfig) -> Report {
             () = tokio::time::sleep(config.idle_timeout) => break,
         }
     }
-    for t in &accept_tasks {
+    abort_all(&accept_tasks);
+    let events = view.events.lock().unwrap().clone();
+    let session = Session {
+        observations,
+        fault: config.fault,
+        events,
+    };
+    Ok(evaluate(&session, &format!("client {peer}")))
+}
+
+fn abort_all(tasks: &[JoinHandle<()>]) {
+    for t in tasks {
         t.abort();
     }
-    let events = view.events.lock().unwrap().clone();
-    evaluate(
-        &observations,
-        config.fault,
-        &events,
-        &format!("client {peer}"),
-    )
 }
 
 async fn handle_conn(
@@ -650,26 +726,41 @@ fn encode_api_versions(error_code: i16, version: i16) -> Bytes {
     buf.freeze()
 }
 
-fn evaluate(
-    observations: &[Observation],
-    fault: Option<HarnessFault>,
-    events: &[FaultEvent],
-    subject: &str,
-) -> Report {
+/// Evaluate the catalogued Client-role checks over a recorded session.
+fn evaluate(session: &Session, subject: &str) -> Report {
     let mut outcomes = Vec::new();
-    let none_observed = observations.is_empty();
-    let skip = |reason: &str| Verdict::Skipped {
-        reason: reason.into(),
-    };
-    let describe = |o: &Observation| {
-        format!(
-            "conn #{} request #{} to broker {} (api {} v{})",
-            o.conn_id, o.index, o.node_id, o.api_key, o.api_version
-        )
-    };
+    for check in crate::checks::catalog() {
+        if check.role() != SubjectRole::Client {
+            continue;
+        }
+        let Runner::Client(runner) = check.runner else {
+            continue;
+        };
+        outcomes.push(CheckOutcome::new(
+            CheckId(check.id.into()),
+            check.requirement,
+            runner(session),
+        ));
+    }
+    Report::new(subject, outcomes)
+}
 
-    // client/header-well-formed
-    let header_failures: Vec<String> = observations
+fn skip(reason: &str) -> Verdict {
+    Verdict::Skipped {
+        reason: reason.into(),
+    }
+}
+
+fn describe(o: &Observation) -> String {
+    format!(
+        "conn #{} request #{} to broker {} (api {} v{})",
+        o.conn_id, o.index, o.node_id, o.api_key, o.api_version
+    )
+}
+
+fn header_well_formed(s: &Session) -> Verdict {
+    let failures: Vec<String> = s
+        .observations
         .iter()
         .filter_map(|o| {
             o.header_error
@@ -677,51 +768,45 @@ fn evaluate(
                 .map(|e| format!("{}: {e}", describe(o)))
         })
         .collect();
-    outcomes.push(CheckOutcome {
-        id: CheckId("client/header-well-formed".into()),
-        requirement: "every request carries a decodable header at the version \
-                      implied by its (api key, api version)",
-        verdict: if none_observed {
-            skip("client sent no requests")
-        } else if header_failures.is_empty() {
-            Verdict::Pass
-        } else {
-            Verdict::Fail {
-                details: header_failures.join("; "),
-            }
-        },
-    });
+    if s.observations.is_empty() {
+        skip("client sent no requests")
+    } else if failures.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail {
+            details: failures.join("; "),
+        }
+    }
+}
 
-    // client/starts-with-api-versions: per connection — negotiation is a
-    // per-connection handshake, not a per-session one.
-    let mut handshake_failures = Vec::new();
-    for o in observations.iter().filter(|o| o.index == 0) {
+/// Per connection — negotiation is a per-connection handshake, not a
+/// per-session one.
+fn starts_with_api_versions(s: &Session) -> Verdict {
+    let mut failures = Vec::new();
+    for o in s.observations.iter().filter(|o| o.index == 0) {
         if o.api_key != 18 {
-            handshake_failures.push(format!(
+            failures.push(format!(
                 "{}: first request on the connection is not ApiVersions",
                 describe(o)
             ));
         }
     }
-    outcomes.push(CheckOutcome {
-        id: CheckId("client/starts-with-api-versions".into()),
-        requirement: "the first request on every connection is ApiVersions, so \
-                      versions are negotiated before anything else is sent",
-        verdict: if none_observed {
-            skip("client sent no requests")
-        } else if handshake_failures.is_empty() {
-            Verdict::Pass
-        } else {
-            Verdict::Fail {
-                details: handshake_failures.join("; "),
-            }
-        },
-    });
+    if s.observations.is_empty() {
+        skip("client sent no requests")
+    } else if failures.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail {
+            details: failures.join("; "),
+        }
+    }
+}
 
-    // client/correlation-ids-unique (scoped per connection).
+/// Scoped per connection.
+fn correlation_ids_unique(s: &Session) -> Verdict {
     let mut seen: HashMap<usize, HashSet<i32>> = HashMap::new();
     let mut duplicates = Vec::new();
-    for o in observations {
+    for o in &s.observations {
         if let Some(h) = &o.header {
             if !seen.entry(o.conn_id).or_default().insert(h.correlation_id) {
                 duplicates.push(format!(
@@ -732,92 +817,79 @@ fn evaluate(
             }
         }
     }
-    outcomes.push(CheckOutcome {
-        id: CheckId("client/correlation-ids-unique".into()),
-        requirement: "correlation ids are not reused within a connection, so \
-                      responses are unambiguously attributable",
-        verdict: if none_observed {
-            skip("client sent no requests")
-        } else if duplicates.is_empty() {
-            Verdict::Pass
-        } else {
-            Verdict::Fail {
-                details: duplicates.join("; "),
-            }
-        },
-    });
+    if s.observations.is_empty() {
+        skip("client sent no requests")
+    } else if duplicates.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail {
+            details: duplicates.join("; "),
+        }
+    }
+}
 
-    // client/respects-advertised-versions (ApiVersions itself exempt: the
-    // probe-and-downgrade dance happens before ranges are known).
-    let mut range_violations = Vec::new();
+/// ApiVersions itself is exempt: the probe-and-downgrade dance happens
+/// before ranges are known.
+fn respects_advertised_versions(s: &Session) -> Verdict {
+    let mut violations = Vec::new();
     let mut applicable = 0usize;
-    for o in observations.iter().filter(|o| o.api_key != 18) {
+    for o in s.observations.iter().filter(|o| o.api_key != 18) {
         applicable += 1;
         match ADVERTISED.iter().find(|(k, _, _)| *k == o.api_key) {
-            None => range_violations.push(format!(
+            None => violations.push(format!(
                 "{} uses an api key the harness never advertised",
                 describe(o)
             )),
-            Some(&(_, min, max)) if o.api_version < min || o.api_version > max => range_violations
-                .push(format!(
-                    "{} is outside the advertised {min}-{max}",
-                    describe(o)
-                )),
+            Some(&(_, min, max)) if o.api_version < min || o.api_version > max => violations.push(
+                format!("{} is outside the advertised {min}-{max}", describe(o)),
+            ),
             Some(_) => {}
         }
     }
-    outcomes.push(CheckOutcome {
-        id: CheckId("client/respects-advertised-versions".into()),
-        requirement: "after negotiation the client only sends apis and \
-                      versions the server advertised",
-        verdict: if applicable == 0 {
-            skip("only ApiVersions requests observed")
-        } else if range_violations.is_empty() {
-            Verdict::Pass
-        } else {
-            Verdict::Fail {
-                details: range_violations.join("; "),
-            }
-        },
-    });
-
-    // client/body-decodes
-    let mut body_failures = Vec::new();
-    let mut body_applicable = 0usize;
-    for o in observations.iter().filter(|o| !o.body_exempt) {
-        body_applicable += 1;
-        if let Some(e) = &o.body_error {
-            body_failures.push(format!("{}: {e}", describe(o)));
+    if applicable == 0 {
+        skip("only ApiVersions requests observed")
+    } else if violations.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail {
+            details: violations.join("; "),
         }
     }
-    outcomes.push(CheckOutcome {
-        id: CheckId("client/body-decodes".into()),
-        requirement: "request bodies decode per the message schema at the \
-                      claimed version, with no trailing bytes",
-        verdict: if body_applicable == 0 {
-            skip("no checkable request bodies observed")
-        } else if body_failures.is_empty() {
-            Verdict::Pass
-        } else {
-            Verdict::Fail {
-                details: body_failures.join("; "),
-            }
-        },
-    });
+}
 
-    // client/routes-to-partition-leader: partition i of the routing topic
-    // starts led by broker i; a staged fault may move it. A misroute is
-    // an arrival at a broker that was never that partition's advertised
-    // leader.
+fn body_decodes(s: &Session) -> Verdict {
+    let mut failures = Vec::new();
+    let mut applicable = 0usize;
+    for o in s.observations.iter().filter(|o| !o.body_exempt) {
+        applicable += 1;
+        if let Some(e) = &o.body_error {
+            failures.push(format!("{}: {e}", describe(o)));
+        }
+    }
+    if applicable == 0 {
+        skip("no checkable request bodies observed")
+    } else if failures.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail {
+            details: failures.join("; "),
+        }
+    }
+}
+
+/// Partition i of the routing topic starts led by broker i; a staged
+/// fault may move it. A misroute is an arrival at a broker that was never
+/// that partition's advertised leader.
+fn routes_to_partition_leader(s: &Session) -> Verdict {
     let ever_led = |partition: i32, node: i32| {
         node == partition
-            || events
+            || s.events
                 .iter()
                 .any(|e| e.partition == partition && e.to_node == node)
     };
     let mut misroutes = Vec::new();
     let mut routed = 0usize;
-    for o in observations {
+    for o in &s.observations {
         for (topic, partition) in &o.routes {
             if topic != ROUTING_TOPIC {
                 continue;
@@ -833,26 +905,23 @@ fn evaluate(
             }
         }
     }
-    outcomes.push(CheckOutcome {
-        id: CheckId("client/routes-to-partition-leader".into()),
-        requirement: "produce and fetch requests go to the broker the \
-                      metadata advertises as the partition's leader",
-        verdict: if routed == 0 {
-            skip("no produce/fetch for the routing topic observed")
-        } else if misroutes.is_empty() {
-            Verdict::Pass
-        } else {
-            Verdict::Fail {
-                details: misroutes.join("; "),
-            }
-        },
-    });
+    if routed == 0 {
+        skip("no produce/fetch for the routing topic observed")
+    } else if misroutes.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail {
+            details: misroutes.join("; "),
+        }
+    }
+}
 
-    // client/recovers-from-leader-change: only meaningful when the
-    // leader-move fault is armed and actually fired.
+/// Only meaningful when the leader-move fault is armed and actually
+/// fired.
+fn recovers_from_leader_change(s: &Session) -> Verdict {
     let mut unrecovered = Vec::new();
-    for event in events {
-        let redelivered = observations.iter().any(|o| {
+    for event in &s.events {
+        let redelivered = s.observations.iter().any(|o| {
             o.node_id == event.to_node
                 && o.routes
                     .iter()
@@ -866,26 +935,15 @@ fn evaluate(
             ));
         }
     }
-    outcomes.push(CheckOutcome {
-        id: CheckId("client/recovers-from-leader-change".into()),
-        requirement: "after a NOT_LEADER_OR_FOLLOWER answer, the client \
-                      refreshes metadata and re-delivers to the newly \
-                      advertised leader",
-        verdict: if fault != Some(HarnessFault::LeaderMove) {
-            skip("leader-move fault not armed")
-        } else if events.is_empty() {
-            skip("the client sent nothing that triggered the leader move")
-        } else if unrecovered.is_empty() {
-            Verdict::Pass
-        } else {
-            Verdict::Fail {
-                details: unrecovered.join("; "),
-            }
-        },
-    });
-
-    Report {
-        subject: subject.into(),
-        outcomes,
+    if s.fault != Some(HarnessFault::LeaderMove) {
+        skip("leader-move fault not armed")
+    } else if s.events.is_empty() {
+        skip("the client sent nothing that triggered the leader move")
+    } else if unrecovered.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail {
+            details: unrecovered.join("; "),
+        }
     }
 }

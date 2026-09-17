@@ -57,8 +57,13 @@ pub enum Fault {
     /// In the UNSUPPORTED_VERSION error response, advertise a different
     /// ApiVersions max than the one advertised normally.
     AdvertiseWrongMaxInError,
-    /// Append junk bytes inside the response frame after the body.
+    /// Append junk bytes inside the ApiVersions response frame after the
+    /// body.
     TrailingGarbage,
+    /// Append junk bytes inside Fetch response frames after the body —
+    /// proof the consolidated exchange path polices trailing bytes on the
+    /// produce/fetch flows, not just ApiVersions and Metadata.
+    FetchTrailingGarbage,
     /// Use response header v1 (with tagged fields) for flexible ApiVersions
     /// requests, violating the always-v0 quirk.
     FlexibleHeaderOnV3,
@@ -91,6 +96,7 @@ impl Fault {
         Fault::ErrorBodyNotV0,
         Fault::AdvertiseWrongMaxInError,
         Fault::TrailingGarbage,
+        Fault::FetchTrailingGarbage,
         Fault::FlexibleHeaderOnV3,
         Fault::MetadataEmptyBrokers,
         Fault::MetadataUnrequestedTopic,
@@ -552,6 +558,6 @@ fn fetch_exchange(
         req_header.correlation_id,
         response_header_version(FetchRequest::API_KEY, api_version),
         |out| resp.encode(out, api_version).unwrap(),
-        false,
+        faults.contains(&Fault::FetchTrailingGarbage),
     )
 }

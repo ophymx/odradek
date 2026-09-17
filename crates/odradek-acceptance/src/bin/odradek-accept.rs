@@ -1,6 +1,9 @@
 //! CLI entry point for the acceptance suite.
 //!
 //! ```sh
+//! # what would run: every catalogued check with id, role, requirement
+//! odradek-accept --list
+//!
 //! # validate a server (broker or broker-compatible proxy)
 //! odradek-accept --server localhost:9092
 //!
@@ -14,7 +17,10 @@
 //! ```
 //!
 //! Exit code 0 on success (conformant, or matching the baseline when one is
-//! given), 1 on failures/diffs, 2 on usage errors.
+//! given), 1 on failures/diffs, 2 on usage errors. Checks that could not
+//! run (`ERROR`, an infrastructure finding — connection refused, timeout,
+//! harness setup failure) never satisfy a baseline and never pass a run,
+//! but are reported distinctly from protocol violations.
 
 use std::process::ExitCode;
 
@@ -24,7 +30,7 @@ use tokio::net::TcpListener;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: odradek-accept (--server <host:port> | --client-listen <host:port>)\n\
+        "usage: odradek-accept (--server <host:port> | --client-listen <host:port> | --list)\n\
          \x20                    [--fault leader-move] [--json]\n\
          \x20                    [--baseline <file>] [--write-baseline <file>]"
     );
@@ -34,6 +40,7 @@ fn usage() -> ExitCode {
 struct Args {
     server: Option<String>,
     client_listen: Option<String>,
+    list: bool,
     fault: Option<checks::client::HarnessFault>,
     json: bool,
     baseline: Option<String>,
@@ -44,6 +51,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut parsed = Args {
         server: None,
         client_listen: None,
+        list: false,
         fault: None,
         json: false,
         baseline: None,
@@ -54,6 +62,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         match arg.as_str() {
             "--server" => parsed.server = Some(it.next()?.clone()),
             "--client-listen" => parsed.client_listen = Some(it.next()?.clone()),
+            "--list" => parsed.list = true,
             "--fault" => {
                 parsed.fault = match it.next()?.as_str() {
                     "leader-move" => Some(checks::client::HarnessFault::LeaderMove),
@@ -66,7 +75,17 @@ fn parse_args(args: &[String]) -> Option<Args> {
             _ => return None,
         }
     }
-    // Exactly one subject; faults only apply to the client harness.
+    // --list stands alone; otherwise exactly one subject, and faults only
+    // apply to the client harness.
+    if parsed.list {
+        let alone = parsed.server.is_none()
+            && parsed.client_listen.is_none()
+            && parsed.fault.is_none()
+            && !parsed.json
+            && parsed.baseline.is_none()
+            && parsed.write_baseline.is_none();
+        return alone.then_some(parsed);
+    }
     if parsed.server.is_some() == parsed.client_listen.is_some() {
         return None;
     }
@@ -76,12 +95,25 @@ fn parse_args(args: &[String]) -> Option<Args> {
     Some(parsed)
 }
 
+/// Print every catalogued check: id, subject role, requirement.
+fn list_checks() {
+    for check in checks::catalog() {
+        println!("[{}] {}", check.role(), check.id);
+        println!("    {}", check.requirement);
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let Some(args) = parse_args(&raw) else {
         return usage();
     };
+
+    if args.list {
+        list_checks();
+        return ExitCode::SUCCESS;
+    }
 
     let report = if let Some(addr) = &args.server {
         checks::server::run(addr).await
@@ -97,7 +129,16 @@ async fn main() -> ExitCode {
         eprintln!("waiting for a client connection on {addr} ...");
         let mut config = checks::client::ObserveConfig::default();
         config.fault = args.fault;
-        checks::client::run(&listener, &config).await
+        match checks::client::run(&listener, &config).await {
+            Ok(report) => report,
+            Err(e) => {
+                eprintln!(
+                    "client harness could not run: {e} (infrastructure, \
+                     not evidence of nonconformance)"
+                );
+                return ExitCode::FAILURE;
+            }
+        }
     };
 
     if args.json {
@@ -120,15 +161,23 @@ async fn main() -> ExitCode {
 
 fn exit_status(report: &Report, baseline_path: Option<&str>) -> ExitCode {
     let Some(path) = baseline_path else {
+        if report.errored() > 0 {
+            eprintln!(
+                "{} check(s) could not run (infrastructure) — the run proves \
+                 neither conformance nor nonconformance",
+                report.errored()
+            );
+            return ExitCode::FAILURE;
+        }
         return if report.is_conformant() {
             ExitCode::SUCCESS
         } else {
             ExitCode::FAILURE
         };
     };
-    let baseline: Baseline = match std::fs::read_to_string(path)
+    let baseline = match std::fs::read_to_string(path)
         .map_err(|e| e.to_string())
-        .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
+        .and_then(|s| Baseline::from_json(&s))
     {
         Ok(b) => b,
         Err(e) => {

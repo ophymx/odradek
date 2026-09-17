@@ -1,11 +1,13 @@
 //! Calibration of the client-side checks: our own client must pass them
 //! (dogfooding), and a deliberately misbehaving raw client must be caught.
+//! Id lists and counts derive from the check catalog, never restated.
 
 use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use odradek_acceptance::Verdict;
+use odradek_acceptance::checks::catalog;
 use odradek_acceptance::checks::client::{HarnessFault, ObserveConfig, ROUTING_TOPIC, run};
+use odradek_acceptance::{SubjectRole, Verdict};
 use odradek_client::{ClientConfig, Cluster, Connection, Consumer, Producer};
 use odradek_protocol::messages::produce_request::{
     PartitionProduceData, ProduceRequest, TopicProduceData,
@@ -13,6 +15,34 @@ use odradek_protocol::messages::produce_request::{
 use odradek_protocol::messages::request_header::RequestHeader;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
+
+fn client_check_ids() -> Vec<&'static str> {
+    catalog()
+        .filter(|c| c.role() == SubjectRole::Client)
+        .map(|c| c.id)
+        .collect()
+}
+
+/// The ids this file cites when asserting specific catches; a typo (or a
+/// catalog rename this file missed) fails here rather than passing
+/// vacuously.
+const CITED: &[&str] = &[
+    "client/header-well-formed",
+    "client/starts-with-api-versions",
+    "client/correlation-ids-unique",
+    "client/respects-advertised-versions",
+    "client/body-decodes",
+    "client/routes-to-partition-leader",
+    "client/recovers-from-leader-change",
+];
+
+#[test]
+fn cited_ids_are_catalogued() {
+    let ids = client_check_ids();
+    for id in CITED {
+        assert!(ids.contains(id), "{id} is not in the catalog");
+    }
+}
 
 fn config() -> ObserveConfig {
     let mut config = ObserveConfig::default();
@@ -66,15 +96,24 @@ async fn odradek_client_passes_the_client_checks() {
     assert_eq!(result.next_offset, 0);
     drop(consumer); // close all connections so the observation session ends
 
-    let report = harness.await.unwrap();
+    let report = harness.await.unwrap().expect("harness ran");
     assert!(
         report.is_conformant(),
         "our client is nonconformant:\n{report}"
     );
+    // Every catalogued client check passes except recovers-from-leader-
+    // change, which skips when the leader-move fault is not armed.
     assert_eq!(
         report.passed(),
-        6,
-        "expected every client check to pass:\n{report}"
+        client_check_ids().len() - 1,
+        "expected every applicable client check to pass:\n{report}"
+    );
+    assert!(
+        matches!(
+            report.verdict("client/recovers-from-leader-change"),
+            Some(Verdict::Skipped { .. })
+        ),
+        "{report}"
     );
 }
 
@@ -95,7 +134,7 @@ async fn misbehaving_client_is_caught() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     drop(stream);
 
-    let report = harness.await.unwrap();
+    let report = harness.await.unwrap().expect("harness ran");
     for id in [
         "client/starts-with-api-versions",
         "client/correlation-ids-unique",
@@ -149,7 +188,7 @@ async fn odradek_client_recovers_from_leader_change() {
     assert_eq!(offset, 0);
     drop(producer);
 
-    let report = harness.await.unwrap();
+    let report = harness.await.unwrap().expect("harness ran");
     assert!(
         matches!(
             report.verdict("client/recovers-from-leader-change"),
@@ -184,7 +223,7 @@ async fn client_that_abandons_after_leader_change_is_caught() {
         .unwrap();
     drop(conn);
 
-    let report = harness.await.unwrap();
+    let report = harness.await.unwrap().expect("harness ran");
     assert!(
         matches!(
             report.verdict("client/recovers-from-leader-change"),
@@ -213,7 +252,7 @@ async fn misrouted_produce_is_caught() {
         .unwrap();
     drop(conn);
 
-    let report = harness.await.unwrap();
+    let report = harness.await.unwrap().expect("harness ran");
     assert!(
         matches!(
             report.verdict("client/routes-to-partition-leader"),
@@ -234,6 +273,17 @@ async fn misrouted_produce_is_caught() {
             "collateral failure in {id}:\n{report}"
         );
     }
+}
+
+/// A client that never dials is an infrastructure finding, not a report:
+/// the harness's first accept has a deadline and times out cleanly.
+#[tokio::test]
+async fn harness_times_out_when_no_client_connects() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = config();
+    config.accept_timeout = Duration::from_millis(200);
+    let err = run(&listener, &config).await.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
 }
 
 fn request_frame(api_key: i16, api_version: i16, correlation_id: i32, body: &[u8]) -> Vec<u8> {

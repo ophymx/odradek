@@ -10,8 +10,12 @@
 //! Each subject runs in a throwaway container on an ephemeral host port,
 //! with the broker's advertised listener pointed back at that port so a
 //! future metadata-following check keeps working. Baselines live in
-//! `conformance/<name>.json`; a run that diverges from its baseline fails,
-//! which is what makes real brokers ground truth for the suite itself.
+//! `conformance/<name>.json` as versioned envelopes (`format`/`suite`
+//! plus the per-check statuses); a run that diverges from its baseline
+//! fails, which is what makes real brokers ground truth for the suite
+//! itself. Checks the suite could not run (infrastructure `error`
+//! outcomes) never satisfy a baseline, but odradek-accept reports them
+//! distinctly from protocol failures.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

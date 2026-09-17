@@ -12,9 +12,10 @@
 //!   (well-formed headers, correct compact encodings, sane retry behavior on
 //!   injected errors, ...).
 //!
-//! Checks are data: each one carries an id, the protocol requirement it
-//! verifies, and which subject roles it applies to, so reports can cite
-//! exactly what an implementation got wrong.
+//! Checks are data: every check lives in a static catalog
+//! ([`checks::catalog`]) carrying its stable id, the protocol requirement
+//! it verifies, and its [`SubjectRole`], so runs execute exactly the
+//! catalog and reports can cite exactly what an implementation got wrong.
 
 use std::fmt;
 
@@ -28,7 +29,9 @@ pub mod subject;
 pub use odradek_protocol as protocol;
 pub use report::{CheckOutcome, Report};
 
-/// Which side of the wire the subject implements.
+/// Which side of the wire the subject implements. Every catalogued
+/// [`checks::Check`] carries its role; a run executes exactly the checks
+/// whose role matches the subject.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubjectRole {
     /// The subject accepts connections and answers requests (a broker or
@@ -36,6 +39,15 @@ pub enum SubjectRole {
     Server,
     /// The subject dials the suite's harness server and issues requests.
     Client,
+}
+
+impl fmt::Display for SubjectRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SubjectRole::Server => write!(f, "server"),
+            SubjectRole::Client => write!(f, "client"),
+        }
+    }
 }
 
 /// Stable identifier for a check, e.g. `api-versions/flexible-header`.
@@ -52,6 +64,7 @@ impl fmt::Display for CheckId {
 /// Result of running a single check against a subject.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Verdict {
     Pass,
     /// The subject violated the protocol; `details` explains the observed
@@ -63,5 +76,11 @@ pub enum Verdict {
     /// API version the check exercises).
     Skipped {
         reason: String,
+    },
+    /// The check could not run at all — connection refused, timeout,
+    /// harness setup failure. This is an infrastructure finding about the
+    /// run, never evidence that the subject violated the requirement.
+    Error {
+        details: String,
     },
 }

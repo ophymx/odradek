@@ -1,4 +1,6 @@
 {
+  "format": 1,
+  "suite": "0.1.0",
   "checks": {
     "api-versions/correlation-echo": "pass",
     "api-versions/flexible-v3": "pass",

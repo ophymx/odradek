@@ -1,7 +1,14 @@
 //! Checks that run against a server under test (the suite acts as client).
 //!
 //! Every check opens its own connection so subjects are validated from a
-//! clean state, and failures in one check cannot poison another.
+//! clean state, and failures in one check cannot poison another. The
+//! catalog [`SERVER_CHECKS`] is the single source of truth: [`run`]
+//! executes exactly the Server-role checks it lists, in order.
+//!
+//! All traffic goes through one exchange path ([`checked_call`]) that
+//! always validates the correlation echo, decodes the response header and
+//! body, and rejects trailing bytes — no response gets a lighter
+//! inspection than any other.
 
 use std::time::Duration;
 
@@ -23,105 +30,190 @@ use odradek_protocol::messages::response_header::ResponseHeader;
 use odradek_protocol::records::{Record, RecordBatch, RecordHeader, Records, decode_set};
 use odradek_protocol::{ErrorCode, header, wire};
 
-use crate::raw::RawConnection;
+use crate::checks::{Check, Runner};
+use crate::raw::{RawConnection, WireError};
 use crate::report::{CheckOutcome, Report};
-use crate::{CheckId, Verdict};
+use crate::{CheckId, SubjectRole, Verdict};
 
 const CLIENT_ID: &str = "odradek-acceptance";
 
-/// Run all server-side checks against `addr` and collect a report.
-pub async fn run(addr: &str) -> Report {
-    let mut outcomes = Vec::new();
-
-    // The basic check doubles as discovery: later checks need the
-    // advertised version ranges.
-    let (verdict, keys) = v0_basic(addr).await;
-    let api_versions_range = advertised_range(&keys, ApiVersionsRequest::API_KEY);
-    let metadata_range = advertised_range(&keys, MetadataRequest::API_KEY);
-    outcomes.push(CheckOutcome {
-        id: CheckId("api-versions/v0-basic".into()),
+/// Every server-side check, in run order. Ids are stable; baselines and
+/// the calibration registry cite them verbatim.
+pub static SERVER_CHECKS: &[Check] = &[
+    Check {
+        id: "api-versions/v0-basic",
         requirement: "responds to ApiVersions v0 with error NONE, advertises \
                       ApiVersions itself, and every advertised range has min <= max",
-        verdict,
-    });
-
-    outcomes.push(CheckOutcome {
-        id: CheckId("api-versions/correlation-echo".into()),
+        runner: Runner::Server(|ctx| Box::pin(v0_basic(ctx))),
+    },
+    Check {
+        id: "api-versions/correlation-echo",
         requirement: "echoes the request correlation id, including unusual values",
-        verdict: correlation_echo(addr).await,
-    });
-
-    outcomes.push(CheckOutcome {
-        id: CheckId("api-versions/flexible-v3".into()),
+        runner: Runner::Server(|ctx| Box::pin(correlation_echo(ctx))),
+    },
+    Check {
+        id: "api-versions/flexible-v3",
         requirement: "answers a flexible (v3+) ApiVersions request, including \
                       the tagged-field sections, with a v0 response header",
-        verdict: flexible_v3(addr, api_versions_range).await,
-    });
-
-    outcomes.push(CheckOutcome {
-        id: CheckId("api-versions/unsupported-version-error".into()),
+        runner: Runner::Server(|ctx| Box::pin(flexible_v3(ctx))),
+    },
+    Check {
+        id: "api-versions/unsupported-version-error",
         requirement: "rejects an ApiVersions request newer than it supports \
                       with UNSUPPORTED_VERSION in a v0-encoded response that \
                       advertises the supported range",
-        verdict: unsupported_version(addr, api_versions_range).await,
-    });
-
-    outcomes.push(CheckOutcome {
-        id: CheckId("metadata/basic".into()),
+        runner: Runner::Server(|ctx| Box::pin(unsupported_version(ctx))),
+    },
+    Check {
+        id: "metadata/basic",
         requirement: "answers a Metadata request naming no topics with a \
                       non-empty brokers list (unique node ids, valid ports) \
                       and no topics the client did not ask about",
-        verdict: metadata_basic(addr, metadata_range).await,
-    });
-
-    outcomes.push(CheckOutcome {
-        id: CheckId("metadata/flexible-response-header".into()),
+        runner: Runner::Server(|ctx| Box::pin(metadata_basic(ctx))),
+    },
+    Check {
+        id: "metadata/flexible-response-header",
         requirement: "answers a flexible (v9+) Metadata request with a v1 \
                       response header carrying the tagged-fields section — \
                       the ApiVersions always-v0 quirk does not apply to \
                       other apis",
-        verdict: metadata_flexible_header(addr, metadata_range).await,
-    });
-
-    let create_range = advertised_range(&keys, CreateTopicsRequest::API_KEY);
-    let produce_range = advertised_range(&keys, ProduceRequest::API_KEY);
-    let fetch_range = advertised_range(&keys, FetchRequest::API_KEY);
-
-    outcomes.push(CheckOutcome {
-        id: CheckId("produce/basic".into()),
+        runner: Runner::Server(|ctx| Box::pin(metadata_flexible_header(ctx))),
+    },
+    Check {
+        id: "produce/basic",
         requirement: "accepts a produce (acks=-1) of one well-formed record \
                       batch to a freshly created topic with error NONE and \
                       assigns it base offset 0",
-        verdict: produce_basic(addr, create_range, produce_range).await,
-    });
-
-    outcomes.push(CheckOutcome {
-        id: CheckId("fetch/batch-integrity".into()),
+        runner: Runner::Server(|ctx| Box::pin(produce_basic(ctx))),
+    },
+    Check {
+        id: "fetch/batch-integrity",
         requirement: "a fetch returns the produced record batch byte-identical \
                       from the magic byte onward (crc included) — only \
                       base_offset and partition_leader_epoch, which sit \
                       outside the crc, may be rewritten",
-        verdict: fetch_batch_integrity(addr, create_range, produce_range, fetch_range).await,
-    });
-
-    outcomes.push(CheckOutcome {
-        id: CheckId("produce/topic-id".into()),
+        runner: Runner::Server(|ctx| Box::pin(fetch_batch_integrity(ctx))),
+    },
+    Check {
+        id: "produce/topic-id",
         requirement: "accepts a topic-id-addressed produce (v13+) to a fresh \
                       topic, the id learned from CreateTopics, with error NONE",
-        verdict: produce_topic_id(addr, create_range, produce_range).await,
-    });
-
-    outcomes.push(CheckOutcome {
-        id: CheckId("fetch/topic-id".into()),
+        runner: Runner::Server(|ctx| Box::pin(produce_topic_id(ctx))),
+    },
+    Check {
+        id: "fetch/topic-id",
         requirement: "serves a topic-id-addressed fetch (v13+), echoing the \
                       requested topic id and returning the produced batch \
                       intact",
-        verdict: fetch_topic_id(addr, create_range, produce_range, fetch_range).await,
-    });
+        runner: Runner::Server(|ctx| Box::pin(fetch_topic_id(ctx))),
+    },
+];
 
-    Report {
-        subject: format!("server {addr}"),
-        outcomes,
+/// Run the catalogued Server-role checks against `addr` and collect a
+/// report.
+pub async fn run(addr: &str) -> Report {
+    let ctx = ServerCtx::discover(addr).await;
+    let mut outcomes = Vec::new();
+    for check in crate::checks::catalog() {
+        if check.role() != SubjectRole::Server {
+            continue;
+        }
+        let Runner::Server(runner) = check.runner else {
+            continue;
+        };
+        outcomes.push(CheckOutcome::new(
+            CheckId(check.id.into()),
+            check.requirement,
+            runner(&ctx).await,
+        ));
+    }
+    Report::new(format!("server {addr}"), outcomes)
+}
+
+/// Why an exchange did not yield a validated response: the suite could
+/// not run it (infrastructure) or the subject misbehaved on the wire.
+/// The distinction is what keeps a flaky network from reading as
+/// nonconformance.
+#[derive(Debug)]
+enum CheckError {
+    /// The check could not run: connection refused, i/o failure, timeout.
+    Infra(String),
+    /// The subject violated the requirement under test.
+    Violation(String),
+}
+
+impl CheckError {
+    fn context(self, what: &str) -> CheckError {
+        match self {
+            CheckError::Infra(d) => CheckError::Infra(format!("{what}: {d}")),
+            CheckError::Violation(d) => CheckError::Violation(format!("{what}: {d}")),
+        }
+    }
+
+    fn into_verdict(self) -> Verdict {
+        match self {
+            CheckError::Infra(details) => Verdict::Error { details },
+            CheckError::Violation(details) => Verdict::Fail { details },
+        }
+    }
+}
+
+impl From<WireError> for CheckError {
+    fn from(e: WireError) -> CheckError {
+        match e {
+            // An implausible frame length is the subject talking garbage.
+            WireError::BadFrameLength(_) => CheckError::Violation(e.to_string()),
+            // I/o trouble, timeouts, and our own encode failures mean the
+            // exchange never got a fair chance to observe the subject.
+            WireError::Io(_) | WireError::Timeout | WireError::Encode(_) => {
+                CheckError::Infra(e.to_string())
+            }
+        }
+    }
+}
+
+async fn connect(addr: &str) -> Result<RawConnection, CheckError> {
+    RawConnection::connect(addr)
+        .await
+        .map_err(|e| CheckError::Infra(format!("connect {addr}: {e}")))
+}
+
+/// Discovery and shared state for one server run: the subject's address
+/// plus the api ranges learned from an up-front ApiVersions v0 exchange.
+#[derive(Debug)]
+pub(crate) struct ServerCtx {
+    addr: String,
+    /// `Err` when discovery could not run at all (infrastructure); an
+    /// empty list when the exchange ran but yielded nothing usable — a
+    /// protocol problem `api-versions/v0-basic` reports, which the other
+    /// checks answer with skips exactly as before.
+    discovery: Result<Vec<ApiVersion>, String>,
+}
+
+impl ServerCtx {
+    async fn discover(addr: &str) -> ServerCtx {
+        let discovery = match exchange(addr, 0, 1, 9, 0).await {
+            Ok(resp) => Ok(resp.api_keys),
+            Err(CheckError::Violation(_)) => Ok(Vec::new()),
+            Err(CheckError::Infra(details)) => {
+                Err(format!("discovery (ApiVersions v0): {details}"))
+            }
+        };
+        ServerCtx {
+            addr: addr.into(),
+            discovery,
+        }
+    }
+
+    /// The advertised range for `api_key`, or an infra [`Verdict::Error`]
+    /// when discovery never ran.
+    fn range(&self, api_key: i16) -> Result<Option<(i16, i16)>, Verdict> {
+        match &self.discovery {
+            Ok(keys) => Ok(advertised_range(keys, api_key)),
+            Err(details) => Err(Verdict::Error {
+                details: details.clone(),
+            }),
+        }
     }
 }
 
@@ -131,27 +223,133 @@ fn advertised_range(keys: &[ApiVersion], api_key: i16) -> Option<(i16, i16)> {
         .map(|v| (v.min_version, v.max_version))
 }
 
-fn header(version: i16, correlation_id: i32) -> RequestHeader {
-    let mut header = RequestHeader::default();
-    header.request_api_key = ApiVersionsRequest::API_KEY;
-    header.request_api_version = version;
-    header.correlation_id = correlation_id;
-    header.client_id = Some(CLIENT_ID.into());
-    header
+/// Response types [`checked_call`] can decode.
+trait DecodeResponse: Sized {
+    fn decode_response(
+        buf: &mut Bytes,
+        version: i16,
+    ) -> Result<Self, odradek_protocol::DecodeError>;
 }
 
-/// One ApiVersions exchange; returns the decoded body after validating the
-/// correlation echo and (always-v0) response header.
+macro_rules! impl_decode_response {
+    ($($ty:ty),+ $(,)?) => {
+        $(impl DecodeResponse for $ty {
+            fn decode_response(
+                buf: &mut Bytes,
+                version: i16,
+            ) -> Result<Self, odradek_protocol::DecodeError> {
+                Self::decode(buf, version)
+            }
+        })+
+    };
+}
+impl_decode_response!(
+    ApiVersionsResponse,
+    MetadataResponse,
+    CreateTopicsResponse,
+    ProduceResponse,
+    FetchResponse,
+);
+
+/// The wire coordinates of one exchange.
+struct Call {
+    api_key: i16,
+    api_version: i16,
+    request_header_version: i16,
+    response_header_version: i16,
+    correlation_id: i32,
+    /// The version to decode the response body at (differs from
+    /// `api_version` only for from-the-future ApiVersions probes).
+    decode_at: i16,
+}
+
+/// The one exchange path every server-side check goes through: frame the
+/// request, validate the correlation echo, decode the response header and
+/// body, and reject trailing bytes. Produce, Fetch, and CreateTopics
+/// responses get exactly the same scrutiny as ApiVersions and Metadata.
+async fn checked_call<T: DecodeResponse>(
+    conn: &mut RawConnection,
+    call: Call,
+    body: &[u8],
+) -> Result<T, CheckError> {
+    let mut req_header = RequestHeader::default();
+    req_header.request_api_key = call.api_key;
+    req_header.request_api_version = call.api_version;
+    req_header.correlation_id = call.correlation_id;
+    req_header.client_id = Some(CLIENT_ID.into());
+
+    let mut frame = conn
+        .round_trip(&req_header, call.request_header_version, body)
+        .await?;
+    let echoed = wire::get_i32(&mut frame.clone()).map_err(|_| {
+        CheckError::Violation("response frame shorter than a correlation id".into())
+    })?;
+    if echoed != call.correlation_id {
+        return Err(CheckError::Violation(format!(
+            "sent correlation id {}, response carries {echoed}",
+            call.correlation_id
+        )));
+    }
+    let hv = call.response_header_version;
+    ResponseHeader::decode(&mut frame, hv)
+        .map_err(|e| CheckError::Violation(format!("response header (decoded as v{hv}): {e}")))?;
+    let resp = T::decode_response(&mut frame, call.decode_at).map_err(|e| {
+        CheckError::Violation(format!(
+            "response body (decoded as v{}): {e}",
+            call.decode_at
+        ))
+    })?;
+    if !frame.is_empty() {
+        return Err(CheckError::Violation(format!(
+            "{} byte(s) of trailing garbage after the response body",
+            frame.len()
+        )));
+    }
+    Ok(resp)
+}
+
+/// One exchange at a negotiated version on an existing connection, header
+/// versions derived from the api tables.
+async fn api_call<T: DecodeResponse>(
+    conn: &mut RawConnection,
+    api_key: i16,
+    version: i16,
+    correlation_id: i32,
+    body: &[u8],
+) -> Result<T, CheckError> {
+    let request_header_version =
+        header::request_header_version(api_key, version).ok_or_else(|| {
+            CheckError::Infra(format!(
+                "no header version known for api {api_key} v{version}"
+            ))
+        })?;
+    let response_header_version = header::response_header_version(api_key, version)
+        .expect("request header version implies response header version");
+    checked_call(
+        conn,
+        Call {
+            api_key,
+            api_version: version,
+            request_header_version,
+            response_header_version,
+            correlation_id,
+            decode_at: version,
+        },
+        body,
+    )
+    .await
+}
+
+/// One ApiVersions exchange on a fresh connection. The response header is
+/// always decoded at v0 (the negotiation-bootstrap quirk).
 async fn exchange(
     addr: &str,
     api_version: i16,
     header_version: i16,
     correlation_id: i32,
     decode_at: i16,
-) -> Result<ApiVersionsResponse, String> {
-    let mut conn = RawConnection::connect(addr)
-        .await
-        .map_err(|e| e.to_string())?;
+) -> Result<ApiVersionsResponse, CheckError> {
+    let mut conn = connect(addr).await?;
     let mut body = BytesMut::new();
     let mut req = ApiVersionsRequest::default();
     req.client_software_name = "odradek-acceptance".into();
@@ -159,65 +357,44 @@ async fn exchange(
     // Encode the body at the newest shape the schema knows; for a probe of
     // an unknown future version this is the closest well-formed guess.
     req.encode(&mut body, api_version.min(ApiVersionsRequest::MAX_VERSION))
-        .map_err(|e| e.to_string())?;
-
-    let mut frame = conn
-        .round_trip(&header(api_version, correlation_id), header_version, &body)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let echoed = wire::get_i32(&mut frame.clone())
-        .map_err(|_| "response frame shorter than a correlation id".to_string())?;
-    if echoed != correlation_id {
-        return Err(format!(
-            "sent correlation id {correlation_id}, response carries {echoed}"
-        ));
-    }
-    // ApiVersions responses always use response header v0.
-    ResponseHeader::decode(&mut frame, 0).map_err(|e| format!("response header: {e}"))?;
-    let resp = ApiVersionsResponse::decode(&mut frame, decode_at)
-        .map_err(|e| format!("response body (decoded as v{decode_at}): {e}"))?;
-    if !frame.is_empty() {
-        return Err(format!(
-            "{} byte(s) of trailing garbage after the response body",
-            frame.len()
-        ));
-    }
-    Ok(resp)
+        .map_err(|e| CheckError::Infra(e.to_string()))?;
+    checked_call(
+        &mut conn,
+        Call {
+            api_key: ApiVersionsRequest::API_KEY,
+            api_version,
+            request_header_version: header_version,
+            response_header_version: 0,
+            correlation_id,
+            decode_at,
+        },
+        &body,
+    )
+    .await
 }
 
-/// Returns the advertised api keys alongside the verdict; discovery for
-/// the version-adaptive checks. The list is kept even on failure so
-/// downstream checks can still run (and skip with a precise reason).
-async fn v0_basic(addr: &str) -> (Verdict, Vec<ApiVersion>) {
-    let resp = match exchange(addr, 0, 1, 1, 0).await {
+async fn v0_basic(ctx: &ServerCtx) -> Verdict {
+    let resp = match exchange(&ctx.addr, 0, 1, 1, 0).await {
         Ok(resp) => resp,
-        Err(details) => return (Verdict::Fail { details }, Vec::new()),
+        Err(e) => return e.into_verdict(),
     };
     let code = ErrorCode(resp.error_code);
     if !code.is_ok() {
-        return (
-            Verdict::Fail {
-                details: format!("error code {code}"),
-            },
-            resp.api_keys,
-        );
+        return Verdict::Fail {
+            details: format!("error code {code}"),
+        };
     }
     for v in &resp.api_keys {
         if v.min_version > v.max_version {
-            return (
-                Verdict::Fail {
-                    details: format!(
-                        "api key {} advertises min {} > max {}",
-                        v.api_key, v.min_version, v.max_version
-                    ),
-                },
-                resp.api_keys,
-            );
+            return Verdict::Fail {
+                details: format!(
+                    "api key {} advertises min {} > max {}",
+                    v.api_key, v.min_version, v.max_version
+                ),
+            };
         }
     }
-    let advertised = advertised_range(&resp.api_keys, ApiVersionsRequest::API_KEY);
-    let verdict = match advertised {
+    match advertised_range(&resp.api_keys, ApiVersionsRequest::API_KEY) {
         Some((min, _)) if min <= 0 => Verdict::Pass,
         Some((min, max)) => Verdict::Fail {
             details: format!(
@@ -227,18 +404,21 @@ async fn v0_basic(addr: &str) -> (Verdict, Vec<ApiVersion>) {
         None => Verdict::Fail {
             details: "response does not advertise the ApiVersions api itself".into(),
         },
-    };
-    (verdict, resp.api_keys)
-}
-
-async fn correlation_echo(addr: &str) -> Verdict {
-    match exchange(addr, 0, 1, i32::MAX - 17, 0).await {
-        Ok(_) => Verdict::Pass,
-        Err(details) => Verdict::Fail { details },
     }
 }
 
-async fn flexible_v3(addr: &str, advertised: Option<(i16, i16)>) -> Verdict {
+async fn correlation_echo(ctx: &ServerCtx) -> Verdict {
+    match exchange(&ctx.addr, 0, 1, i32::MAX - 17, 0).await {
+        Ok(_) => Verdict::Pass,
+        Err(e) => e.into_verdict(),
+    }
+}
+
+async fn flexible_v3(ctx: &ServerCtx) -> Verdict {
+    let advertised = match ctx.range(ApiVersionsRequest::API_KEY) {
+        Ok(a) => a,
+        Err(v) => return v,
+    };
     let Some((_, max)) = advertised else {
         return Verdict::Skipped {
             reason: "advertised range unknown (v0-basic failed)".into(),
@@ -250,16 +430,20 @@ async fn flexible_v3(addr: &str, advertised: Option<(i16, i16)>) -> Verdict {
         };
     }
     let version = max.min(ApiVersionsRequest::MAX_VERSION);
-    match exchange(addr, version, 2, 2, version).await {
+    match exchange(&ctx.addr, version, 2, 2, version).await {
         Ok(resp) if ErrorCode(resp.error_code).is_ok() => Verdict::Pass,
         Ok(resp) => Verdict::Fail {
             details: format!("error code {}", ErrorCode(resp.error_code)),
         },
-        Err(details) => Verdict::Fail { details },
+        Err(e) => e.into_verdict(),
     }
 }
 
-async fn unsupported_version(addr: &str, advertised: Option<(i16, i16)>) -> Verdict {
+async fn unsupported_version(ctx: &ServerCtx) -> Verdict {
+    let advertised = match ctx.range(ApiVersionsRequest::API_KEY) {
+        Ok(a) => a,
+        Err(v) => return v,
+    };
     let Some((_, max)) = advertised else {
         return Verdict::Skipped {
             reason: "advertised range unknown (v0-basic failed)".into(),
@@ -273,9 +457,9 @@ async fn unsupported_version(addr: &str, advertised: Option<(i16, i16)>) -> Verd
         };
     }
     let probe = max + 7;
-    let resp = match exchange(addr, probe, 2, 3, 0).await {
+    let resp = match exchange(&ctx.addr, probe, 2, 3, 0).await {
         Ok(resp) => resp,
-        Err(details) => return Verdict::Fail { details },
+        Err(e) => return e.into_verdict(),
     };
     let code = ErrorCode(resp.error_code);
     if code != ErrorCode::UNSUPPORTED_VERSION {
@@ -329,100 +513,51 @@ fn negotiate(
     Ok(version)
 }
 
-/// One request/response exchange on an existing connection: send `body`
-/// framed with the version-appropriate headers, validate the correlation
-/// echo, and return the response body bytes.
-async fn request_response(
-    conn: &mut RawConnection,
-    api_key: i16,
-    version: i16,
-    correlation_id: i32,
-    body: &[u8],
-) -> Result<Bytes, String> {
-    let req_hv = header::request_header_version(api_key, version)
-        .ok_or_else(|| format!("no header version known for api {api_key} v{version}"))?;
-    let resp_hv = header::response_header_version(api_key, version)
-        .expect("request header version implies response header version");
-    let mut req_header = RequestHeader::default();
-    req_header.request_api_key = api_key;
-    req_header.request_api_version = version;
-    req_header.correlation_id = correlation_id;
-    req_header.client_id = Some(CLIENT_ID.into());
-    let mut frame = conn
-        .round_trip(&req_header, req_hv, body)
-        .await
-        .map_err(|e| e.to_string())?;
-    let echoed = wire::get_i32(&mut frame.clone())
-        .map_err(|_| "response frame shorter than a correlation id".to_string())?;
-    if echoed != correlation_id {
-        return Err(format!(
-            "sent correlation id {correlation_id}, response carries {echoed}"
-        ));
-    }
-    ResponseHeader::decode(&mut frame, resp_hv)
-        .map_err(|e| format!("response header (decoded as v{resp_hv}): {e}"))?;
-    Ok(frame)
-}
-
-/// One Metadata exchange naming no topics, validating the correlation
-/// echo, the version-appropriate response header, and full body decode.
+/// One Metadata exchange naming no topics, on a fresh connection, with
+/// the version-appropriate headers.
 async fn metadata_exchange(
     addr: &str,
     version: i16,
     correlation_id: i32,
-) -> Result<MetadataResponse, String> {
-    let mut conn = RawConnection::connect(addr)
-        .await
-        .map_err(|e| e.to_string())?;
+) -> Result<MetadataResponse, CheckError> {
+    let mut conn = connect(addr).await?;
     let mut req = MetadataRequest::default();
     // An empty (non-null) topics array means "no topics" from v1 on;
     // the checks only negotiate v1+.
     req.topics = Some(Vec::new());
     req.allow_auto_topic_creation = false;
     let mut body = BytesMut::new();
-    req.encode(&mut body, version).map_err(|e| e.to_string())?;
+    req.encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(e.to_string()))?;
 
     let flexible = metadata_request::is_flexible(version);
-    let mut header = RequestHeader::default();
-    header.request_api_key = MetadataRequest::API_KEY;
-    header.request_api_version = version;
-    header.correlation_id = correlation_id;
-    header.client_id = Some(CLIENT_ID.into());
-    let mut frame = conn
-        .round_trip(&header, if flexible { 2 } else { 1 }, &body)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let echoed = wire::get_i32(&mut frame.clone())
-        .map_err(|_| "response frame shorter than a correlation id".to_string())?;
-    if echoed != correlation_id {
-        return Err(format!(
-            "sent correlation id {correlation_id}, response carries {echoed}"
-        ));
-    }
-    let resp_header_version = if flexible { 1 } else { 0 };
-    ResponseHeader::decode(&mut frame, resp_header_version)
-        .map_err(|e| format!("response header (decoded as v{resp_header_version}): {e}"))?;
-    let resp = MetadataResponse::decode(&mut frame, version)
-        .map_err(|e| format!("response body (decoded as v{version}): {e}"))?;
-    if !frame.is_empty() {
-        return Err(format!(
-            "{} byte(s) left over after the response body — wrong response \
-             header version or corrupt body encoding",
-            frame.len()
-        ));
-    }
-    Ok(resp)
+    checked_call(
+        &mut conn,
+        Call {
+            api_key: MetadataRequest::API_KEY,
+            api_version: version,
+            request_header_version: if flexible { 2 } else { 1 },
+            response_header_version: if flexible { 1 } else { 0 },
+            correlation_id,
+            decode_at: version,
+        },
+        &body,
+    )
+    .await
 }
 
-async fn metadata_basic(addr: &str, advertised: Option<(i16, i16)>) -> Verdict {
+async fn metadata_basic(ctx: &ServerCtx) -> Verdict {
+    let advertised = match ctx.range(MetadataRequest::API_KEY) {
+        Ok(a) => a,
+        Err(v) => return v,
+    };
     let version = match negotiate("Metadata", advertised, 1, MetadataRequest::MAX_VERSION) {
         Ok(v) => v,
         Err(skip) => return skip,
     };
-    let resp = match metadata_exchange(addr, version, 4).await {
+    let resp = match metadata_exchange(&ctx.addr, version, 4).await {
         Ok(resp) => resp,
-        Err(details) => return Verdict::Fail { details },
+        Err(e) => return e.into_verdict(),
     };
     if resp.brokers.is_empty() {
         return Verdict::Fail {
@@ -458,7 +593,11 @@ async fn metadata_basic(addr: &str, advertised: Option<(i16, i16)>) -> Verdict {
     Verdict::Pass
 }
 
-async fn metadata_flexible_header(addr: &str, advertised: Option<(i16, i16)>) -> Verdict {
+async fn metadata_flexible_header(ctx: &ServerCtx) -> Verdict {
+    let advertised = match ctx.range(MetadataRequest::API_KEY) {
+        Ok(a) => a,
+        Err(v) => return v,
+    };
     let version = match negotiate("Metadata", advertised, 9, MetadataRequest::MAX_VERSION) {
         Ok(v) => v,
         Err(skip) => return skip,
@@ -466,9 +605,9 @@ async fn metadata_flexible_header(addr: &str, advertised: Option<(i16, i16)>) ->
     // metadata_exchange decodes the response header at v1 for flexible
     // versions and demands the body consume every remaining byte, so a
     // v0-header response cannot pass undetected.
-    match metadata_exchange(addr, version, 5).await {
+    match metadata_exchange(&ctx.addr, version, 5).await {
         Ok(_) => Verdict::Pass,
-        Err(details) => Verdict::Fail { details },
+        Err(e) => e.into_verdict(),
     }
 }
 
@@ -562,18 +701,17 @@ enum Addressing {
 /// Create a unique single-partition topic and produce [`probe_batch`] to
 /// partition 0 with acks=-1, retrying while the topic materializes.
 async fn produce_flow(
-    addr: &str,
+    ctx: &ServerCtx,
     tag: &str,
-    create_range: Option<(i16, i16)>,
-    produce_range: Option<(i16, i16)>,
     addressing: Addressing,
 ) -> Result<ProducedTopic, Verdict> {
     let create_version = negotiate(
         "CreateTopics",
-        create_range,
+        ctx.range(CreateTopicsRequest::API_KEY)?,
         CreateTopicsRequest::MIN_VERSION,
         CreateTopicsRequest::MAX_VERSION,
     )?;
+    let produce_range = ctx.range(ProduceRequest::API_KEY)?;
     let produce_version = match addressing {
         Addressing::Name => negotiate(
             "Produce",
@@ -589,10 +727,10 @@ async fn produce_flow(
         )?,
     };
     let fail = |details: String| Verdict::Fail { details };
+    // Failing to encode our own request means the check never ran.
+    let infra = |details: String| Verdict::Error { details };
 
-    let mut conn = RawConnection::connect(addr)
-        .await
-        .map_err(|e| fail(e.to_string()))?;
+    let mut conn = connect(&ctx.addr).await.map_err(CheckError::into_verdict)?;
     let topic = unique_topic(tag);
 
     // Create the topic.
@@ -607,8 +745,8 @@ async fn produce_flow(
     let mut body = BytesMut::new();
     create
         .encode(&mut body, create_version)
-        .map_err(|e| fail(e.to_string()))?;
-    let mut resp = request_response(
+        .map_err(|e| infra(e.to_string()))?;
+    let resp: CreateTopicsResponse = api_call(
         &mut conn,
         CreateTopicsRequest::API_KEY,
         create_version,
@@ -616,9 +754,7 @@ async fn produce_flow(
         &body,
     )
     .await
-    .map_err(|e| fail(format!("CreateTopics: {e}")))?;
-    let resp = CreateTopicsResponse::decode(&mut resp, create_version)
-        .map_err(|e| fail(format!("CreateTopics response (v{create_version}): {e}")))?;
+    .map_err(|e| e.context("CreateTopics").into_verdict())?;
     let result = resp
         .topics
         .first()
@@ -645,7 +781,7 @@ async fn produce_flow(
     let mut sent = BytesMut::new();
     probe_batch()
         .encode(&mut sent)
-        .map_err(|e| fail(e.to_string()))?;
+        .map_err(|e| infra(e.to_string()))?;
     let sent = sent.freeze();
 
     let mut partition_data = PartitionProduceData::default();
@@ -670,11 +806,11 @@ async fn produce_flow(
     let mut body = BytesMut::new();
     produce
         .encode(&mut body, produce_version)
-        .map_err(|e| fail(e.to_string()))?;
+        .map_err(|e| infra(e.to_string()))?;
 
     let mut last_code = ErrorCode(0);
     for _ in 0..SETTLE_ATTEMPTS {
-        let mut resp = request_response(
+        let resp: ProduceResponse = api_call(
             &mut conn,
             ProduceRequest::API_KEY,
             produce_version,
@@ -682,9 +818,7 @@ async fn produce_flow(
             &body,
         )
         .await
-        .map_err(|e| fail(format!("Produce: {e}")))?;
-        let resp = ProduceResponse::decode(&mut resp, produce_version)
-            .map_err(|e| fail(format!("Produce response (v{produce_version}): {e}")))?;
+        .map_err(|e| e.context("Produce").into_verdict())?;
         let partition = resp
             .responses
             .first()
@@ -711,20 +845,8 @@ async fn produce_flow(
     )))
 }
 
-async fn produce_basic(
-    addr: &str,
-    create_range: Option<(i16, i16)>,
-    produce_range: Option<(i16, i16)>,
-) -> Verdict {
-    let produced = match produce_flow(
-        addr,
-        "produce",
-        create_range,
-        produce_range,
-        Addressing::Name,
-    )
-    .await
-    {
+async fn produce_basic(ctx: &ServerCtx) -> Verdict {
+    let produced = match produce_flow(ctx, "produce", Addressing::Name).await {
         Ok(p) => p,
         Err(verdict) => return verdict,
     };
@@ -739,20 +861,8 @@ async fn produce_basic(
     Verdict::Pass
 }
 
-async fn produce_topic_id(
-    addr: &str,
-    create_range: Option<(i16, i16)>,
-    produce_range: Option<(i16, i16)>,
-) -> Verdict {
-    match produce_flow(
-        addr,
-        "produce-id",
-        create_range,
-        produce_range,
-        Addressing::TopicId,
-    )
-    .await
-    {
+async fn produce_topic_id(ctx: &ServerCtx) -> Verdict {
+    match produce_flow(ctx, "produce-id", Addressing::TopicId).await {
         Ok(_) => Verdict::Pass,
         Err(verdict) => verdict,
     }
@@ -765,7 +875,7 @@ async fn run_fetch(
     produced: &mut ProducedTopic,
     fetch_version: i16,
     addressing: Addressing,
-) -> Result<Bytes, String> {
+) -> Result<Bytes, CheckError> {
     let mut fetch_partition = FetchPartition::default();
     fetch_partition.partition = 0;
     fetch_partition.current_leader_epoch = -1;
@@ -793,14 +903,14 @@ async fn run_fetch(
     let mut body = BytesMut::new();
     fetch
         .encode(&mut body, fetch_version)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| CheckError::Infra(e.to_string()))?;
 
     // acks=-1 already committed the batch, but give replication internals
     // a moment anyway rather than failing on an empty first response.
     let mut last = String::from("fetch returned no records");
     for _ in 0..SETTLE_ATTEMPTS {
         let outcome = async {
-            let mut resp = request_response(
+            let resp: FetchResponse = api_call(
                 &mut produced.conn,
                 FetchRequest::API_KEY,
                 fetch_version,
@@ -808,30 +918,29 @@ async fn run_fetch(
                 &body,
             )
             .await
-            .map_err(|e| format!("Fetch: {e}"))?;
-            let resp = FetchResponse::decode(&mut resp, fetch_version)
-                .map_err(|e| format!("Fetch response (v{fetch_version}): {e}"))?;
+            .map_err(|e| e.context("Fetch"))?;
             let code = ErrorCode(resp.error_code);
             if !code.is_ok() {
-                return Err(format!("Fetch failed with top-level {code}"));
+                return Err(CheckError::Violation(format!(
+                    "Fetch failed with top-level {code}"
+                )));
             }
             let topic = resp
                 .responses
                 .first()
-                .ok_or_else(|| "Fetch response names no topics".to_string())?;
+                .ok_or_else(|| CheckError::Violation("Fetch response names no topics".into()))?;
             if addressing == Addressing::TopicId && topic.topic_id != produced.topic_id {
-                return Err(format!(
+                return Err(CheckError::Violation(format!(
                     "response echoes topic id {:02x?}, requested {:02x?}",
                     topic.topic_id, produced.topic_id
-                ));
+                )));
             }
-            let partition = topic
-                .partitions
-                .first()
-                .ok_or_else(|| "Fetch response names no partitions".to_string())?;
+            let partition = topic.partitions.first().ok_or_else(|| {
+                CheckError::Violation("Fetch response names no partitions".into())
+            })?;
             let code = ErrorCode(partition.error_code);
             if !code.is_ok() {
-                return Err(format!("Fetch failed with {code}"));
+                return Err(CheckError::Violation(format!("Fetch failed with {code}")));
             }
             Ok(partition.records.clone().unwrap_or_default())
         }
@@ -839,7 +948,9 @@ async fn run_fetch(
         match outcome {
             Ok(got) if !got.is_empty() => return Ok(got),
             Ok(_) => {}
-            Err(details) => {
+            // Infrastructure trouble is not going to settle; surface it.
+            Err(CheckError::Infra(details)) => return Err(CheckError::Infra(details)),
+            Err(CheckError::Violation(details)) => {
                 let transient = [
                     "UNKNOWN_TOPIC_OR_PARTITION",
                     "NOT_LEADER_OR_FOLLOWER",
@@ -847,22 +958,21 @@ async fn run_fetch(
                     "UNKNOWN_TOPIC_ID",
                 ];
                 if !transient.iter().any(|t| details.contains(t)) {
-                    return Err(details);
+                    return Err(CheckError::Violation(details));
                 }
                 last = details;
             }
         }
         tokio::time::sleep(SETTLE_DELAY).await;
     }
-    Err(last)
+    Err(CheckError::Violation(last))
 }
 
-async fn fetch_batch_integrity(
-    addr: &str,
-    create_range: Option<(i16, i16)>,
-    produce_range: Option<(i16, i16)>,
-    fetch_range: Option<(i16, i16)>,
-) -> Verdict {
+async fn fetch_batch_integrity(ctx: &ServerCtx) -> Verdict {
+    let fetch_range = match ctx.range(FetchRequest::API_KEY) {
+        Ok(r) => r,
+        Err(v) => return v,
+    };
     let fetch_version = match negotiate(
         "Fetch",
         fetch_range,
@@ -874,23 +984,21 @@ async fn fetch_batch_integrity(
     };
     // The flow tolerates a wrong assigned base offset here — that is
     // produce/basic's finding — and always fetches from offset 0.
-    let mut produced =
-        match produce_flow(addr, "fetch", create_range, produce_range, Addressing::Name).await {
-            Ok(p) => p,
-            Err(verdict) => return verdict,
-        };
+    let mut produced = match produce_flow(ctx, "fetch", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
     match run_fetch(&mut produced, fetch_version, Addressing::Name).await {
         Ok(got) => batch_integrity(&produced.sent, &got),
-        Err(details) => Verdict::Fail { details },
+        Err(e) => e.into_verdict(),
     }
 }
 
-async fn fetch_topic_id(
-    addr: &str,
-    create_range: Option<(i16, i16)>,
-    produce_range: Option<(i16, i16)>,
-    fetch_range: Option<(i16, i16)>,
-) -> Verdict {
+async fn fetch_topic_id(ctx: &ServerCtx) -> Verdict {
+    let fetch_range = match ctx.range(FetchRequest::API_KEY) {
+        Ok(r) => r,
+        Err(v) => return v,
+    };
     let fetch_version = match negotiate(
         "Fetch",
         fetch_range,
@@ -902,15 +1010,7 @@ async fn fetch_topic_id(
     };
     // Produce by name (that leg has its own checks); the id under test
     // here is the fetch path's.
-    let mut produced = match produce_flow(
-        addr,
-        "fetch-id",
-        create_range,
-        produce_range,
-        Addressing::Name,
-    )
-    .await
-    {
+    let mut produced = match produce_flow(ctx, "fetch-id", Addressing::Name).await {
         Ok(p) => p,
         Err(verdict) => return verdict,
     };
@@ -921,7 +1021,7 @@ async fn fetch_topic_id(
     }
     match run_fetch(&mut produced, fetch_version, Addressing::TopicId).await {
         Ok(got) => batch_integrity(&produced.sent, &got),
-        Err(details) => Verdict::Fail { details },
+        Err(e) => e.into_verdict(),
     }
 }
 
