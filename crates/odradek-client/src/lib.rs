@@ -38,6 +38,7 @@ pub mod group;
 pub mod negotiate;
 mod offsets;
 pub mod producer;
+mod retry;
 #[cfg(feature = "sasl")]
 pub mod sasl;
 #[cfg(feature = "tls")]

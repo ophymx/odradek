@@ -34,6 +34,7 @@ use odradek_protocol::messages::sync_group_response::SyncGroupResponse;
 use crate::cluster::Cluster;
 use crate::error::ClientError;
 use crate::offsets::{self, CommitIdentity};
+use crate::retry::{Attempt, or_forget_coordinator, retry_loop};
 
 /// JoinGroup versions this member speaks: v4+ for the MEMBER_ID_REQUIRED
 /// handshake.
@@ -142,32 +143,31 @@ impl GroupMember {
 
     /// Run one join/sync round, updating generation and assignment.
     pub async fn rejoin(&mut self) -> Result<(), ClientError> {
-        let mut last = None;
-        for round in 0..self.config.max_attempts {
-            if round > 0 {
-                tokio::time::sleep(self.config.retry_backoff).await;
-            }
-            match self.join_round().await {
-                Ok(()) => return Ok(()),
-                Err(e) if e.is_retriable() => {
-                    self.cluster.forget_coordinator(&self.group_id);
-                    last = Some(e);
+        let (max_attempts, backoff) = (self.config.max_attempts, self.config.retry_backoff);
+        retry_loop(&mut *self, max_attempts, backoff, |this| {
+            Box::pin(async move {
+                match this.join_round().await {
+                    Ok(()) => Attempt::Done(()),
+                    Err(e) if e.is_retriable() => {
+                        this.cluster.forget_coordinator(&this.group_id);
+                        Attempt::Retry(e)
+                    }
+                    // The join/sync dance's own transient states.
+                    Err(ClientError::Broker(code))
+                        if code == ErrorCode::REBALANCE_IN_PROGRESS
+                            || code == ErrorCode::ILLEGAL_GENERATION =>
+                    {
+                        Attempt::Retry(ClientError::Broker(code))
+                    }
+                    Err(ClientError::Broker(code)) if code == ErrorCode::UNKNOWN_MEMBER_ID => {
+                        this.member_id.clear();
+                        Attempt::Retry(ClientError::Broker(code))
+                    }
+                    Err(e) => Attempt::Fatal(e),
                 }
-                // The join/sync dance's own transient states.
-                Err(ClientError::Broker(code))
-                    if code == ErrorCode::REBALANCE_IN_PROGRESS
-                        || code == ErrorCode::ILLEGAL_GENERATION =>
-                {
-                    last = Some(ClientError::Broker(code));
-                }
-                Err(ClientError::Broker(code)) if code == ErrorCode::UNKNOWN_MEMBER_ID => {
-                    self.member_id.clear();
-                    last = Some(ClientError::Broker(code));
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(last.unwrap_or(ClientError::ConnectionClosed))
+            })
+        })
+        .await
     }
 
     async fn join_round(&mut self) -> Result<(), ClientError> {
@@ -295,34 +295,30 @@ impl GroupMember {
         // Retriable errors (the coordinator moved, the connection died)
         // invalidate the discovered coordinator and retry; fencing
         // errors are not retriable and surface immediately.
-        let mut last = None;
-        for round in 0..self.config.max_attempts {
-            if round > 0 {
-                tokio::time::sleep(self.config.retry_backoff).await;
-            }
-            let identity = CommitIdentity {
-                generation_id: self.generation_id,
-                member_id: &self.member_id,
-            };
-            match offsets::commit_once(
-                &self.cluster,
-                &self.group_id,
-                identity,
-                topic,
-                partition,
-                offset,
-            )
-            .await
-            {
-                Ok(()) => return Ok(()),
-                Err(e) if e.is_retriable() => {
-                    self.cluster.forget_coordinator(&self.group_id);
-                    last = Some(e);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(last.unwrap_or(ClientError::ConnectionClosed))
+        retry_loop(
+            &mut &*self,
+            self.config.max_attempts,
+            self.config.retry_backoff,
+            |this| {
+                Box::pin(async move {
+                    let identity = CommitIdentity {
+                        generation_id: this.generation_id,
+                        member_id: &this.member_id,
+                    };
+                    let result = offsets::commit_once(
+                        &this.cluster,
+                        &this.group_id,
+                        identity,
+                        topic,
+                        partition,
+                        offset,
+                    )
+                    .await;
+                    or_forget_coordinator(&this.cluster, &this.group_id, result)
+                })
+            },
+        )
+        .await
     }
 
     /// The offset last committed for `topic[partition]` under this
@@ -332,32 +328,40 @@ impl GroupMember {
         topic: &str,
         partition: i32,
     ) -> Result<Option<i64>, ClientError> {
-        let mut last = None;
-        for round in 0..self.config.max_attempts {
-            if round > 0 {
-                tokio::time::sleep(self.config.retry_backoff).await;
-            }
-            match offsets::committed_once(&self.cluster, &self.group_id, topic, partition).await {
-                Ok(v) => return Ok(v),
-                Err(e) if e.is_retriable() => {
-                    self.cluster.forget_coordinator(&self.group_id);
-                    last = Some(e);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(last.unwrap_or(ClientError::ConnectionClosed))
+        retry_loop(
+            &mut &*self,
+            self.config.max_attempts,
+            self.config.retry_backoff,
+            |this| {
+                Box::pin(async move {
+                    let result =
+                        offsets::committed_once(&this.cluster, &this.group_id, topic, partition)
+                            .await;
+                    or_forget_coordinator(&this.cluster, &this.group_id, result)
+                })
+            },
+        )
+        .await
     }
 
     /// Tell the coordinator this member is alive; the caller should do
     /// this well within the session timeout.
     pub async fn heartbeat(&mut self) -> Result<HeartbeatStatus, ClientError> {
-        let mut last = None;
-        for round in 0..self.config.max_attempts {
-            if round > 0 {
-                tokio::time::sleep(self.config.retry_backoff).await;
-            }
-            let broker = self.cluster.coordinator(&self.group_id).await?;
+        let (max_attempts, backoff) = (self.config.max_attempts, self.config.retry_backoff);
+        retry_loop(&mut *self, max_attempts, backoff, |this| {
+            Box::pin(this.heartbeat_attempt())
+        })
+        .await
+    }
+
+    async fn heartbeat_attempt(&mut self) -> Attempt<HeartbeatStatus> {
+        // Coordinator discovery failures classify like every other
+        // coordinator-scoped error: forget and rediscover.
+        let broker = match self.cluster.coordinator(&self.group_id).await {
+            Ok(broker) => broker,
+            Err(e) => return or_forget_coordinator(&self.cluster, &self.group_id, Err(e)),
+        };
+        let sent = async {
             let version = broker
                 .ranges
                 .pick(HeartbeatRequest::API_KEY, HEARTBEAT_SUPPORTED)?;
@@ -367,36 +371,26 @@ impl GroupMember {
             request.member_id = self.member_id.clone();
             let mut body = BytesMut::new();
             request.encode(&mut body, version)?;
-            let resp = broker
+            let mut resp = broker
                 .conn
                 .request(HeartbeatRequest::API_KEY, version, &body)
-                .await
-                .and_then(|mut b| Ok(HeartbeatResponse::decode(&mut b, version)?));
-            let code = match resp {
-                Ok(resp) => ErrorCode(resp.error_code),
-                Err(e) if e.is_retriable() => {
-                    self.cluster.forget_coordinator(&self.group_id);
-                    last = Some(e);
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            return Ok(match code {
-                c if c.is_ok() => HeartbeatStatus::Stable,
-                ErrorCode::REBALANCE_IN_PROGRESS => HeartbeatStatus::RebalanceInProgress,
-                ErrorCode::UNKNOWN_MEMBER_ID | ErrorCode::ILLEGAL_GENERATION => {
-                    self.member_id.clear();
-                    HeartbeatStatus::Evicted
-                }
-                c if ClientError::Broker(c).is_retriable() => {
-                    self.cluster.forget_coordinator(&self.group_id);
-                    last = Some(ClientError::Broker(c));
-                    continue;
-                }
-                c => return Err(ClientError::Broker(c)),
-            });
+                .await?;
+            Ok(HeartbeatResponse::decode(&mut resp, version)?)
         }
-        Err(last.unwrap_or(ClientError::ConnectionClosed))
+        .await;
+        let code = match sent {
+            Ok(resp) => ErrorCode(resp.error_code),
+            Err(e) => return or_forget_coordinator(&self.cluster, &self.group_id, Err(e)),
+        };
+        match code {
+            c if c.is_ok() => Attempt::Done(HeartbeatStatus::Stable),
+            ErrorCode::REBALANCE_IN_PROGRESS => Attempt::Done(HeartbeatStatus::RebalanceInProgress),
+            ErrorCode::UNKNOWN_MEMBER_ID | ErrorCode::ILLEGAL_GENERATION => {
+                self.member_id.clear();
+                Attempt::Done(HeartbeatStatus::Evicted)
+            }
+            c => or_forget_coordinator(&self.cluster, &self.group_id, Err(ClientError::Broker(c))),
+        }
     }
 
     /// Leave the group cleanly. The cluster handle is a cheap clone;

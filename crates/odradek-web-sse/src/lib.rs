@@ -47,14 +47,12 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::routing::get;
-use bytes::Bytes;
-use serde::Deserialize;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
 use odradek_web_core::json::event_json;
 use odradek_web_core::pump::{HubError, StreamItem};
-use odradek_web_core::{Filter, Hub, Position, SourceErrorKind, TopicPosition, cursor};
+use odradek_web_core::{Hub, SourceErrorKind, StreamParams, TopicPosition, cursor};
 
 /// Everything needed to stand the router up, re-exported so embedders
 /// depend on this crate alone; the full engine is under [`web_core`].
@@ -116,6 +114,19 @@ fn error_frame(err: &odradek_web_core::StreamError) -> SseEvent {
     )
 }
 
+/// The raw `Last-Event-ID` header value, if any; non-UTF-8 is a 400.
+fn last_event_id(headers: &HeaderMap) -> Result<Option<String>, (StatusCode, String)> {
+    match headers.get("last-event-id") {
+        None => Ok(None),
+        Some(v) => v.to_str().map(|s| Some(s.to_owned())).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Last-Event-ID must be UTF-8".to_owned(),
+            )
+        }),
+    }
+}
+
 /// The SSE routes over `state`; merge into your own [`Router`].
 pub fn router<F: SourceFactory>(state: Arc<SseState<F>>) -> Router {
     Router::new()
@@ -127,55 +138,6 @@ pub fn router<F: SourceFactory>(state: Arc<SseState<F>>) -> Router {
         .with_state(state)
 }
 
-#[derive(Debug, Deserialize)]
-struct StreamParams {
-    from: Option<String>,
-    key_prefix: Option<String>,
-    header: Option<String>,
-}
-
-impl StreamParams {
-    /// `Last-Event-ID` (a reconnect) wins over `from`.
-    fn position(&self, headers: &HeaderMap) -> Result<Position, String> {
-        if let Some(last) = headers.get("last-event-id") {
-            // Ids are resume tokens (next offset), used verbatim.
-            let last: i64 = last
-                .to_str()
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| "Last-Event-ID must be an offset".to_owned())?;
-            return Ok(Position::Offset(last));
-        }
-        match self.from.as_deref() {
-            None | Some("latest") => Ok(Position::Latest),
-            Some("earliest") => Ok(Position::Earliest),
-            Some(raw) => raw
-                .parse()
-                .map(Position::Offset)
-                .map_err(|_| format!("from must be earliest, latest, or an offset (got {raw:?})")),
-        }
-    }
-
-    fn filter(&self) -> Result<Filter, String> {
-        let header = match &self.header {
-            None => None,
-            Some(raw) => {
-                let (name, value) = raw
-                    .split_once(':')
-                    .ok_or_else(|| "header filter must be <name>:<value>".to_owned())?;
-                Some((name.to_owned(), Bytes::copy_from_slice(value.as_bytes())))
-            }
-        };
-        Ok(Filter {
-            key_prefix: self
-                .key_prefix
-                .as_ref()
-                .map(|p| Bytes::copy_from_slice(p.as_bytes())),
-            header,
-        })
-    }
-}
-
 async fn stream_partition<F: SourceFactory>(
     State(state): State<Arc<SseState<F>>>,
     Path((topic, partition)): Path<(String, i32)>,
@@ -184,7 +146,7 @@ async fn stream_partition<F: SourceFactory>(
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>>, (StatusCode, String)>
 {
     let position = params
-        .position(&headers)
+        .position(last_event_id(&headers)?.as_deref())
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let filter = params.filter().map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
@@ -221,7 +183,9 @@ async fn stream_topic<F: SourceFactory>(
     headers: HeaderMap,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>>, (StatusCode, String)>
 {
-    let position = topic_position(&params, &headers).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let position = params
+        .topic_position(last_event_id(&headers)?.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let filter = params.filter().map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
     // Seed the running cursor from the resume point, so an id always
@@ -253,20 +217,4 @@ async fn stream_topic<F: SourceFactory>(
         })
     });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
-}
-
-/// `Last-Event-ID` (a cursor) wins over `from`; `from` accepts
-/// `earliest`, `latest`, or a cursor.
-fn topic_position(params: &StreamParams, headers: &HeaderMap) -> Result<TopicPosition, String> {
-    if let Some(last) = headers.get("last-event-id") {
-        let raw = last
-            .to_str()
-            .map_err(|_| "Last-Event-ID must be a cursor".to_owned())?;
-        return Ok(TopicPosition::Offsets(cursor::parse(raw)?));
-    }
-    match params.from.as_deref() {
-        None | Some("latest") => Ok(TopicPosition::Latest),
-        Some("earliest") => Ok(TopicPosition::Earliest),
-        Some(raw) => Ok(TopicPosition::Offsets(cursor::parse(raw)?)),
-    }
 }

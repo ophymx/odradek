@@ -23,6 +23,7 @@ use odradek_protocol::records::{Record, RecordHeader, Records, decode_set};
 use crate::cluster::Cluster;
 use crate::error::ClientError;
 use crate::offsets::{self, CommitIdentity};
+use crate::retry::{or_forget_coordinator, or_mark_stale, retry_loop};
 
 /// Fetch versions this consumer speaks: name-addressed (v13+ switches to
 /// topic ids).
@@ -121,25 +122,49 @@ impl Consumer {
         partition: i32,
         offset: i64,
     ) -> Result<FetchResult, ClientError> {
-        self.with_retries(topic, |this| {
-            Box::pin(this.fetch_once(topic.to_owned(), partition, offset))
-        })
+        retry_loop(
+            &mut &*self,
+            self.config.max_attempts,
+            self.config.retry_backoff,
+            |this| {
+                Box::pin(async move {
+                    let result = this.fetch_once(topic, partition, offset).await;
+                    or_mark_stale(&this.cluster, topic, result)
+                })
+            },
+        )
         .await
     }
 
     /// The partition's oldest available offset (the log start).
     pub async fn earliest_offset(&self, topic: &str, partition: i32) -> Result<i64, ClientError> {
-        self.with_retries(topic, |this| {
-            Box::pin(this.list_offset_once(topic.to_owned(), partition, EARLIEST))
-        })
+        retry_loop(
+            &mut &*self,
+            self.config.max_attempts,
+            self.config.retry_backoff,
+            |this| {
+                Box::pin(async move {
+                    let result = this.list_offset_once(topic, partition, EARLIEST).await;
+                    or_mark_stale(&this.cluster, topic, result)
+                })
+            },
+        )
         .await
     }
 
     /// The partition's next-to-be-assigned offset (the log end).
     pub async fn latest_offset(&self, topic: &str, partition: i32) -> Result<i64, ClientError> {
-        self.with_retries(topic, |this| {
-            Box::pin(this.list_offset_once(topic.to_owned(), partition, LATEST))
-        })
+        retry_loop(
+            &mut &*self,
+            self.config.max_attempts,
+            self.config.retry_backoff,
+            |this| {
+                Box::pin(async move {
+                    let result = this.list_offset_once(topic, partition, LATEST).await;
+                    or_mark_stale(&this.cluster, topic, result)
+                })
+            },
+        )
         .await
     }
 
@@ -153,9 +178,25 @@ impl Consumer {
         partition: i32,
         offset: i64,
     ) -> Result<(), ClientError> {
-        self.with_group_retries(group, |this| {
-            Box::pin(this.commit_once(group.to_owned(), topic.to_owned(), partition, offset))
-        })
+        retry_loop(
+            &mut &*self,
+            self.config.max_attempts,
+            self.config.retry_backoff,
+            |this| {
+                Box::pin(async move {
+                    let result = offsets::commit_once(
+                        &this.cluster,
+                        group,
+                        CommitIdentity::SIMPLE,
+                        topic,
+                        partition,
+                        offset,
+                    )
+                    .await;
+                    or_forget_coordinator(&this.cluster, group, result)
+                })
+            },
+        )
         .await
     }
 
@@ -167,104 +208,29 @@ impl Consumer {
         topic: &str,
         partition: i32,
     ) -> Result<Option<i64>, ClientError> {
-        self.with_group_retries(group, |this| {
-            Box::pin(this.committed_once(group.to_owned(), topic.to_owned(), partition))
-        })
-        .await
-    }
-
-    /// Like [`Self::with_retries`], but coordinator-scoped: a retriable
-    /// error invalidates the discovered coordinator, not topic metadata.
-    async fn with_group_retries<T>(
-        &self,
-        group: &str,
-        mut attempt: impl for<'a> FnMut(
-            &'a Consumer,
-        ) -> std::pin::Pin<
-            Box<dyn Future<Output = Result<T, ClientError>> + Send + 'a>,
-        >,
-    ) -> Result<T, ClientError> {
-        let mut last = None;
-        for round in 0..self.config.max_attempts {
-            if round > 0 {
-                tokio::time::sleep(self.config.retry_backoff).await;
-            }
-            match attempt(self).await {
-                Ok(v) => return Ok(v),
-                Err(e) if e.is_retriable() => {
-                    self.cluster.forget_coordinator(group);
-                    last = Some(e);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(last.unwrap_or(ClientError::ConnectionClosed))
-    }
-
-    async fn commit_once(
-        &self,
-        group: String,
-        topic: String,
-        partition: i32,
-        offset: i64,
-    ) -> Result<(), ClientError> {
-        // Simple consumer: no generation, no member, no fencing. A group
-        // member commits through `GroupMember::commit_offset`, which
-        // carries its real generation so the coordinator fences zombies.
-        offsets::commit_once(
-            &self.cluster,
-            &group,
-            CommitIdentity::SIMPLE,
-            &topic,
-            partition,
-            offset,
+        retry_loop(
+            &mut &*self,
+            self.config.max_attempts,
+            self.config.retry_backoff,
+            |this| {
+                Box::pin(async move {
+                    let result =
+                        offsets::committed_once(&this.cluster, group, topic, partition).await;
+                    or_forget_coordinator(&this.cluster, group, result)
+                })
+            },
         )
         .await
     }
 
-    async fn committed_once(
-        &self,
-        group: String,
-        topic: String,
-        partition: i32,
-    ) -> Result<Option<i64>, ClientError> {
-        offsets::committed_once(&self.cluster, &group, &topic, partition).await
-    }
-
-    async fn with_retries<T>(
-        &self,
-        topic: &str,
-        mut attempt: impl for<'a> FnMut(
-            &'a Consumer,
-        ) -> std::pin::Pin<
-            Box<dyn Future<Output = Result<T, ClientError>> + Send + 'a>,
-        >,
-    ) -> Result<T, ClientError> {
-        let mut last = None;
-        for round in 0..self.config.max_attempts {
-            if round > 0 {
-                tokio::time::sleep(self.config.retry_backoff).await;
-            }
-            match attempt(self).await {
-                Ok(v) => return Ok(v),
-                Err(e) if e.is_retriable() => {
-                    self.cluster.mark_stale(topic);
-                    last = Some(e);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(last.unwrap_or(ClientError::ConnectionClosed))
-    }
-
     async fn fetch_once(
         &self,
-        topic: String,
+        topic: &str,
         partition: i32,
         offset: i64,
     ) -> Result<FetchResult, ClientError> {
-        let broker = self.cluster.partition_leader(&topic, partition).await?;
-        let leader = self.cluster.leader_id(&topic, partition);
+        let broker = self.cluster.partition_leader(topic, partition).await?;
+        let leader = self.cluster.leader_id(topic, partition);
         let version = broker.ranges.pick(FetchRequest::API_KEY, FETCH_SUPPORTED)?;
 
         let mut fetch_partition = FetchPartition::default();
@@ -275,7 +241,7 @@ impl Consumer {
         fetch_partition.log_start_offset = -1;
         fetch_partition.partition_max_bytes = self.config.partition_max_bytes;
         let mut fetch_topic = FetchTopic::default();
-        fetch_topic.topic = topic.clone();
+        fetch_topic.topic = topic.to_owned();
         fetch_topic.partitions = vec![fetch_partition];
         let mut request = FetchRequest::default();
         request.max_wait_ms = self.config.max_wait_ms;
@@ -377,11 +343,11 @@ impl Consumer {
 
     async fn list_offset_once(
         &self,
-        topic: String,
+        topic: &str,
         partition: i32,
         timestamp: i64,
     ) -> Result<i64, ClientError> {
-        let broker = self.cluster.partition_leader(&topic, partition).await?;
+        let broker = self.cluster.partition_leader(topic, partition).await?;
         let version = broker
             .ranges
             .pick(ListOffsetsRequest::API_KEY, LIST_OFFSETS_SUPPORTED)?;
@@ -391,7 +357,7 @@ impl Consumer {
         request_partition.current_leader_epoch = -1;
         request_partition.timestamp = timestamp;
         let mut request_topic = ListOffsetsTopic::default();
-        request_topic.name = topic.clone();
+        request_topic.name = topic.to_owned();
         request_topic.partitions = vec![request_partition];
         let mut request = ListOffsetsRequest::default();
         request.replica_id = -1;

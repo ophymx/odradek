@@ -528,6 +528,7 @@ dependencies = [
  "base64",
  "bytes",
  "odradek-client",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",

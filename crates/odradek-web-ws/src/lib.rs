@@ -42,12 +42,10 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::get;
-use bytes::Bytes;
-use serde::Deserialize;
 
 use odradek_web_core::json::event_json;
 use odradek_web_core::pump::{HubError, StreamError, StreamItem};
-use odradek_web_core::{Filter, Hub, Position, SourceErrorKind, TopicPosition, cursor};
+use odradek_web_core::{Hub, SourceErrorKind, StreamParams};
 
 /// Everything needed to stand the router up, re-exported so embedders
 /// depend on this crate alone; the full engine is under [`web_core`].
@@ -108,45 +106,6 @@ pub fn router<F: SourceFactory>(state: Arc<WsState<F>>) -> Router {
         .with_state(state)
 }
 
-#[derive(Debug, Deserialize)]
-struct StreamParams {
-    from: Option<String>,
-    key_prefix: Option<String>,
-    header: Option<String>,
-}
-
-impl StreamParams {
-    fn position(&self) -> Result<Position, String> {
-        match self.from.as_deref() {
-            None | Some("latest") => Ok(Position::Latest),
-            Some("earliest") => Ok(Position::Earliest),
-            Some(raw) => raw
-                .parse()
-                .map(Position::Offset)
-                .map_err(|_| format!("from must be earliest, latest, or an offset (got {raw:?})")),
-        }
-    }
-
-    fn filter(&self) -> Result<Filter, String> {
-        let header = match &self.header {
-            None => None,
-            Some(raw) => {
-                let (name, value) = raw
-                    .split_once(':')
-                    .ok_or_else(|| "header filter must be <name>:<value>".to_owned())?;
-                Some((name.to_owned(), Bytes::copy_from_slice(value.as_bytes())))
-            }
-        };
-        Ok(Filter {
-            key_prefix: self
-                .key_prefix
-                .as_ref()
-                .map(|p| Bytes::copy_from_slice(p.as_bytes())),
-            header,
-        })
-    }
-}
-
 async fn upgrade_partition<F: SourceFactory>(
     State(state): State<Arc<WsState<F>>>,
     Path((topic, partition)): Path<(String, i32)>,
@@ -156,7 +115,7 @@ async fn upgrade_partition<F: SourceFactory>(
     // Validate and subscribe before upgrading, so failures are ordinary
     // HTTP errors a client can read.
     let position = params
-        .position()
+        .position(None)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let filter = params.filter().map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let subscription = state
@@ -179,13 +138,9 @@ async fn upgrade_topic<F: SourceFactory>(
     Query(params): Query<StreamParams>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, (StatusCode, String)> {
-    let position = match params.from.as_deref() {
-        None | Some("latest") => TopicPosition::Latest,
-        Some("earliest") => TopicPosition::Earliest,
-        Some(raw) => {
-            TopicPosition::Offsets(cursor::parse(raw).map_err(|e| (StatusCode::BAD_REQUEST, e))?)
-        }
-    };
+    let position = params
+        .topic_position(None)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let filter = params.filter().map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let subscription = state
         .hub

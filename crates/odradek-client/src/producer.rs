@@ -23,6 +23,7 @@ use odradek_protocol::records::{Compression, Record, RecordBatch, Records};
 use crate::cluster::Cluster;
 use crate::compression::{attribute_bits, compress};
 use crate::error::ClientError;
+use crate::retry::{or_mark_stale, retry_loop};
 
 /// Produce versions this producer speaks: name-addressed (v13+ switches
 /// to topic ids).
@@ -226,24 +227,21 @@ impl Producer {
         partition: i32,
         records: Vec<Record>,
     ) -> Result<i64, ClientError> {
-        let set = encode_batch(records, self.config.compression)?;
-        let mut last = None;
-        for attempt in 0..self.config.max_attempts {
-            if attempt > 0 {
-                tokio::time::sleep(self.config.retry_backoff).await;
-            }
-            match self.try_once(topic, partition, &set).await {
-                Ok(offset) => return Ok(offset),
-                Err(e) if e.is_retriable() => {
-                    // Leadership (or the broker itself) may have moved on;
-                    // refetch rather than resend into the same wall.
-                    self.cluster.mark_stale(topic);
-                    last = Some(e);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(last.unwrap_or(ClientError::ConnectionClosed))
+        // Owned per-round captures keep the attempt future free of
+        // outer borrows; the Bytes clone is a refcount bump.
+        let set = bytes::Bytes::from(encode_batch(records, self.config.compression)?);
+        let (max_attempts, backoff) = (self.config.max_attempts, self.config.retry_backoff);
+        // A retriable failure means leadership (or the broker itself)
+        // may have moved on; refetch rather than resend into the wall.
+        retry_loop(&mut *self, max_attempts, backoff, |this| {
+            let set = set.clone();
+            let topic = topic.to_owned();
+            Box::pin(async move {
+                let result = this.try_once(&topic, partition, &set).await;
+                or_mark_stale(&this.cluster, &topic, result)
+            })
+        })
+        .await
     }
 
     async fn try_once(
