@@ -96,7 +96,7 @@ impl MemorySource {
         usize::try_from(partition)
             .ok()
             .and_then(|p| self.log.partitions.get(p))
-            .ok_or_else(|| SourceError(format!("no partition {partition}")))
+            .ok_or_else(|| SourceError::not_found(format!("no partition {partition}")))
     }
 }
 
@@ -140,17 +140,53 @@ impl RecordSource for MemorySource {
 /// Hands every pump a view of the same [`MemoryLog`].
 #[derive(Debug, Clone)]
 pub struct MemoryFactory {
-    pub log: MemoryLog,
+    log: MemoryLog,
+    /// Topics that exist; `None` means every name reads the log (the
+    /// historical behavior, plenty for most tests).
+    known_topics: Option<Vec<String>>,
+}
+
+impl MemoryFactory {
+    pub fn new(log: MemoryLog) -> MemoryFactory {
+        MemoryFactory {
+            log,
+            known_topics: None,
+        }
+    }
+
+    /// Restrict the factory to these topic names; anything else fails
+    /// with a `NotFound` [`SourceError`], like a real broker's unknown
+    /// topic.
+    #[must_use]
+    pub fn known_topics<I, S>(mut self, topics: I) -> MemoryFactory
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.known_topics = Some(topics.into_iter().map(Into::into).collect());
+        self
+    }
+
+    fn check_topic(&self, topic: &str) -> Result<(), SourceError> {
+        match &self.known_topics {
+            Some(known) if !known.iter().any(|t| t == topic) => {
+                Err(SourceError::not_found(format!("unknown topic {topic}")))
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 impl SourceFactory for MemoryFactory {
     type Source = MemorySource;
 
-    async fn create(&self, _topic: &str, _partition: i32) -> Result<MemorySource, SourceError> {
+    async fn create(&self, topic: &str, _partition: i32) -> Result<MemorySource, SourceError> {
+        self.check_topic(topic)?;
         Ok(self.log.source())
     }
 
-    async fn partitions(&self, _topic: &str) -> Result<Vec<i32>, SourceError> {
+    async fn partitions(&self, topic: &str) -> Result<Vec<i32>, SourceError> {
+        self.check_topic(topic)?;
         Ok((0..i32::try_from(self.log.partitions.len()).unwrap_or(1)).collect())
     }
 }

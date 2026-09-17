@@ -24,6 +24,16 @@ traits: Kafka via
 production, and an in-memory log (published as
 `odradek_web_core::memory`) for deterministic downstream tests.
 
+Source errors are typed (`SourceErrorKind`: not-found, auth,
+unavailable, other): permanent failures stop a pump at once, transient
+ones retry with backoff, and either way subscribers receive one final
+`StreamError` explaining why before their stream closes. Lifecycle is
+managed: dead subscribers are noticed even on quiet topics, a pump with
+no subscribers exits after `PumpConfig::idle_shutdown` (default 30s,
+respawned on the next subscribe), `Hub::shutdown` stops everything
+cleanly, and `Hub::with_topic_gate` limits which topics a hub will
+serve at all.
+
 ## Features
 
 `kafka` (default) pulls in `odradek-client` for the real-cluster

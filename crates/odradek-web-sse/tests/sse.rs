@@ -6,18 +6,18 @@
 //! socket.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
-use odradek_web_core::PumpConfig;
 use odradek_web_core::memory::{MemoryFactory, MemoryLog};
-use odradek_web_sse::{SseState, router};
+use odradek_web_core::{PumpConfig, RecordSource, SourceBatch, SourceError};
+use odradek_web_sse::{SourceFactory, SseState, router};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const TOPIC: &str = "bridge";
 
-async fn serve(log: MemoryLog) -> SocketAddr {
-    let state = SseState::new(MemoryFactory { log }, PumpConfig::default());
+async fn serve_state<F: SourceFactory>(state: Arc<SseState<F>>) -> SocketAddr {
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -25,6 +25,52 @@ async fn serve(log: MemoryLog) -> SocketAddr {
         axum::serve(listener, app).await.unwrap();
     });
     addr
+}
+
+async fn serve(log: MemoryLog) -> SocketAddr {
+    serve_state(SseState::new(
+        MemoryFactory::new(log),
+        PumpConfig::default(),
+    ))
+    .await
+}
+
+/// A source whose partition metadata resolves but whose reads fail
+/// permanently — the shape of "auth revoked under a live stream".
+#[derive(Debug, Clone)]
+struct RevokedFactory;
+
+struct RevokedSource;
+
+impl RecordSource for RevokedSource {
+    async fn fetch(
+        &mut self,
+        _topic: &str,
+        _partition: i32,
+        _offset: i64,
+    ) -> Result<SourceBatch, SourceError> {
+        Err(SourceError::auth("TOPIC_AUTHORIZATION_FAILED"))
+    }
+
+    async fn earliest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
+        Err(SourceError::auth("TOPIC_AUTHORIZATION_FAILED"))
+    }
+
+    async fn latest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
+        Err(SourceError::auth("TOPIC_AUTHORIZATION_FAILED"))
+    }
+}
+
+impl SourceFactory for RevokedFactory {
+    type Source = RevokedSource;
+
+    async fn create(&self, _topic: &str, _partition: i32) -> Result<RevokedSource, SourceError> {
+        Ok(RevokedSource)
+    }
+
+    async fn partitions(&self, _topic: &str) -> Result<Vec<i32>, SourceError> {
+        Ok(vec![0])
+    }
 }
 
 struct SseClient {
@@ -138,6 +184,54 @@ impl SseClient {
                 }
             }
             self.fill().await;
+        }
+    }
+
+    /// The next SSE block's (event name, data json), skipping
+    /// keep-alive comments. Unlike [`Self::next_event`] it does not
+    /// require an id, so it also sees `event: error` frames.
+    async fn next_named(&mut self) -> (String, serde_json::Value) {
+        if self.body_at.is_none() {
+            let status = self.status().await;
+            assert!(status.contains("200"), "unexpected status: {status}");
+        }
+        loop {
+            if let Some(end) = find(&self.buffer[self.consumed..], b"\n\n") {
+                let block =
+                    String::from_utf8_lossy(&self.buffer[self.consumed..self.consumed + end])
+                        .into_owned();
+                self.consumed += end + 2;
+                let mut event = None;
+                let mut data = None;
+                for line in block.lines() {
+                    if let Some(v) = line.strip_prefix("event:") {
+                        event = Some(v.trim().to_owned());
+                    } else if let Some(v) = line.strip_prefix("data:") {
+                        data = Some(v.trim().to_owned());
+                    }
+                }
+                match (event, data) {
+                    (Some(event), Some(data)) => {
+                        return (event, serde_json::from_str(&data).unwrap());
+                    }
+                    _ => continue,
+                }
+            }
+            self.fill().await;
+        }
+    }
+
+    /// Wait for the server to close the connection.
+    async fn wait_close(&mut self) {
+        loop {
+            let mut chunk = [0u8; 4096];
+            let n = tokio::time::timeout(Duration::from_secs(5), self.stream.read(&mut chunk))
+                .await
+                .expect("timed out waiting for the stream to close")
+                .unwrap();
+            if n == 0 {
+                return;
+            }
         }
     }
 }
@@ -294,4 +388,88 @@ async fn topic_stream_merges_partitions_with_cursor_ids() {
     assert_eq!(json["partition"], 1);
     assert_eq!(json["offset"], 1);
     assert_eq!(cursor, "0:2,1:2");
+}
+
+#[tokio::test]
+async fn gated_topics_return_403_and_allowed_topics_still_stream() {
+    use odradek_web_sse::web_core::Hub;
+
+    let log = MemoryLog::new();
+    let hub = Hub::new(MemoryFactory::new(log.clone()), PumpConfig::default())
+        .with_topic_gate(|topic| !topic.starts_with("internal-"));
+    let addr = serve_state(SseState::from_hub(hub)).await;
+
+    let mut denied = SseClient::get(
+        addr,
+        "/topics/internal-audit/partitions/0/events?from=earliest",
+        &[],
+    )
+    .await;
+    let status = denied.status().await;
+    assert!(status.contains("403"), "{status}");
+
+    let mut denied_topic = SseClient::get(addr, "/topics/internal-audit/events", &[]).await;
+    let status = denied_topic.status().await;
+    assert!(status.contains("403"), "{status}");
+
+    // The gate does not get in the way of allowed topics.
+    let mut allowed =
+        SseClient::get(addr, &format!("/topics/{TOPIC}/partitions/0/events"), &[]).await;
+    let status = allowed.status().await;
+    assert!(status.contains("200"), "{status}");
+    log.append(TOPIC, 0, None, b"through-the-gate", Vec::new());
+    let (_, json) = allowed.next_event().await;
+    assert_eq!(value_of(&json), "through-the-gate");
+}
+
+#[tokio::test]
+async fn unknown_topics_return_404() {
+    let log = MemoryLog::new();
+    let factory = MemoryFactory::new(log).known_topics([TOPIC]);
+    let addr = serve_state(SseState::new(factory, PumpConfig::default())).await;
+
+    let mut client =
+        SseClient::get(addr, "/topics/ghost/partitions/0/events?from=earliest", &[]).await;
+    let status = client.status().await;
+    assert!(status.contains("404"), "{status}");
+
+    let mut topic_client = SseClient::get(addr, "/topics/ghost/events", &[]).await;
+    let status = topic_client.status().await;
+    assert!(status.contains("404"), "{status}");
+}
+
+#[tokio::test]
+async fn failed_stream_ends_with_an_error_event() {
+    let addr = serve_state(SseState::new(RevokedFactory, PumpConfig::default())).await;
+
+    // Latest subscribes without touching the source, so the stream
+    // opens — then the pump hits the permanent auth failure.
+    let mut client =
+        SseClient::get(addr, &format!("/topics/{TOPIC}/partitions/0/events"), &[]).await;
+    let (event, json) = client.next_named().await;
+    assert_eq!(event, "error");
+    assert_eq!(json["kind"], "auth");
+    assert_eq!(json["message"], "TOPIC_AUTHORIZATION_FAILED");
+    client.wait_close().await;
+}
+
+#[tokio::test]
+async fn shutdown_ends_streams_cleanly_and_refuses_new_subscribes() {
+    let log = MemoryLog::new();
+    let state = SseState::new(MemoryFactory::new(log), PumpConfig::default());
+    let addr = serve_state(state.clone()).await;
+
+    let mut client =
+        SseClient::get(addr, &format!("/topics/{TOPIC}/partitions/0/events"), &[]).await;
+    let status = client.status().await;
+    assert!(status.contains("200"), "{status}");
+
+    state.shutdown().await;
+    // A clean end: no error frame, the response simply completes.
+    client.wait_close().await;
+
+    let mut refused =
+        SseClient::get(addr, &format!("/topics/{TOPIC}/partitions/0/events"), &[]).await;
+    let status = refused.status().await;
+    assert!(status.contains("503"), "{status}");
 }

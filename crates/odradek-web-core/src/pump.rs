@@ -7,6 +7,18 @@
 //! from the ring (or, past the ring, from the source itself) as its
 //! queue drains. Events are delivered in offset order with no gaps and
 //! no duplicates, however slow the consumer.
+//!
+//! Lifecycle: dead subscribers (dropped receivers) are noticed every
+//! loop iteration, not just on delivery, so a quiet topic is never
+//! fetched for nobody; a pump with no subscribers for
+//! [`PumpConfig::idle_shutdown`] exits, and the hub respawns it on the
+//! next subscribe. A *permanent* source error ([`SourceError`] whose
+//! kind is `NotFound` or `Auth`) stops the pump immediately; transient
+//! errors retry with backoff until [`PumpConfig::max_consecutive_errors`]
+//! runs out. Either way, every subscriber receives one final
+//! [`StreamError`] item explaining why before its stream closes. A
+//! clean stop ([`PumpHandle::shutdown`], reached via `Hub::shutdown`)
+//! closes subscriber streams without an error item.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -14,7 +26,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::event::{Event, Filter, Position};
-use crate::source::RecordSource;
+use crate::source::{RecordSource, SourceError, SourceErrorKind};
 
 /// Tuning for one pump.
 #[derive(Debug, Clone)]
@@ -28,11 +40,16 @@ pub struct PumpConfig {
     /// Pause after an empty live fetch (the source's own long-poll wait
     /// does the heavy lifting; this only paces busy in-memory sources).
     pub idle_poll: Duration,
-    /// Pause after a source error.
+    /// Pause after a transient source error.
     pub error_backoff: Duration,
-    /// Consecutive source errors before the pump gives up and closes
-    /// every subscription.
+    /// Consecutive transient source errors before the pump gives up and
+    /// closes every subscription with a terminal [`StreamError`].
+    /// Permanent errors (`NotFound`, `Auth`) skip the budget entirely.
     pub max_consecutive_errors: u32,
+    /// How long a pump lingers with zero subscribers before exiting
+    /// (the hub respawns it on the next subscribe). `None` keeps idle
+    /// pumps alive forever.
+    pub idle_shutdown: Option<Duration>,
 }
 
 impl Default for PumpConfig {
@@ -43,6 +60,7 @@ impl Default for PumpConfig {
             idle_poll: Duration::from_millis(10),
             error_backoff: Duration::from_millis(500),
             max_consecutive_errors: 20,
+            idle_shutdown: Some(Duration::from_secs(30)),
         }
     }
 }
@@ -52,27 +70,58 @@ impl Default for PumpConfig {
 #[non_exhaustive]
 pub enum HubError {
     #[error("source error: {0}")]
-    Source(String),
+    Source(#[from] SourceError),
     #[error("the pump for this partition has shut down")]
     PumpClosed,
+    #[error("the hub has been shut down")]
+    ShutDown,
+    #[error("access to topic {0:?} denied")]
+    Denied(String),
 }
 
-/// A live subscription: a stream of [`Event`]s in offset order.
+/// Why a stream ended, delivered as the final item before the channel
+/// closes. Streams that end *cleanly* (pump or hub shutdown) close
+/// without one.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{kind}: {message}")]
+#[non_exhaustive]
+pub struct StreamError {
+    pub kind: SourceErrorKind,
+    pub message: String,
+}
+
+impl From<SourceError> for StreamError {
+    fn from(e: SourceError) -> StreamError {
+        StreamError {
+            kind: e.kind,
+            message: e.message,
+        }
+    }
+}
+
+/// What a subscriber's channel carries: events until the stream ends,
+/// with an optional final error explaining an abnormal end.
+pub type StreamItem = Result<Event, StreamError>;
+
+/// A live subscription: a stream of [`Event`]s in offset order,
+/// possibly ending with one [`StreamError`].
 #[derive(Debug)]
 pub struct Subscription {
     pub topic: String,
     pub partition: i32,
-    receiver: mpsc::Receiver<Event>,
+    receiver: mpsc::Receiver<StreamItem>,
 }
 
 impl Subscription {
-    /// The next event, or `None` when the pump has shut down.
-    pub async fn recv(&mut self) -> Option<Event> {
+    /// The next event; `Some(Err(_))` is the final item of a stream
+    /// that failed, `None` means the stream ended cleanly (or after
+    /// that error).
+    pub async fn recv(&mut self) -> Option<StreamItem> {
         self.receiver.recv().await
     }
 
     /// The underlying receiver, for `select!`-style composition.
-    pub fn into_receiver(self) -> mpsc::Receiver<Event> {
+    pub fn into_receiver(self) -> mpsc::Receiver<StreamItem> {
         self.receiver
     }
 }
@@ -83,6 +132,8 @@ pub(crate) enum Command {
         filter: Filter,
         reply: oneshot::Sender<Result<Subscription, HubError>>,
     },
+    /// Stop cleanly: subscriber streams close without an error item.
+    Shutdown,
 }
 
 /// A handle to a running pump; cheap to clone. Dropping every handle
@@ -135,6 +186,12 @@ impl PumpHandle {
         response.await.map_err(|_| HubError::PumpClosed)?
     }
 
+    /// Stop the pump cleanly: remaining subscriber streams close
+    /// without an error item. Idempotent; a no-op on a dead pump.
+    pub async fn shutdown(&self) {
+        let _ = self.commands.send(Command::Shutdown).await;
+    }
+
     pub fn topic(&self) -> &str {
         &self.topic
     }
@@ -153,7 +210,7 @@ enum Mode {
 }
 
 struct SubState {
-    sender: mpsc::Sender<Event>,
+    sender: mpsc::Sender<StreamItem>,
     filter: Filter,
     mode: Mode,
     closed: bool,
@@ -168,7 +225,7 @@ impl SubState {
         if !self.filter.matches(event) {
             return;
         }
-        match self.sender.try_send(event.clone()) {
+        match self.sender.try_send(Ok(event.clone())) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.mode = Mode::CatchingUp {
@@ -177,6 +234,23 @@ impl SubState {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => self.closed = true,
         }
+    }
+}
+
+/// Deliver a terminal error to every subscriber, each on its own task
+/// so one stalled queue cannot delay the others, then let the channels
+/// close.
+fn fail_subs(subs: Vec<SubState>, error: &SourceError) {
+    let error = StreamError::from(error.clone());
+    for sub in subs {
+        if sub.closed {
+            continue;
+        }
+        let sender = sub.sender;
+        let error = error.clone();
+        tokio::spawn(async move {
+            let _ = sender.send(Err(error)).await;
+        });
     }
 }
 
@@ -194,16 +268,35 @@ async fn run_pump<S: RecordSource>(
     let mut consecutive_errors = 0u32;
 
     loop {
-        // With nobody listening, sit idle on the command channel.
+        // Notice dead subscribers every iteration — not just on
+        // delivery — so a quiet topic is never fetched for nobody.
+        subs.retain(|s| !s.closed && !s.sender.is_closed());
+
+        // With nobody listening, sit idle on the command channel; give
+        // up entirely after `idle_shutdown`.
         if subs.is_empty() {
-            match commands.recv().await {
+            let command = match config.idle_shutdown {
+                Some(idle) => match tokio::time::timeout(idle, commands.recv()).await {
+                    Ok(command) => command,
+                    Err(_) => {
+                        tracing::debug!(topic, partition, "pump idle too long; exiting");
+                        return;
+                    }
+                },
+                None => commands.recv().await,
+            };
+            match command {
+                Some(Command::Shutdown) | None => return,
                 Some(cmd) => {
                     handle_command(cmd, &mut source, &topic, partition, &config, &mut subs).await;
                 }
-                None => return,
             }
         }
         while let Ok(cmd) = commands.try_recv() {
+            if matches!(cmd, Command::Shutdown) {
+                // Drop the senders without an error item: a clean end.
+                return;
+            }
             handle_command(cmd, &mut source, &topic, partition, &config, &mut subs).await;
         }
 
@@ -216,9 +309,10 @@ async fn run_pump<S: RecordSource>(
                     latest
                 }
                 Err(e) => {
-                    consecutive_errors += 1;
                     tracing::warn!(topic, partition, error = %e, "latest offset lookup failed");
-                    if consecutive_errors > config.max_consecutive_errors {
+                    consecutive_errors += 1;
+                    if e.is_permanent() || consecutive_errors > config.max_consecutive_errors {
+                        fail_subs(subs, &e);
                         return;
                     }
                     tokio::time::sleep(config.error_backoff).await;
@@ -246,9 +340,10 @@ async fn run_pump<S: RecordSource>(
                 }
             }
             Err(e) => {
-                consecutive_errors += 1;
                 tracing::warn!(topic, partition, error = %e, "live fetch failed");
-                if consecutive_errors > config.max_consecutive_errors {
+                consecutive_errors += 1;
+                if e.is_permanent() || consecutive_errors > config.max_consecutive_errors {
+                    fail_subs(subs, &e);
                     return;
                 }
                 tokio::time::sleep(config.error_backoff).await;
@@ -257,10 +352,19 @@ async fn run_pump<S: RecordSource>(
 
         // Advance every catching-up subscriber by one step.
         let live_edge = live_cursor.unwrap_or(0);
+        let mut permanent: Option<SourceError> = None;
         for sub in &mut subs {
-            advance_catch_up(sub, &mut source, &topic, partition, &ring, live_edge).await;
+            if let Err(e) =
+                advance_catch_up(sub, &mut source, &topic, partition, &ring, live_edge).await
+            {
+                permanent = Some(e);
+                break;
+            }
         }
-        subs.retain(|s| !s.closed);
+        if let Some(e) = permanent {
+            fail_subs(subs, &e);
+            return;
+        }
     }
 }
 
@@ -276,7 +380,10 @@ async fn handle_command<S: RecordSource>(
         position,
         filter,
         reply,
-    } = cmd;
+    } = cmd
+    else {
+        return;
+    };
     let mode = match position {
         Position::Latest => Ok(Mode::Live),
         Position::Offset(offset) => Ok(Mode::CatchingUp { cursor: offset }),
@@ -284,7 +391,7 @@ async fn handle_command<S: RecordSource>(
             .earliest_offset(topic, partition)
             .await
             .map(|cursor| Mode::CatchingUp { cursor })
-            .map_err(|e| HubError::Source(e.to_string())),
+            .map_err(HubError::Source),
     };
     match mode {
         Ok(mode) => {
@@ -329,7 +436,7 @@ fn push_run<'a>(
             continue;
         }
         if sub.filter.matches(event) {
-            match sub.sender.try_send(event.clone()) {
+            match sub.sender.try_send(Ok(event.clone())) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     return PushOutcome::Stalled(event.offset);
@@ -345,6 +452,7 @@ fn push_run<'a>(
 /// Move one catching-up subscriber forward: from the ring when its
 /// cursor is inside it, else by one direct fetch from the source. Stops
 /// early (without losing its place) when the subscriber's queue fills.
+/// A permanent source error is returned to end the whole pump.
 async fn advance_catch_up<S: RecordSource>(
     sub: &mut SubState,
     source: &mut S,
@@ -352,12 +460,12 @@ async fn advance_catch_up<S: RecordSource>(
     partition: i32,
     ring: &VecDeque<Event>,
     live_edge: i64,
-) {
+) -> Result<(), SourceError> {
     let Mode::CatchingUp { cursor } = sub.mode else {
-        return;
+        return Ok(());
     };
     if sub.closed {
-        return;
+        return Ok(());
     }
     if cursor >= live_edge {
         // Caught up (or asked for a future offset: wait for the live
@@ -365,7 +473,7 @@ async fn advance_catch_up<S: RecordSource>(
         if cursor == live_edge {
             sub.mode = Mode::Live;
         }
-        return;
+        return Ok(());
     }
 
     let ring_start = ring.front().map(|e| e.offset);
@@ -377,7 +485,7 @@ async fn advance_catch_up<S: RecordSource>(
             PushOutcome::Stalled(at) => sub.mode = Mode::CatchingUp { cursor: at },
             PushOutcome::Closed => sub.closed = true,
         }
-        return;
+        return Ok(());
     }
 
     // Behind the ring (or the ring is empty): fetch on the subscriber's
@@ -393,9 +501,11 @@ async fn advance_catch_up<S: RecordSource>(
             PushOutcome::Stalled(at) => sub.mode = Mode::CatchingUp { cursor: at },
             PushOutcome::Closed => sub.closed = true,
         },
+        Err(e) if e.is_permanent() => return Err(e),
         Err(e) => {
             // Transient; the next pump iteration retries.
             tracing::debug!(topic, partition, error = %e, "catch-up fetch failed");
         }
     }
+    Ok(())
 }

@@ -20,12 +20,120 @@ pub struct SourceBatch {
     pub high_watermark: i64,
 }
 
-/// An error from a source; the pump treats every source error as
-/// transient and retries with backoff (a permanently broken source ends
-/// the pump after the configured error budget).
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct SourceError(pub String);
+/// What broke, coarsely — the part of a source error the pump and the
+/// transports act on.
+///
+/// [`NotFound`](SourceErrorKind::NotFound) and
+/// [`Auth`](SourceErrorKind::Auth) are *permanent*: the pump stops at
+/// once and tells its subscribers why. Everything else is transient and
+/// retried with backoff until the configured error budget runs out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SourceErrorKind {
+    /// The topic or partition does not exist.
+    NotFound,
+    /// The source refused the bridge's credentials for this resource.
+    Auth,
+    /// The source cannot be reached right now (connection, timeout,
+    /// bootstrap).
+    Unavailable,
+    /// Anything else.
+    Other,
+}
+
+impl SourceErrorKind {
+    /// A stable lowercase name, for wire formats (JSON, close reasons).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SourceErrorKind::NotFound => "not_found",
+            SourceErrorKind::Auth => "auth",
+            SourceErrorKind::Unavailable => "unavailable",
+            _ => "other",
+        }
+    }
+}
+
+impl std::fmt::Display for SourceErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// An error from a source, carrying the [`SourceErrorKind`] that
+/// decides whether the pump retries (transient) or stops and tells its
+/// subscribers (permanent).
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{message}")]
+#[non_exhaustive]
+pub struct SourceError {
+    pub kind: SourceErrorKind,
+    pub message: String,
+}
+
+impl SourceError {
+    pub fn new(kind: SourceErrorKind, message: impl Into<String>) -> SourceError {
+        SourceError {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// The topic or partition does not exist (permanent).
+    pub fn not_found(message: impl Into<String>) -> SourceError {
+        SourceError::new(SourceErrorKind::NotFound, message)
+    }
+
+    /// The source refused the bridge's credentials (permanent).
+    pub fn auth(message: impl Into<String>) -> SourceError {
+        SourceError::new(SourceErrorKind::Auth, message)
+    }
+
+    /// The source cannot be reached right now (transient).
+    pub fn unavailable(message: impl Into<String>) -> SourceError {
+        SourceError::new(SourceErrorKind::Unavailable, message)
+    }
+
+    /// Anything else (transient).
+    pub fn other(message: impl Into<String>) -> SourceError {
+        SourceError::new(SourceErrorKind::Other, message)
+    }
+
+    /// True when retrying can never help: the pump stops immediately.
+    pub fn is_permanent(&self) -> bool {
+        matches!(self.kind, SourceErrorKind::NotFound | SourceErrorKind::Auth)
+    }
+}
+
+/// Classify an [`odradek_client::ClientError`] into the kinds the pump
+/// acts on.
+#[cfg(feature = "kafka")]
+impl From<odradek_client::ClientError> for SourceError {
+    fn from(e: odradek_client::ClientError) -> SourceError {
+        use odradek_client::ClientError;
+        use odradek_client::protocol::ErrorCode;
+
+        let kind = match &e {
+            ClientError::Broker(code) => match *code {
+                ErrorCode::UNKNOWN_TOPIC_OR_PARTITION | ErrorCode::UNKNOWN_TOPIC_ID => {
+                    SourceErrorKind::NotFound
+                }
+                ErrorCode::TOPIC_AUTHORIZATION_FAILED
+                | ErrorCode::GROUP_AUTHORIZATION_FAILED
+                | ErrorCode::SASL_AUTHENTICATION_FAILED
+                | ErrorCode::UNSUPPORTED_SASL_MECHANISM => SourceErrorKind::Auth,
+                _ => SourceErrorKind::Other,
+            },
+            ClientError::Sasl(_) => SourceErrorKind::Auth,
+            ClientError::ConnectionClosed
+            | ClientError::Io(_)
+            | ClientError::Bootstrap(_)
+            | ClientError::Tls(_)
+            | ClientError::UnknownLeader { .. } => SourceErrorKind::Unavailable,
+            _ => SourceErrorKind::Other,
+        };
+        SourceError::new(kind, e.to_string())
+    }
+}
 
 /// An offset-addressed stream of records for one partition.
 ///
@@ -93,7 +201,7 @@ impl RecordSource for KafkaSource {
             .consumer
             .fetch(topic, partition, offset)
             .await
-            .map_err(|e| SourceError(e.to_string()))?;
+            .map_err(SourceError::from)?;
         Ok(SourceBatch {
             events: result
                 .records
@@ -117,14 +225,14 @@ impl RecordSource for KafkaSource {
         self.consumer
             .earliest_offset(topic, partition)
             .await
-            .map_err(|e| SourceError(e.to_string()))
+            .map_err(SourceError::from)
     }
 
     async fn latest_offset(&mut self, topic: &str, partition: i32) -> Result<i64, SourceError> {
         self.consumer
             .latest_offset(topic, partition)
             .await
-            .map_err(|e| SourceError(e.to_string()))
+            .map_err(SourceError::from)
     }
 }
 
@@ -152,7 +260,7 @@ impl KafkaSourceFactory {
             .get_or_try_init(|| async {
                 Cluster::connect(self.config.clone())
                     .await
-                    .map_err(|e| SourceError(e.to_string()))
+                    .map_err(SourceError::from)
             })
             .await
             .cloned()
@@ -172,10 +280,10 @@ impl SourceFactory for KafkaSourceFactory {
         cluster
             .refresh_metadata(&[topic])
             .await
-            .map_err(|e| SourceError(e.to_string()))?;
+            .map_err(SourceError::from)?;
         let mut partitions: Vec<i32> = cluster
             .partitions(topic)
-            .ok_or_else(|| SourceError(format!("unknown topic {topic}")))?
+            .ok_or_else(|| SourceError::not_found(format!("unknown topic {topic}")))?
             .iter()
             .map(|p| p.index)
             .collect();

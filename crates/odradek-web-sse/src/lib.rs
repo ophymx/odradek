@@ -24,6 +24,20 @@
 //! Keys, values, and header values arrive as UTF-8 strings when they
 //! are valid UTF-8 (`key`, `value`), else base64 (`key_base64`,
 //! `value_base64`) — web-friendly without lying about binary data.
+//!
+//! Subscribe failures are plain HTTP errors before the stream starts:
+//! `403` for a topic the hub's gate denies, `404` for a topic the
+//! source does not have, `503` after shutdown, `502` for other source
+//! trouble. If the stream fails *later* (topic deleted, auth revoked,
+//! error budget exhausted), the client receives one final
+//! `event: error` frame whose data is `{"kind": "...", "message":
+//! "..."}` and the stream ends; a clean shutdown just ends the stream.
+//!
+//! Graceful shutdown: keep the [`SseState`] `Arc` you built the router
+//! from and call [`SseState::shutdown`] when your server begins to
+//! drain (e.g. from the future you hand to axum's
+//! `with_graceful_shutdown`) — every pump stops, open streams end
+//! cleanly, and new subscribes are refused with `503`.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -39,7 +53,8 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
 use odradek_web_core::json::event_json;
-use odradek_web_core::{Filter, Hub, Position, TopicPosition, cursor};
+use odradek_web_core::pump::{HubError, StreamItem};
+use odradek_web_core::{Filter, Hub, Position, SourceErrorKind, TopicPosition, cursor};
 
 /// Everything needed to stand the router up, re-exported so embedders
 /// depend on this crate alone; the full engine is under [`web_core`].
@@ -57,10 +72,48 @@ pub struct SseState<F: SourceFactory> {
 
 impl<F: SourceFactory> SseState<F> {
     pub fn new(factory: F, config: PumpConfig) -> Arc<SseState<F>> {
+        SseState::from_hub(Hub::new(factory, config))
+    }
+
+    /// Wrap a pre-built hub — the way in for hub-level options such as
+    /// [`Hub::with_topic_gate`].
+    pub fn from_hub(hub: Hub<F>) -> Arc<SseState<F>> {
         Arc::new(SseState {
-            hub: tokio::sync::Mutex::new(Hub::new(factory, config)),
+            hub: tokio::sync::Mutex::new(hub),
         })
     }
+
+    /// Stop every pump and refuse further subscribes with `503`; open
+    /// streams end cleanly. Call this from your server's graceful
+    /// shutdown (axum's `with_graceful_shutdown`).
+    pub async fn shutdown(&self) {
+        self.hub.lock().await.shutdown().await;
+    }
+}
+
+/// The HTTP status a failed subscribe maps to: gated topics are `403`,
+/// missing ones `404`, a shut-down hub `503`, the rest `502`.
+fn subscribe_status(error: &HubError) -> StatusCode {
+    match error {
+        HubError::Denied(_) => StatusCode::FORBIDDEN,
+        HubError::ShutDown => StatusCode::SERVICE_UNAVAILABLE,
+        HubError::Source(source) if source.kind == SourceErrorKind::NotFound => {
+            StatusCode::NOT_FOUND
+        }
+        _ => StatusCode::BAD_GATEWAY,
+    }
+}
+
+/// One channel item as an SSE frame; errors become a final
+/// `event: error` frame right before the stream ends.
+fn error_frame(err: &odradek_web_core::StreamError) -> SseEvent {
+    SseEvent::default().event("error").data(
+        serde_json::json!({
+            "kind": err.kind.as_str(),
+            "message": err.message,
+        })
+        .to_string(),
+    )
 }
 
 /// The SSE routes over `state`; merge into your own [`Router`].
@@ -141,13 +194,18 @@ async fn stream_partition<F: SourceFactory>(
         .await
         .subscribe(&topic, partition, position, filter)
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+        .map_err(|e| (subscribe_status(&e), e.to_string()))?;
 
-    let stream = ReceiverStream::new(subscription.into_receiver()).map(|event| {
-        Ok(SseEvent::default()
-            .event("record")
-            .id((event.offset + 1).to_string())
-            .data(event_json(&event).to_string()))
+    let stream = ReceiverStream::new(subscription.into_receiver()).map(|item: StreamItem| {
+        Ok(match item {
+            Ok(event) => SseEvent::default()
+                .event("record")
+                .id((event.offset + 1).to_string())
+                .data(event_json(&event).to_string()),
+            // The final item of a failed stream; the channel closes
+            // right after, ending the response.
+            Err(err) => error_frame(&err),
+        })
     });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
@@ -178,14 +236,21 @@ async fn stream_topic<F: SourceFactory>(
         .await
         .subscribe_topic(&topic, position, filter)
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+        .map_err(|e| (subscribe_status(&e), e.to_string()))?;
 
-    let stream = ReceiverStream::new(subscription.into_receiver()).map(move |event| {
-        running.insert(event.partition, event.offset + 1);
-        Ok(SseEvent::default()
-            .event("record")
-            .id(cursor::encode(&running))
-            .data(event_json(&event).to_string()))
+    let stream = ReceiverStream::new(subscription.into_receiver()).map(move |item: StreamItem| {
+        Ok(match item {
+            Ok(event) => {
+                running.insert(event.partition, event.offset + 1);
+                SseEvent::default()
+                    .event("record")
+                    .id(cursor::encode(&running))
+                    .data(event_json(&event).to_string())
+            }
+            // A partition pump failed; report it and let the stream
+            // wind down.
+            Err(err) => error_frame(&err),
+        })
     });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }

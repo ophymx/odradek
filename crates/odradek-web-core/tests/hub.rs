@@ -1,11 +1,15 @@
-//! Engine tests over an in-memory log: fan-out, replay, filtering, and
-//! the no-loss guarantee under backpressure.
+//! Engine tests over an in-memory log: fan-out, replay, filtering, the
+//! no-loss guarantee under backpressure, and the lifecycle — terminal
+//! errors, idle exit, shutdown, and topic gating.
 
 use std::time::Duration;
 
 use bytes::Bytes;
 use odradek_web_core::memory::{MemoryFactory, MemoryLog};
-use odradek_web_core::{Filter, Hub, Position, PumpConfig, PumpHandle, Subscription};
+use odradek_web_core::{
+    Filter, Hub, HubError, Position, PumpConfig, PumpHandle, RecordSource, SourceBatch,
+    SourceError, SourceErrorKind, Subscription,
+};
 
 const TOPIC: &str = "bridge";
 
@@ -19,11 +23,36 @@ async fn collect(sub: &mut Subscription, n: usize) -> Vec<(i64, String)> {
         let event = tokio::time::timeout(Duration::from_secs(5), sub.recv())
             .await
             .expect("timed out waiting for event")
-            .expect("pump closed");
+            .expect("pump closed")
+            .expect("stream failed");
         let value = String::from_utf8(event.value.clone().unwrap().to_vec()).unwrap();
         out.push((event.offset, value));
     }
     out
+}
+
+/// A source that fails every call with one fixed error.
+struct FailingSource {
+    error: SourceError,
+}
+
+impl RecordSource for FailingSource {
+    async fn fetch(
+        &mut self,
+        _topic: &str,
+        _partition: i32,
+        _offset: i64,
+    ) -> Result<SourceBatch, SourceError> {
+        Err(self.error.clone())
+    }
+
+    async fn earliest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
+        Err(self.error.clone())
+    }
+
+    async fn latest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
+        Err(self.error.clone())
+    }
 }
 
 #[tokio::test]
@@ -140,7 +169,8 @@ async fn slow_subscriber_loses_nothing() {
         let event = tokio::time::timeout(Duration::from_secs(5), sub.recv())
             .await
             .expect("timed out")
-            .expect("pump closed");
+            .expect("pump closed")
+            .expect("stream failed");
         seen.push(event.offset);
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
@@ -150,7 +180,7 @@ async fn slow_subscriber_loses_nothing() {
 #[tokio::test]
 async fn hub_runs_one_pump_per_partition() {
     let log = MemoryLog::new();
-    let mut hub = Hub::new(MemoryFactory { log: log.clone() }, PumpConfig::default());
+    let mut hub = Hub::new(MemoryFactory::new(log.clone()), PumpConfig::default());
 
     let mut a = hub
         .subscribe(TOPIC, 0, Position::Latest, Filter::default())
@@ -179,7 +209,7 @@ async fn topic_subscribe_merges_partitions_in_partition_order() {
     for i in 0..4 {
         log.append(TOPIC, i % 3, None, format!("v{i}").as_bytes(), Vec::new());
     }
-    let mut hub = Hub::new(MemoryFactory { log: log.clone() }, PumpConfig::default());
+    let mut hub = Hub::new(MemoryFactory::new(log.clone()), PumpConfig::default());
     let mut sub = hub
         .subscribe_topic(TOPIC, TopicPosition::Earliest, Filter::default())
         .await
@@ -193,7 +223,8 @@ async fn topic_subscribe_merges_partitions_in_partition_order() {
         let event = tokio::time::timeout(Duration::from_secs(5), sub.recv())
             .await
             .expect("timed out")
-            .expect("stream closed");
+            .expect("stream closed")
+            .expect("stream failed");
         per_partition
             .entry(event.partition)
             .or_default()
@@ -208,7 +239,8 @@ async fn topic_subscribe_merges_partitions_in_partition_order() {
     let event = tokio::time::timeout(Duration::from_secs(5), sub.recv())
         .await
         .expect("timed out")
-        .expect("stream closed");
+        .expect("stream closed")
+        .expect("stream failed");
     assert_eq!((event.partition, event.offset), (2, 1));
 }
 
@@ -222,7 +254,7 @@ async fn topic_cursor_resumes_seen_partitions_and_replays_unseen() {
         log.append(TOPIC, 0, None, format!("p0-{i}").as_bytes(), Vec::new());
         log.append(TOPIC, 1, None, format!("p1-{i}").as_bytes(), Vec::new());
     }
-    let mut hub = Hub::new(MemoryFactory { log: log.clone() }, PumpConfig::default());
+    let mut hub = Hub::new(MemoryFactory::new(log.clone()), PumpConfig::default());
 
     // The cursor names partition 0 only: resume it at 2, replay
     // partition 1 from the start (absent = never seen).
@@ -238,9 +270,211 @@ async fn topic_cursor_resumes_seen_partitions_and_replays_unseen() {
         let event = tokio::time::timeout(Duration::from_secs(5), sub.recv())
             .await
             .expect("timed out")
-            .expect("stream closed");
+            .expect("stream closed")
+            .expect("stream failed");
         seen.push((event.partition, event.offset));
     }
     seen.sort_unstable();
     assert_eq!(seen, vec![(0, 2), (1, 0), (1, 1), (1, 2)]);
+}
+
+/// A permanent error (NotFound/Auth) skips the retry budget entirely:
+/// the terminal StreamError arrives long before even one backoff.
+#[tokio::test]
+async fn permanent_error_fails_subscribers_immediately() {
+    let mut config = PumpConfig::default();
+    config.error_backoff = Duration::from_secs(5); // one retry would blow the deadline
+    config.max_consecutive_errors = 100;
+    let source = FailingSource {
+        error: SourceError::not_found("unknown topic ghost"),
+    };
+    let pump = PumpHandle::spawn(source, "ghost", 0, config);
+
+    // Latest needs no source call, so the subscribe itself succeeds.
+    let mut sub = pump
+        .subscribe(Position::Latest, Filter::default())
+        .await
+        .unwrap();
+    let item = tokio::time::timeout(Duration::from_secs(1), sub.recv())
+        .await
+        .expect("terminal error should not wait for backoff")
+        .expect("expected a terminal error, not a bare close");
+    let err = item.expect_err("expected the stream to fail");
+    assert_eq!(err.kind, SourceErrorKind::NotFound);
+    assert!(err.message.contains("ghost"), "{}", err.message);
+    // After the terminal item the stream is closed.
+    assert!(sub.recv().await.is_none());
+}
+
+/// Transient errors keep the old behavior: retry with backoff, then a
+/// terminal StreamError once the budget is spent.
+#[tokio::test]
+async fn transient_errors_exhaust_budget_then_fail_subscribers() {
+    let mut config = PumpConfig::default();
+    config.error_backoff = Duration::from_millis(1);
+    config.max_consecutive_errors = 3;
+    let source = FailingSource {
+        error: SourceError::unavailable("broker down"),
+    };
+    let pump = PumpHandle::spawn(source, TOPIC, 0, config);
+
+    let mut sub = pump
+        .subscribe(Position::Latest, Filter::default())
+        .await
+        .unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+        .await
+        .expect("timed out")
+        .expect("expected a terminal error, not a bare close")
+        .expect_err("expected the stream to fail");
+    assert_eq!(err.kind, SourceErrorKind::Unavailable);
+    assert!(sub.recv().await.is_none());
+}
+
+/// On a quiet topic, a dropped subscriber is noticed without any event
+/// flowing, and the now-empty pump exits after `idle_shutdown`.
+#[tokio::test]
+async fn dead_subscribers_are_detected_on_quiet_topics() {
+    let log = MemoryLog::new();
+    let mut config = PumpConfig::default();
+    config.idle_shutdown = Some(Duration::from_millis(50));
+    let pump = pump_for(&log, config);
+
+    let sub = pump
+        .subscribe(Position::Latest, Filter::default())
+        .await
+        .unwrap();
+    drop(sub); // no event is ever appended: only the per-iteration check can see this
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let result = pump.subscribe(Position::Latest, Filter::default()).await;
+    assert!(
+        matches!(result, Err(HubError::PumpClosed)),
+        "the pump should have exited idle"
+    );
+}
+
+/// The hub respawns a pump that exited idle, replacing (not leaking)
+/// its map entry, and the new pump streams.
+#[tokio::test]
+async fn hub_respawns_idle_exited_pumps() {
+    let log = MemoryLog::new();
+    let mut config = PumpConfig::default();
+    config.idle_shutdown = Some(Duration::from_millis(50));
+    let mut hub = Hub::new(MemoryFactory::new(log.clone()), config);
+
+    let sub = hub
+        .subscribe(TOPIC, 0, Position::Latest, Filter::default())
+        .await
+        .unwrap();
+    drop(sub);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Resubscribe through the hub: the dead pump is replaced in place.
+    let mut sub = hub
+        .subscribe(TOPIC, 0, Position::Latest, Filter::default())
+        .await
+        .expect("hub should respawn an idle-exited pump");
+    assert_eq!(hub.active_partitions().count(), 1);
+
+    log.append(TOPIC, 0, None, b"after-respawn", Vec::new());
+    assert_eq!(
+        collect(&mut sub, 1).await,
+        vec![(0, "after-respawn".into())]
+    );
+}
+
+/// Hub::shutdown ends live streams cleanly (no error item), clears the
+/// pump map, and refuses later subscribes.
+#[tokio::test]
+async fn hub_shutdown_closes_streams_and_refuses_new_subscribes() {
+    let log = MemoryLog::new();
+    let mut hub = Hub::new(MemoryFactory::new(log.clone()), PumpConfig::default());
+    let mut sub = hub
+        .subscribe(TOPIC, 0, Position::Latest, Filter::default())
+        .await
+        .unwrap();
+
+    hub.shutdown().await;
+    assert_eq!(hub.active_partitions().count(), 0);
+
+    let end = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+        .await
+        .expect("timed out waiting for the stream to close");
+    assert!(end.is_none(), "shutdown should close cleanly, got {end:?}");
+
+    let result = hub
+        .subscribe(TOPIC, 0, Position::Latest, Filter::default())
+        .await;
+    assert!(matches!(result, Err(HubError::ShutDown)), "{result:?}");
+}
+
+/// A gated topic fails before any pump or source exists; ungated
+/// topics still stream.
+#[tokio::test]
+async fn topic_gate_denies_before_any_pump_is_created() {
+    let log = MemoryLog::new();
+    let mut hub = Hub::new(MemoryFactory::new(log.clone()), PumpConfig::default())
+        .with_topic_gate(|topic| !topic.starts_with("internal-"));
+
+    let denied = hub
+        .subscribe("internal-audit", 0, Position::Latest, Filter::default())
+        .await;
+    assert!(matches!(denied, Err(HubError::Denied(_))), "{denied:?}");
+    let denied_topic = hub
+        .subscribe_topic(
+            "internal-audit",
+            odradek_web_core::TopicPosition::Latest,
+            Filter::default(),
+        )
+        .await;
+    assert!(
+        matches!(denied_topic, Err(HubError::Denied(_))),
+        "{denied_topic:?}"
+    );
+    assert_eq!(hub.active_partitions().count(), 0);
+
+    let mut sub = hub
+        .subscribe(TOPIC, 0, Position::Latest, Filter::default())
+        .await
+        .unwrap();
+    log.append(TOPIC, 0, None, b"allowed", Vec::new());
+    assert_eq!(collect(&mut sub, 1).await, vec![(0, "allowed".into())]);
+}
+
+/// A first subscribe to an unknown topic fails NotFound and leaves no
+/// dead entry behind in the pump map.
+#[tokio::test]
+async fn unknown_topic_fails_not_found_without_leaking_a_pump_entry() {
+    let log = MemoryLog::new();
+    let factory = MemoryFactory::new(log.clone()).known_topics([TOPIC]);
+    let mut hub = Hub::new(factory, PumpConfig::default());
+
+    let result = hub
+        .subscribe("ghost", 0, Position::Latest, Filter::default())
+        .await;
+    match result {
+        Err(HubError::Source(e)) => assert_eq!(e.kind, SourceErrorKind::NotFound),
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+    let topic_result = hub
+        .subscribe_topic(
+            "ghost",
+            odradek_web_core::TopicPosition::Earliest,
+            Filter::default(),
+        )
+        .await;
+    match topic_result {
+        Err(HubError::Source(e)) => assert_eq!(e.kind, SourceErrorKind::NotFound),
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+    assert_eq!(hub.active_partitions().count(), 0);
+
+    // The known topic still works.
+    let mut sub = hub
+        .subscribe(TOPIC, 0, Position::Latest, Filter::default())
+        .await
+        .unwrap();
+    log.append(TOPIC, 0, None, b"real", Vec::new());
+    assert_eq!(collect(&mut sub, 1).await, vec![(0, "real".into())]);
 }

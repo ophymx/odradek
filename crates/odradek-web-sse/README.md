@@ -13,6 +13,15 @@ embeddable axum `Router` that streams Kafka topics to browsers.
   cursor (`partition:next_offset,...`) as the resume token.
 - `from=` start positions and key/header filters as query parameters;
   UTF-8 payloads as strings, binary as base64.
+- Typed failures: `403` for topics the hub's gate denies
+  (`Hub::with_topic_gate`), `404` for topics the source does not have,
+  `503` after shutdown, `502` for other source trouble. A stream that
+  fails mid-flight ends with one `event: error` frame carrying
+  `{"kind", "message"}`.
+- Graceful shutdown: call `SseState::shutdown()` (e.g. from axum's
+  `with_graceful_shutdown`) to stop every pump, end open streams
+  cleanly, and refuse new subscribes. Idle pumps also exit on their own
+  after `PumpConfig::idle_shutdown` (default 30s) and respawn on demand.
 
 It is a `Router`, not a server: mount it under your own routes and
 layer your own auth.

@@ -12,7 +12,17 @@ as JSON text frames.
   resumable via a multi-partition cursor.
 - Parameter errors are rejected as plain HTTP 400s *before* the
   upgrade, so misconfigured clients get a readable error instead of a
-  dropped socket.
+  dropped socket — as are `403` for topics the hub's gate denies
+  (`Hub::with_topic_gate`), `404` for topics the source does not have,
+  `503` after shutdown, and `502` for other source trouble.
+- A stream that fails mid-flight closes the socket with code `1008`
+  (auth) or `1011` (anything else) and the kind and message as the
+  close reason; a clean end closes with `1001` ("going away").
+- Graceful shutdown: call `WsState::shutdown()` (e.g. from axum's
+  `with_graceful_shutdown`) to stop every pump, close open sockets
+  with `1001`, and refuse new upgrades. Idle pumps also exit on their
+  own after `PumpConfig::idle_shutdown` (default 30s) and respawn on
+  demand.
 
 Like the SSE crate, it is an embeddable axum `Router` — mount it in
 your own service and layer your own auth. Both transports share one

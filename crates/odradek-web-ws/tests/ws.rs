@@ -3,18 +3,18 @@
 //! so parsing is small), and the in-memory log behind the hub.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
-use odradek_web_core::PumpConfig;
 use odradek_web_core::memory::{MemoryFactory, MemoryLog};
-use odradek_web_ws::{WsState, router};
+use odradek_web_core::{PumpConfig, RecordSource, SourceBatch, SourceError};
+use odradek_web_ws::{SourceFactory, WsState, router};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const TOPIC: &str = "bridge";
 
-async fn serve(log: MemoryLog) -> SocketAddr {
-    let state = WsState::new(MemoryFactory { log }, PumpConfig::default());
+async fn serve_state<F: SourceFactory>(state: Arc<WsState<F>>) -> SocketAddr {
     let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -22,6 +22,48 @@ async fn serve(log: MemoryLog) -> SocketAddr {
         axum::serve(listener, app).await.unwrap();
     });
     addr
+}
+
+async fn serve(log: MemoryLog) -> SocketAddr {
+    serve_state(WsState::new(MemoryFactory::new(log), PumpConfig::default())).await
+}
+
+/// A source whose partition metadata resolves but whose reads fail
+/// permanently — the shape of "auth revoked under a live stream".
+#[derive(Debug, Clone)]
+struct RevokedFactory;
+
+struct RevokedSource;
+
+impl RecordSource for RevokedSource {
+    async fn fetch(
+        &mut self,
+        _topic: &str,
+        _partition: i32,
+        _offset: i64,
+    ) -> Result<SourceBatch, SourceError> {
+        Err(SourceError::auth("TOPIC_AUTHORIZATION_FAILED"))
+    }
+
+    async fn earliest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
+        Err(SourceError::auth("TOPIC_AUTHORIZATION_FAILED"))
+    }
+
+    async fn latest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
+        Err(SourceError::auth("TOPIC_AUTHORIZATION_FAILED"))
+    }
+}
+
+impl SourceFactory for RevokedFactory {
+    type Source = RevokedSource;
+
+    async fn create(&self, _topic: &str, _partition: i32) -> Result<RevokedSource, SourceError> {
+        Ok(RevokedSource)
+    }
+
+    async fn partitions(&self, _topic: &str) -> Result<Vec<i32>, SourceError> {
+        Ok(vec![0])
+    }
 }
 
 struct WsClient {
@@ -79,6 +121,23 @@ impl WsClient {
                     0x8 => panic!("server closed the websocket"),
                     _ => continue, // ping/pong or continuation: skip
                 }
+            }
+            self.fill().await;
+        }
+    }
+
+    /// The next close frame as (code, reason); skips data frames.
+    async fn next_close(&mut self) -> (u16, String) {
+        loop {
+            if let Some((opcode, payload, consumed)) = parse_frame(&self.buffer) {
+                self.buffer.drain(..consumed);
+                if opcode == 0x8 {
+                    assert!(payload.len() >= 2, "close frame without a code");
+                    let code = u16::from_be_bytes([payload[0], payload[1]]);
+                    let reason = String::from_utf8(payload[2..].to_vec()).unwrap();
+                    return (code, reason);
+                }
+                continue;
             }
             self.fill().await;
         }
@@ -240,4 +299,74 @@ async fn topic_stream_merges_partitions_and_resumes_by_cursor() {
     assert_eq!(json["partition"], 1);
     assert_eq!(json["offset"], 1);
     assert_eq!(value_of(&json), "p1-b");
+}
+
+#[tokio::test]
+async fn gated_topics_fail_403_before_the_upgrade() {
+    use odradek_web_ws::web_core::Hub;
+
+    let log = MemoryLog::new();
+    let hub = Hub::new(MemoryFactory::new(log.clone()), PumpConfig::default())
+        .with_topic_gate(|topic| !topic.starts_with("internal-"));
+    let addr = serve_state(WsState::from_hub(hub)).await;
+
+    let (_denied, status) = WsClient::connect(addr, "/topics/internal-audit/partitions/0/ws").await;
+    assert!(status.contains("403"), "{status}");
+    let (_denied_topic, status) = WsClient::connect(addr, "/topics/internal-audit/ws").await;
+    assert!(status.contains("403"), "{status}");
+
+    // The gate does not get in the way of allowed topics.
+    let (mut allowed, status) =
+        WsClient::connect(addr, &format!("/topics/{TOPIC}/partitions/0/ws")).await;
+    assert!(status.contains("101"), "{status}");
+    log.append(TOPIC, 0, None, b"through-the-gate", Vec::new());
+    let json = allowed.next_json().await;
+    assert_eq!(value_of(&json), "through-the-gate");
+}
+
+#[tokio::test]
+async fn unknown_topics_fail_404_before_the_upgrade() {
+    let log = MemoryLog::new();
+    let factory = MemoryFactory::new(log).known_topics([TOPIC]);
+    let addr = serve_state(WsState::new(factory, PumpConfig::default())).await;
+
+    let (_client, status) = WsClient::connect(addr, "/topics/ghost/partitions/0/ws").await;
+    assert!(status.contains("404"), "{status}");
+    let (_topic_client, status) = WsClient::connect(addr, "/topics/ghost/ws").await;
+    assert!(status.contains("404"), "{status}");
+}
+
+#[tokio::test]
+async fn failed_stream_closes_with_a_reasoned_close_frame() {
+    let addr = serve_state(WsState::new(RevokedFactory, PumpConfig::default())).await;
+
+    // Latest subscribes without touching the source, so the upgrade
+    // succeeds — then the pump hits the permanent auth failure.
+    let (mut client, status) =
+        WsClient::connect(addr, &format!("/topics/{TOPIC}/partitions/0/ws")).await;
+    assert!(status.contains("101"), "{status}");
+
+    let (code, reason) = client.next_close().await;
+    assert_eq!(code, 1008, "auth failures use policy-violation");
+    assert_eq!(reason, "auth: TOPIC_AUTHORIZATION_FAILED");
+}
+
+#[tokio::test]
+async fn shutdown_closes_sockets_going_away_and_refuses_new_upgrades() {
+    let log = MemoryLog::new();
+    let state = WsState::new(MemoryFactory::new(log), PumpConfig::default());
+    let addr = serve_state(state.clone()).await;
+
+    let (mut client, status) =
+        WsClient::connect(addr, &format!("/topics/{TOPIC}/partitions/0/ws")).await;
+    assert!(status.contains("101"), "{status}");
+
+    state.shutdown().await;
+    let (code, reason) = client.next_close().await;
+    assert_eq!(code, 1001);
+    assert_eq!(reason, "going away");
+
+    let (_refused, status) =
+        WsClient::connect(addr, &format!("/topics/{TOPIC}/partitions/0/ws")).await;
+    assert!(status.contains("503"), "{status}");
 }

@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     for _ in 0..5 {
-        let event = sub.recv().await.ok_or("pump closed")?;
+        let event = sub.recv().await.ok_or("pump closed")??;
         println!(
             "  replay offset {}: {}",
             event.offset,
@@ -76,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let event = tokio::time::timeout(std::time::Duration::from_secs(10), sub.recv())
         .await?
-        .ok_or("pump closed")?;
+        .ok_or("pump closed")??;
     println!(
         "  live offset {}: {}",
         event.offset,
