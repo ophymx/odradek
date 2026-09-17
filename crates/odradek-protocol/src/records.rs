@@ -51,7 +51,7 @@ impl Compression {
     }
 
     /// The attribute bits that select this codec — the inverse of
-    /// [`Compression::from_attributes`], kept beside it so a new codec
+    /// `Compression::from_attributes`, kept beside it so a new codec
     /// number cannot land in one direction only.
     pub fn attribute_bits(self) -> i16 {
         match self {

@@ -540,10 +540,8 @@ name = "odradek-web-sse"
 version = "0.1.0"
 dependencies = [
  "axum",
- "bytes",
  "odradek-client",
  "odradek-web-core",
- "serde",
  "serde_json",
  "tokio",
  "tokio-stream",
@@ -554,11 +552,9 @@ name = "odradek-web-ws"
 version = "0.1.0"
 dependencies = [
  "axum",
- "bytes",
  "odradek-client",
  "odradek-web-core",
  "odradek-web-sse",
- "serde",
  "serde_json",
  "tokio",
 ]

@@ -51,8 +51,10 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
 use odradek_web_core::json::event_json;
-use odradek_web_core::pump::{HubError, StreamItem};
-use odradek_web_core::{Hub, SourceErrorKind, StreamParams, TopicPosition, cursor};
+use odradek_web_core::pump::StreamItem;
+use odradek_web_core::{
+    Hub, Rejection, RejectionKind, SharedHub, StreamParams, TopicPosition, cursor,
+};
 
 /// Everything needed to stand the router up, re-exported so embedders
 /// depend on this crate alone; the full engine is under [`web_core`].
@@ -65,7 +67,7 @@ pub use odradek_web_core::{PumpConfig, SourceFactory};
 /// mutation only (streams run lock-free once created).
 #[derive(Debug)]
 pub struct SseState<F: SourceFactory> {
-    hub: tokio::sync::Mutex<Hub<F>>,
+    hub: SharedHub<F>,
 }
 
 impl<F: SourceFactory> SseState<F> {
@@ -77,7 +79,7 @@ impl<F: SourceFactory> SseState<F> {
     /// [`Hub::with_topic_gate`].
     pub fn from_hub(hub: Hub<F>) -> Arc<SseState<F>> {
         Arc::new(SseState {
-            hub: tokio::sync::Mutex::new(hub),
+            hub: SharedHub::from_hub(hub),
         })
     }
 
@@ -85,21 +87,22 @@ impl<F: SourceFactory> SseState<F> {
     /// streams end cleanly. Call this from your server's graceful
     /// shutdown (axum's `with_graceful_shutdown`).
     pub async fn shutdown(&self) {
-        self.hub.lock().await.shutdown().await;
+        self.hub.shutdown().await;
     }
 }
 
-/// The HTTP status a failed subscribe maps to: gated topics are `403`,
-/// missing ones `404`, a shut-down hub `503`, the rest `502`.
-fn subscribe_status(error: &HubError) -> StatusCode {
-    match error {
-        HubError::Denied(_) => StatusCode::FORBIDDEN,
-        HubError::ShutDown => StatusCode::SERVICE_UNAVAILABLE,
-        HubError::Source(source) if source.kind == SourceErrorKind::NotFound => {
-            StatusCode::NOT_FOUND
-        }
+/// A refused subscribe as the plain HTTP error it becomes: `400` for
+/// bad parameters, `403` for gated topics, `404` for missing ones,
+/// `503` after shutdown, `502` for the rest.
+fn reject(rejection: Rejection) -> (StatusCode, String) {
+    let status = match rejection.kind {
+        RejectionKind::BadRequest => StatusCode::BAD_REQUEST,
+        RejectionKind::Denied => StatusCode::FORBIDDEN,
+        RejectionKind::NotFound => StatusCode::NOT_FOUND,
+        RejectionKind::ShutDown => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::BAD_GATEWAY,
-    }
+    };
+    (status, rejection.message)
 }
 
 /// One channel item as an SSE frame; errors become a final
@@ -145,18 +148,12 @@ async fn stream_partition<F: SourceFactory>(
     headers: HeaderMap,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>>, (StatusCode, String)>
 {
-    let position = params
-        .position(last_event_id(&headers)?.as_deref())
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let filter = params.filter().map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-
+    let resume = last_event_id(&headers)?;
     let subscription = state
         .hub
-        .lock()
+        .stream(&topic, partition, &params, resume.as_deref())
         .await
-        .subscribe(&topic, partition, position, filter)
-        .await
-        .map_err(|e| (subscribe_status(&e), e.to_string()))?;
+        .map_err(reject)?;
 
     let stream = ReceiverStream::new(subscription.into_receiver()).map(|item: StreamItem| {
         Ok(match item {
@@ -183,24 +180,19 @@ async fn stream_topic<F: SourceFactory>(
     headers: HeaderMap,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>>, (StatusCode, String)>
 {
-    let position = params
-        .topic_position(last_event_id(&headers)?.as_deref())
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let filter = params.filter().map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let resume = last_event_id(&headers)?;
+    let (subscription, position) = state
+        .hub
+        .stream_topic(&topic, &params, resume.as_deref())
+        .await
+        .map_err(reject)?;
 
     // Seed the running cursor from the resume point, so an id always
     // carries every partition the client has a position for.
-    let mut running = match &position {
-        TopicPosition::Offsets(cursor) => cursor.clone(),
+    let mut running = match position {
+        TopicPosition::Offsets(cursor) => cursor,
         _ => std::collections::BTreeMap::new(),
     };
-    let subscription = state
-        .hub
-        .lock()
-        .await
-        .subscribe_topic(&topic, position, filter)
-        .await
-        .map_err(|e| (subscribe_status(&e), e.to_string()))?;
 
     let stream = ReceiverStream::new(subscription.into_receiver()).map(move |item: StreamItem| {
         Ok(match item {

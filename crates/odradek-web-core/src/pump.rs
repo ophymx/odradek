@@ -79,6 +79,42 @@ pub enum HubError {
     Denied(String),
 }
 
+/// The transport-facing classification of a refused subscribe — what
+/// to tell the client, without re-deriving it from [`HubError`]'s
+/// shape. Transports map these straight to their status codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RejectionKind {
+    /// The request's own parameters were malformed (bad `from`, bad
+    /// filter). Produced only by the
+    /// [`SharedHub`](crate::hub::SharedHub) front door — never by
+    /// [`HubError::rejection_kind`], which classifies subscribe
+    /// failures, not parse failures.
+    BadRequest,
+    /// The hub's topic gate refused this topic (HTTP `403`).
+    Denied,
+    /// The source does not have this topic or partition (HTTP `404`).
+    NotFound,
+    /// The hub has shut down and refuses new subscribes (HTTP `503`).
+    ShutDown,
+    /// The source failed in some other way (HTTP `502`).
+    Upstream,
+}
+
+impl HubError {
+    /// How a transport should refuse the subscribe this error failed.
+    pub fn rejection_kind(&self) -> RejectionKind {
+        match self {
+            HubError::Denied(_) => RejectionKind::Denied,
+            HubError::ShutDown => RejectionKind::ShutDown,
+            HubError::Source(source) if source.kind == SourceErrorKind::NotFound => {
+                RejectionKind::NotFound
+            }
+            _ => RejectionKind::Upstream,
+        }
+    }
+}
+
 /// Why a stream ended, delivered as the final item before the channel
 /// closes. Streams that end *cleanly* (pump or hub shutdown) close
 /// without one.

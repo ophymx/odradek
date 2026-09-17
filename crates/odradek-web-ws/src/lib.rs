@@ -44,8 +44,8 @@ use axum::response::Response;
 use axum::routing::get;
 
 use odradek_web_core::json::event_json;
-use odradek_web_core::pump::{HubError, StreamError, StreamItem};
-use odradek_web_core::{Hub, SourceErrorKind, StreamParams};
+use odradek_web_core::pump::{StreamError, StreamItem};
+use odradek_web_core::{Hub, Rejection, RejectionKind, SharedHub, SourceErrorKind, StreamParams};
 
 /// Everything needed to stand the router up, re-exported so embedders
 /// depend on this crate alone; the full engine is under [`web_core`].
@@ -58,7 +58,7 @@ pub use odradek_web_core::{PumpConfig, SourceFactory};
 /// mutation only (each socket runs lock-free once subscribed).
 #[derive(Debug)]
 pub struct WsState<F: SourceFactory> {
-    hub: tokio::sync::Mutex<Hub<F>>,
+    hub: SharedHub<F>,
 }
 
 impl<F: SourceFactory> WsState<F> {
@@ -70,7 +70,7 @@ impl<F: SourceFactory> WsState<F> {
     /// [`Hub::with_topic_gate`].
     pub fn from_hub(hub: Hub<F>) -> Arc<WsState<F>> {
         Arc::new(WsState {
-            hub: tokio::sync::Mutex::new(hub),
+            hub: SharedHub::from_hub(hub),
         })
     }
 
@@ -78,21 +78,22 @@ impl<F: SourceFactory> WsState<F> {
     /// sockets close with `1001` ("going away"). Call this from your
     /// server's graceful shutdown (axum's `with_graceful_shutdown`).
     pub async fn shutdown(&self) {
-        self.hub.lock().await.shutdown().await;
+        self.hub.shutdown().await;
     }
 }
 
-/// The HTTP status a failed subscribe maps to: gated topics are `403`,
-/// missing ones `404`, a shut-down hub `503`, the rest `502`.
-fn subscribe_status(error: &HubError) -> StatusCode {
-    match error {
-        HubError::Denied(_) => StatusCode::FORBIDDEN,
-        HubError::ShutDown => StatusCode::SERVICE_UNAVAILABLE,
-        HubError::Source(source) if source.kind == SourceErrorKind::NotFound => {
-            StatusCode::NOT_FOUND
-        }
+/// A refused subscribe as the plain HTTP error it becomes: `400` for
+/// bad parameters, `403` for gated topics, `404` for missing ones,
+/// `503` after shutdown, `502` for the rest.
+fn reject(rejection: Rejection) -> (StatusCode, String) {
+    let status = match rejection.kind {
+        RejectionKind::BadRequest => StatusCode::BAD_REQUEST,
+        RejectionKind::Denied => StatusCode::FORBIDDEN,
+        RejectionKind::NotFound => StatusCode::NOT_FOUND,
+        RejectionKind::ShutDown => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::BAD_GATEWAY,
-    }
+    };
+    (status, rejection.message)
 }
 
 /// The WebSocket routes over `state`; merge into your own [`Router`].
@@ -114,17 +115,11 @@ async fn upgrade_partition<F: SourceFactory>(
 ) -> Result<Response, (StatusCode, String)> {
     // Validate and subscribe before upgrading, so failures are ordinary
     // HTTP errors a client can read.
-    let position = params
-        .position(None)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let filter = params.filter().map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let subscription = state
         .hub
-        .lock()
+        .stream(&topic, partition, &params, None)
         .await
-        .subscribe(&topic, partition, position, filter)
-        .await
-        .map_err(|e| (subscribe_status(&e), e.to_string()))?;
+        .map_err(reject)?;
 
     Ok(ws.on_upgrade(move |socket| stream_events(socket, subscription.into_receiver())))
 }
@@ -138,17 +133,11 @@ async fn upgrade_topic<F: SourceFactory>(
     Query(params): Query<StreamParams>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, (StatusCode, String)> {
-    let position = params
-        .topic_position(None)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let filter = params.filter().map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let subscription = state
+    let (subscription, _) = state
         .hub
-        .lock()
+        .stream_topic(&topic, &params, None)
         .await
-        .subscribe_topic(&topic, position, filter)
-        .await
-        .map_err(|e| (subscribe_status(&e), e.to_string()))?;
+        .map_err(reject)?;
 
     Ok(ws.on_upgrade(move |socket| stream_events(socket, subscription.into_receiver())))
 }
@@ -168,7 +157,7 @@ fn close_frame(error: &StreamError) -> CloseFrame {
         SourceErrorKind::Auth => CLOSE_POLICY_VIOLATION,
         _ => CLOSE_INTERNAL_ERROR,
     };
-    let mut reason = format!("{}: {}", error.kind.as_str(), error.message);
+    let mut reason = error.to_string();
     // A close reason holds at most 123 bytes; cut at a char boundary.
     if reason.len() > 123 {
         let mut end = 123;

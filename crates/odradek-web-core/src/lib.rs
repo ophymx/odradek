@@ -22,6 +22,11 @@
 //! The engine reads through the [`RecordSource`] trait, so it tests
 //! against an in-memory log; [`KafkaSource`] adapts
 //! [`odradek_client::Consumer`] for production.
+//!
+//! This crate is the engine plus the shared web wire contract — the
+//! query grammar ([`StreamParams`]), the JSON event shape
+//! ([`event_json`]), and the resume cursors ([`cursor`]) — so the
+//! transports cannot drift apart.
 
 pub mod cursor;
 pub mod event;
@@ -33,11 +38,13 @@ pub mod pump;
 pub mod source;
 
 pub use event::{Event, Filter, Position, TopicPosition};
-pub use hub::{Hub, TopicSubscription};
+pub use hub::{Hub, Rejection, SharedHub, TopicSubscription};
 pub use json::event_json;
 pub use memory::{MemoryFactory, MemoryLog};
 pub use params::StreamParams;
-pub use pump::{HubError, PumpConfig, PumpHandle, StreamError, StreamItem, Subscription};
+pub use pump::{
+    HubError, PumpConfig, PumpHandle, RejectionKind, StreamError, StreamItem, Subscription,
+};
 #[cfg(feature = "kafka")]
 pub use source::{KafkaSource, KafkaSourceFactory};
 pub use source::{RecordSource, SourceBatch, SourceError, SourceErrorKind, SourceFactory};

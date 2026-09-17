@@ -15,7 +15,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::event::{Filter, Position, TopicPosition};
-use crate::pump::{HubError, PumpConfig, PumpHandle, StreamItem, Subscription};
+use crate::params::StreamParams;
+use crate::pump::{HubError, PumpConfig, PumpHandle, RejectionKind, StreamItem, Subscription};
 use crate::source::SourceFactory;
 
 type TopicGate = Arc<dyn Fn(&str) -> bool + Send + Sync>;
@@ -235,5 +236,132 @@ impl<F: SourceFactory> Hub<F> {
     /// The pumps currently running.
     pub fn active_partitions(&self) -> impl Iterator<Item = (&str, i32)> {
         self.pumps.keys().map(|(t, p)| (t.as_str(), *p))
+    }
+}
+
+/// A refused subscribe from the [`SharedHub`] front door: the
+/// [`RejectionKind`] a transport maps to its status code, plus the
+/// message for the response body.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Rejection {
+    pub kind: RejectionKind,
+    pub message: String,
+}
+
+impl Rejection {
+    /// A malformed request parameter (bad `from`, bad filter).
+    fn bad_request(message: String) -> Rejection {
+        Rejection {
+            kind: RejectionKind::BadRequest,
+            message,
+        }
+    }
+}
+
+impl From<HubError> for Rejection {
+    fn from(e: HubError) -> Rejection {
+        Rejection {
+            kind: e.rejection_kind(),
+            message: e.to_string(),
+        }
+    }
+}
+
+/// A [`Hub`] behind a `tokio::sync::Mutex` — the shape every transport
+/// needs: subscribe-time mutation is serialized, and streams run
+/// lock-free once created. Wrap it (or a state type holding it) in an
+/// `Arc` and share it across handlers; every method takes `&self`.
+#[derive(Debug)]
+pub struct SharedHub<F: SourceFactory> {
+    hub: tokio::sync::Mutex<Hub<F>>,
+}
+
+impl<F: SourceFactory> SharedHub<F> {
+    pub fn new(factory: F, config: PumpConfig) -> SharedHub<F> {
+        SharedHub::from_hub(Hub::new(factory, config))
+    }
+
+    /// Wrap a pre-built hub — the way in for hub-level options such as
+    /// [`Hub::with_topic_gate`].
+    pub fn from_hub(hub: Hub<F>) -> SharedHub<F> {
+        SharedHub {
+            hub: tokio::sync::Mutex::new(hub),
+        }
+    }
+
+    /// [`Hub::subscribe`], serialized behind the lock.
+    pub async fn subscribe(
+        &self,
+        topic: &str,
+        partition: i32,
+        position: Position,
+        filter: Filter,
+    ) -> Result<Subscription, HubError> {
+        self.hub
+            .lock()
+            .await
+            .subscribe(topic, partition, position, filter)
+            .await
+    }
+
+    /// [`Hub::subscribe_topic`], serialized behind the lock.
+    pub async fn subscribe_topic(
+        &self,
+        topic: &str,
+        position: TopicPosition,
+        filter: Filter,
+    ) -> Result<TopicSubscription, HubError> {
+        self.hub
+            .lock()
+            .await
+            .subscribe_topic(topic, position, filter)
+            .await
+    }
+
+    /// [`Hub::shutdown`]: stop every pump and refuse further
+    /// subscribes. Call this from your server's graceful shutdown.
+    pub async fn shutdown(&self) {
+        self.hub.lock().await.shutdown().await;
+    }
+
+    /// The whole front door for one partition's stream: parse `params`
+    /// (with the transport's `resume` token winning over `from`), then
+    /// subscribe. Parameter errors come back as
+    /// [`RejectionKind::BadRequest`]; subscribe failures carry
+    /// [`HubError::rejection_kind`].
+    pub async fn stream(
+        &self,
+        topic: &str,
+        partition: i32,
+        params: &StreamParams,
+        resume: Option<&str>,
+    ) -> Result<Subscription, Rejection> {
+        let position = params.position(resume).map_err(Rejection::bad_request)?;
+        let filter = params.filter().map_err(Rejection::bad_request)?;
+        self.subscribe(topic, partition, position, filter)
+            .await
+            .map_err(Rejection::from)
+    }
+
+    /// The front door for a whole-topic stream. Also hands back the
+    /// parsed [`TopicPosition`], so a transport that emits cursors
+    /// (SSE's event ids) can seed its running cursor from the resume
+    /// point.
+    pub async fn stream_topic(
+        &self,
+        topic: &str,
+        params: &StreamParams,
+        resume: Option<&str>,
+    ) -> Result<(TopicSubscription, TopicPosition), Rejection> {
+        let position = params
+            .topic_position(resume)
+            .map_err(Rejection::bad_request)?;
+        let filter = params.filter().map_err(Rejection::bad_request)?;
+        let subscription = self
+            .subscribe_topic(topic, position.clone(), filter)
+            .await
+            .map_err(Rejection::from)?;
+        Ok((subscription, position))
     }
 }

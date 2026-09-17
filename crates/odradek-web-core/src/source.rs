@@ -105,31 +105,18 @@ impl SourceError {
 }
 
 /// Classify an [`odradek_client::ClientError`] into the kinds the pump
-/// acts on.
+/// acts on. The client owns the taxonomy
+/// ([`ErrorCategory`](odradek_client::ErrorCategory)); this impl only
+/// carries it across the trait boundary.
 #[cfg(feature = "kafka")]
 impl From<odradek_client::ClientError> for SourceError {
     fn from(e: odradek_client::ClientError) -> SourceError {
-        use odradek_client::ClientError;
-        use odradek_client::protocol::ErrorCode;
+        use odradek_client::ErrorCategory;
 
-        let kind = match &e {
-            ClientError::Broker(code) => match *code {
-                ErrorCode::UNKNOWN_TOPIC_OR_PARTITION | ErrorCode::UNKNOWN_TOPIC_ID => {
-                    SourceErrorKind::NotFound
-                }
-                ErrorCode::TOPIC_AUTHORIZATION_FAILED
-                | ErrorCode::GROUP_AUTHORIZATION_FAILED
-                | ErrorCode::SASL_AUTHENTICATION_FAILED
-                | ErrorCode::UNSUPPORTED_SASL_MECHANISM => SourceErrorKind::Auth,
-                _ => SourceErrorKind::Other,
-            },
-            ClientError::Sasl(_) => SourceErrorKind::Auth,
-            ClientError::ConnectionClosed
-            | ClientError::Io(_)
-            | ClientError::Timeout(_)
-            | ClientError::Bootstrap(_)
-            | ClientError::Tls(_)
-            | ClientError::UnknownLeader { .. } => SourceErrorKind::Unavailable,
+        let kind = match e.category() {
+            ErrorCategory::NotFound => SourceErrorKind::NotFound,
+            ErrorCategory::Auth => SourceErrorKind::Auth,
+            ErrorCategory::Unavailable => SourceErrorKind::Unavailable,
             _ => SourceErrorKind::Other,
         };
         SourceError::new(kind, e.to_string())
@@ -277,14 +264,14 @@ impl SourceFactory for KafkaSourceFactory {
     }
 
     async fn partitions(&self, topic: &str) -> Result<Vec<i32>, SourceError> {
-        let cluster = self.cluster().await?;
-        cluster
-            .refresh_metadata(&[topic])
+        // The client owns unknown-topic semantics; its error maps to
+        // `NotFound` through the `From` impl above.
+        let mut partitions: Vec<i32> = self
+            .cluster()
+            .await?
+            .topic_partitions(topic)
             .await
-            .map_err(SourceError::from)?;
-        let mut partitions: Vec<i32> = cluster
-            .partitions(topic)
-            .ok_or_else(|| SourceError::not_found(format!("unknown topic {topic}")))?
+            .map_err(SourceError::from)?
             .iter()
             .map(|p| p.index)
             .collect();
