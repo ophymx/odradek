@@ -128,11 +128,35 @@ impl RecordSource for KafkaSource {
     }
 }
 
-/// Dials a fresh Kafka connection per pump.
+/// Sources over one shared [`Cluster`]: the first pump (or partition
+/// lookup) dials it, and every pump's consumer then rides the same
+/// connection pool and metadata cache.
 #[cfg(feature = "kafka")]
 #[derive(Debug, Clone)]
 pub struct KafkaSourceFactory {
-    pub config: ClientConfig,
+    config: ClientConfig,
+    cluster: std::sync::Arc<tokio::sync::OnceCell<Cluster>>,
+}
+
+#[cfg(feature = "kafka")]
+impl KafkaSourceFactory {
+    pub fn new(config: ClientConfig) -> KafkaSourceFactory {
+        KafkaSourceFactory {
+            config,
+            cluster: std::sync::Arc::new(tokio::sync::OnceCell::new()),
+        }
+    }
+
+    async fn cluster(&self) -> Result<Cluster, SourceError> {
+        self.cluster
+            .get_or_try_init(|| async {
+                Cluster::connect(self.config.clone())
+                    .await
+                    .map_err(|e| SourceError(e.to_string()))
+            })
+            .await
+            .cloned()
+    }
 }
 
 #[cfg(feature = "kafka")]
@@ -140,16 +164,11 @@ impl SourceFactory for KafkaSourceFactory {
     type Source = KafkaSource;
 
     async fn create(&self, _topic: &str, _partition: i32) -> Result<KafkaSource, SourceError> {
-        let cluster = Cluster::connect(self.config.clone())
-            .await
-            .map_err(|e| SourceError(e.to_string()))?;
-        Ok(KafkaSource::new(Consumer::new(cluster)))
+        Ok(KafkaSource::new(Consumer::new(self.cluster().await?)))
     }
 
     async fn partitions(&self, topic: &str) -> Result<Vec<i32>, SourceError> {
-        let mut cluster = Cluster::connect(self.config.clone())
-            .await
-            .map_err(|e| SourceError(e.to_string()))?;
+        let cluster = self.cluster().await?;
         cluster
             .refresh_metadata(&[topic])
             .await

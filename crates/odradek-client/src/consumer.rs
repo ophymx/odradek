@@ -118,13 +118,13 @@ impl Consumer {
     }
 
     /// The underlying cluster, e.g. for metadata queries.
-    pub fn cluster(&mut self) -> &mut Cluster {
-        &mut self.cluster
+    pub fn cluster(&self) -> &Cluster {
+        &self.cluster
     }
 
     /// Fetch records from `topic[partition]` starting at `offset`.
     pub async fn fetch(
-        &mut self,
+        &self,
         topic: &str,
         partition: i32,
         offset: i64,
@@ -136,11 +136,7 @@ impl Consumer {
     }
 
     /// The partition's oldest available offset (the log start).
-    pub async fn earliest_offset(
-        &mut self,
-        topic: &str,
-        partition: i32,
-    ) -> Result<i64, ClientError> {
+    pub async fn earliest_offset(&self, topic: &str, partition: i32) -> Result<i64, ClientError> {
         self.with_retries(topic, |this| {
             Box::pin(this.list_offset_once(topic.to_owned(), partition, EARLIEST))
         })
@@ -148,7 +144,7 @@ impl Consumer {
     }
 
     /// The partition's next-to-be-assigned offset (the log end).
-    pub async fn latest_offset(&mut self, topic: &str, partition: i32) -> Result<i64, ClientError> {
+    pub async fn latest_offset(&self, topic: &str, partition: i32) -> Result<i64, ClientError> {
         self.with_retries(topic, |this| {
             Box::pin(this.list_offset_once(topic.to_owned(), partition, LATEST))
         })
@@ -159,7 +155,7 @@ impl Consumer {
     /// simple (non-member) consumer: no group membership required, the
     /// caller owns partition assignment.
     pub async fn commit_offset(
-        &mut self,
+        &self,
         group: &str,
         topic: &str,
         partition: i32,
@@ -174,7 +170,7 @@ impl Consumer {
     /// The offset last committed for `topic[partition]` under `group`, or
     /// `None` when nothing was ever committed.
     pub async fn committed_offset(
-        &mut self,
+        &self,
         group: &str,
         topic: &str,
         partition: i32,
@@ -188,10 +184,10 @@ impl Consumer {
     /// Like [`Self::with_retries`], but coordinator-scoped: a retriable
     /// error invalidates the discovered coordinator, not topic metadata.
     async fn with_group_retries<T>(
-        &mut self,
+        &self,
         group: &str,
         mut attempt: impl for<'a> FnMut(
-            &'a mut Consumer,
+            &'a Consumer,
         ) -> std::pin::Pin<
             Box<dyn Future<Output = Result<T, ClientError>> + Send + 'a>,
         >,
@@ -214,13 +210,13 @@ impl Consumer {
     }
 
     async fn commit_once(
-        &mut self,
+        &self,
         group: String,
         topic: String,
         partition: i32,
         offset: i64,
     ) -> Result<(), ClientError> {
-        let broker = self.cluster.coordinator(&group).await?.clone();
+        let broker = self.cluster.coordinator(&group).await?;
         let version = broker
             .ranges
             .pick(OffsetCommitRequest::API_KEY, OFFSET_COMMIT_SUPPORTED)?;
@@ -265,12 +261,12 @@ impl Consumer {
     }
 
     async fn committed_once(
-        &mut self,
+        &self,
         group: String,
         topic: String,
         partition: i32,
     ) -> Result<Option<i64>, ClientError> {
-        let broker = self.cluster.coordinator(&group).await?.clone();
+        let broker = self.cluster.coordinator(&group).await?;
         let version = broker
             .ranges
             .pick(OffsetFetchRequest::API_KEY, OFFSET_FETCH_SUPPORTED)?;
@@ -309,10 +305,10 @@ impl Consumer {
     }
 
     async fn with_retries<T>(
-        &mut self,
+        &self,
         topic: &str,
         mut attempt: impl for<'a> FnMut(
-            &'a mut Consumer,
+            &'a Consumer,
         ) -> std::pin::Pin<
             Box<dyn Future<Output = Result<T, ClientError>> + Send + 'a>,
         >,
@@ -335,16 +331,12 @@ impl Consumer {
     }
 
     async fn fetch_once(
-        &mut self,
+        &self,
         topic: String,
         partition: i32,
         offset: i64,
     ) -> Result<FetchResult, ClientError> {
-        let broker = self
-            .cluster
-            .partition_leader(&topic, partition)
-            .await?
-            .clone();
+        let broker = self.cluster.partition_leader(&topic, partition).await?;
         let leader = self.cluster.leader_id(&topic, partition);
         let version = broker.ranges.pick(FetchRequest::API_KEY, FETCH_SUPPORTED)?;
 
@@ -454,16 +446,12 @@ impl Consumer {
     }
 
     async fn list_offset_once(
-        &mut self,
+        &self,
         topic: String,
         partition: i32,
         timestamp: i64,
     ) -> Result<i64, ClientError> {
-        let broker = self
-            .cluster
-            .partition_leader(&topic, partition)
-            .await?
-            .clone();
+        let broker = self.cluster.partition_leader(&topic, partition).await?;
         let version = broker
             .ranges
             .pick(ListOffsetsRequest::API_KEY, LIST_OFFSETS_SUPPORTED)?;

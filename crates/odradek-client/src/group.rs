@@ -135,8 +135,8 @@ impl GroupMember {
     }
 
     /// The underlying cluster, e.g. for metadata queries.
-    pub fn cluster(&mut self) -> &mut Cluster {
-        &mut self.cluster
+    pub fn cluster(&self) -> &Cluster {
+        &self.cluster
     }
 
     /// Run one join/sync round, updating generation and assignment.
@@ -171,7 +171,7 @@ impl GroupMember {
 
     async fn join_round(&mut self) -> Result<(), ClientError> {
         let subscription = encode_subscription(&self.topics);
-        let broker = self.cluster.coordinator(&self.group_id).await?.clone();
+        let broker = self.cluster.coordinator(&self.group_id).await?;
         let join_version = broker
             .ranges
             .pick(JoinGroupRequest::API_KEY, JOIN_SUPPORTED)?;
@@ -285,7 +285,7 @@ impl GroupMember {
             if round > 0 {
                 tokio::time::sleep(self.config.retry_backoff).await;
             }
-            let broker = self.cluster.coordinator(&self.group_id).await?.clone();
+            let broker = self.cluster.coordinator(&self.group_id).await?;
             let version = broker
                 .ranges
                 .pick(HeartbeatRequest::API_KEY, HEARTBEAT_SUPPORTED)?;
@@ -327,12 +327,13 @@ impl GroupMember {
         Err(last.unwrap_or(ClientError::ConnectionClosed))
     }
 
-    /// Leave the group cleanly, returning the cluster for reuse.
-    pub async fn leave(mut self) -> Result<Cluster, ClientError> {
+    /// Leave the group cleanly. The cluster handle is a cheap clone;
+    /// other components sharing it are unaffected.
+    pub async fn leave(self) -> Result<(), ClientError> {
         if self.member_id.is_empty() {
-            return Ok(self.cluster);
+            return Ok(());
         }
-        let broker = self.cluster.coordinator(&self.group_id).await?.clone();
+        let broker = self.cluster.coordinator(&self.group_id).await?;
         let version = broker
             .ranges
             .pick(LeaveGroupRequest::API_KEY, LEAVE_SUPPORTED)?;
@@ -356,7 +357,7 @@ impl GroupMember {
         if !code.is_ok() && code != ErrorCode::UNKNOWN_MEMBER_ID {
             return Err(ClientError::Broker(code));
         }
-        Ok(self.cluster)
+        Ok(())
     }
 }
 

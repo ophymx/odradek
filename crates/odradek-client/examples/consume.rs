@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.bootstrap_servers = vec![bootstrap];
     config.client_id = "odradek-consume".into();
     let cluster = Cluster::connect(config).await?;
-    let mut consumer = Consumer::new(cluster);
+    let consumer = Consumer::new(cluster);
 
     let mut offset = consumer.earliest_offset(&topic, partition).await?;
     let end = consumer.latest_offset(&topic, partition).await?;

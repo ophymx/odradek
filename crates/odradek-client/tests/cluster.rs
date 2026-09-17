@@ -513,7 +513,7 @@ fn probe_produce_body(partition: i32, version: i16) -> Bytes {
 #[tokio::test]
 async fn produce_routes_to_each_partition_leader() {
     let fake = spawn_fake_cluster(3, &[]).await;
-    let mut cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+    let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
 
     // No explicit refresh: the first leader lookup must fetch metadata
     // by itself.
@@ -529,7 +529,7 @@ async fn produce_routes_to_each_partition_leader() {
     assert_eq!(arrivals, vec![(0, 0), (1, 1), (2, 2)]);
 
     // The cached view agrees.
-    assert_eq!(cluster.brokers().count(), 3);
+    assert_eq!(cluster.brokers().len(), 3);
     assert_eq!(cluster.partitions(TOPIC).unwrap().len(), 3);
     assert_eq!(cluster.leader_id(TOPIC, 2), Some(2));
 }
@@ -537,7 +537,7 @@ async fn produce_routes_to_each_partition_leader() {
 #[tokio::test]
 async fn leaderless_partition_is_an_error_not_a_guess() {
     let fake = spawn_fake_cluster(2, &[1]).await;
-    let mut cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+    let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
 
     // Partition 0 routes; partition 1 has leader -1 and must error.
     assert!(cluster.partition_leader(TOPIC, 0).await.is_ok());
@@ -595,7 +595,7 @@ async fn consumer_fetches_from_an_offset_and_skips_noise() {
 
     let fake = spawn_fake_cluster(3, &[]).await;
     let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
-    let mut consumer = Consumer::new(cluster);
+    let consumer = Consumer::new(cluster);
 
     // Fetching from 7: the control batch and record 6 are not data the
     // caller asked for; absolute offsets and timestamps are materialized.
@@ -739,7 +739,7 @@ async fn compressed_batches_roundtrip_end_to_end() {
 
         // ...and the consumer materializes it back into the records.
         let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
-        let mut consumer = Consumer::new(cluster);
+        let consumer = Consumer::new(cluster);
         let result = consumer.fetch(TOPIC, 0, 0).await.unwrap();
         let values: Vec<String> = result
             .records
@@ -764,7 +764,7 @@ async fn offsets_commit_through_the_coordinator_and_read_back() {
 
     let fake = spawn_fake_cluster(3, &[]).await;
     let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
-    let mut consumer = Consumer::new(cluster);
+    let consumer = Consumer::new(cluster);
 
     // Nothing committed yet.
     assert_eq!(
@@ -830,7 +830,7 @@ async fn group_membership_join_heartbeat_rebalance_leave() {
     assert_eq!(member.heartbeat().await.unwrap(), HeartbeatStatus::Stable);
 
     // Leaving hands the cluster back and the coordinator forgets us.
-    let _cluster = member.leave().await.unwrap();
+    member.leave().await.unwrap();
     assert!(fake.group.lock().unwrap().members.is_empty());
 }
 
@@ -863,7 +863,54 @@ async fn bootstrap_falls_through_dead_servers() {
     let mut config = ClientConfig::default();
     config.bootstrap_servers = vec![dead_addr, fake.endpoints[0].1.clone()];
     config.client_id = "odradek".into();
-    let mut cluster = Cluster::connect(config).await.unwrap();
+    let cluster = Cluster::connect(config).await.unwrap();
     cluster.refresh_metadata(&[TOPIC]).await.unwrap();
-    assert_eq!(cluster.brokers().count(), 1);
+    assert_eq!(cluster.brokers().len(), 1);
+}
+
+#[tokio::test]
+async fn one_cluster_handle_is_shared_across_concurrent_tasks() {
+    use odradek_client::{Consumer, Producer};
+    use odradek_protocol::records::Record;
+
+    let fake = spawn_fake_cluster(3, &[]).await;
+    let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+
+    // Three producer tasks, one per partition, all over clones of the
+    // same handle — the shared metadata cache and connection pool must
+    // still route each batch to its partition's leader.
+    let mut tasks = tokio::task::JoinSet::new();
+    for partition in 0..3 {
+        let cluster = cluster.clone();
+        tasks.spawn(async move {
+            let mut producer = Producer::new(cluster);
+            producer
+                .produce(
+                    TOPIC,
+                    partition,
+                    vec![Record {
+                        value: Some(Bytes::from(format!("task {partition}"))),
+                        ..Default::default()
+                    }],
+                )
+                .await
+                .unwrap();
+        });
+    }
+    while let Some(joined) = tasks.join_next().await {
+        joined.unwrap();
+    }
+    {
+        let arrivals = fake.arrivals.lock().unwrap();
+        for partition in 0..3 {
+            assert!(
+                arrivals.contains(&(partition, partition)),
+                "partition {partition} must reach its leader, got {arrivals:?}"
+            );
+        }
+    }
+
+    // A consumer over the same handle reuses what the producers learned.
+    let consumer = Consumer::new(cluster);
+    assert_eq!(consumer.latest_offset(TOPIC, 1).await.unwrap(), 9);
 }

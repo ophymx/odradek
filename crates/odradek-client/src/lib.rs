@@ -2,22 +2,32 @@
 //!
 //! This crate owns everything the sans-I/O [`odradek_protocol`] layer
 //! deliberately does not: connections, API version negotiation, metadata
-//! discovery and routing, and — above that — producer and consumer
-//! machinery.
+//! discovery and routing, and — above that — producer, consumer, and
+//! consumer-group machinery. It is explicit and caller-driven: every
+//! network interaction happens on your task, inside your `.await`, with
+//! no hidden background work.
 //!
-//! Planned layering, bottom up:
-//! 1. `conn`: a single broker connection — framing (i32 length prefix),
+//! Layering, bottom up:
+//! 1. [`conn`]: a single broker connection — framing (i32 length prefix),
 //!    correlation-id matching, in-flight request pipelining, ApiVersions
-//!    negotiation on connect.
-//! 2. `cluster`: connection pool keyed by broker id, metadata cache,
-//!    partition-leader routing, retry/backoff policy.
-//! 3. `producer` / `consumer`: batching, compression, consumer groups.
+//!    negotiation on connect, optional TLS and SASL.
+//! 2. [`cluster`]: a [`Cluster`] handle over a connection pool keyed by
+//!    broker id, a metadata cache, partition-leader routing, and
+//!    coordinator discovery.
+//! 3. [`producer`], [`consumer`], [`group`]: batching and compression on
+//!    the produce side; fetch, offset lookup, and durable offsets on the
+//!    consume side; classic join/sync/heartbeat/leave membership.
 //!
-//! Current state: `conn` (framing, correlation-id pipelining, ApiVersions
-//! negotiation), `cluster` (metadata cache, per-broker connections,
-//! partition-leader routing), and a minimal `producer` (single-batch
-//! sends with leader-change retries) are implemented; batching,
-//! compression, and `consumer` are next.
+//! # One cluster, many components
+//!
+//! [`Cluster`] is a cheap clonable handle. Clone it once per component —
+//! `Producer::new(cluster.clone())`, `Consumer::new(cluster.clone())` —
+//! and they share one authenticated connection pool and one metadata
+//! cache instead of each dialing their own. A `Producer` is a per-task
+//! object (it holds mutable batch buffers), so the idiom for a service
+//! that produces from many tasks is one shared `Cluster` and a cheap
+//! `Producer` per task. See [`cluster`] for how blocking requests
+//! (long-poll fetch, parked join) interact with a shared connection.
 
 pub mod cluster;
 mod compression;

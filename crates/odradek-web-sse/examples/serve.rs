@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = ClientConfig::default();
     config.bootstrap_servers = vec![bootstrap.clone()];
     config.client_id = "odradek-sse".into();
-    let factory = KafkaSourceFactory { config };
+    let factory = KafkaSourceFactory::new(config);
     let app = router(SseState::new(factory, PumpConfig::default()));
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     println!("bridging {bootstrap} on http://{listen}");

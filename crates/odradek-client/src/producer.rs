@@ -98,8 +98,8 @@ impl Producer {
     }
 
     /// The underlying cluster, e.g. for metadata queries.
-    pub fn cluster(&mut self) -> &mut Cluster {
-        &mut self.cluster
+    pub fn cluster(&self) -> &Cluster {
+        &self.cluster
     }
 
     /// Buffer one record for `topic[partition]`. Delivers the partition's
@@ -211,11 +211,7 @@ impl Producer {
         partition: i32,
         set: &[u8],
     ) -> Result<i64, ClientError> {
-        let broker = self
-            .cluster
-            .partition_leader(topic, partition)
-            .await?
-            .clone();
+        let broker = self.cluster.partition_leader(topic, partition).await?;
         let leader = self.cluster.leader_id(topic, partition);
         let version = broker
             .ranges

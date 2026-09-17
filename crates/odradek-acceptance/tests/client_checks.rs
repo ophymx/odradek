@@ -49,7 +49,7 @@ async fn odradek_client_passes_the_client_checks() {
     let mut client_config = ClientConfig::default();
     client_config.bootstrap_servers = vec![addr];
     client_config.client_id = "odradek".into();
-    let mut cluster = Cluster::connect(client_config).await.unwrap();
+    let cluster = Cluster::connect(client_config).await.unwrap();
     for partition in 0..3 {
         let broker = cluster
             .partition_leader(ROUTING_TOPIC, partition)
@@ -60,7 +60,7 @@ async fn odradek_client_passes_the_client_checks() {
         broker.conn.request(0, version, &body).await.unwrap();
     }
     // The consumer rides the same cluster; the harness serves empty logs.
-    let mut consumer = Consumer::new(cluster);
+    let consumer = Consumer::new(cluster);
     let result = consumer.fetch(ROUTING_TOPIC, 2, 0).await.unwrap();
     assert!(result.records.is_empty());
     assert_eq!(result.next_offset, 0);

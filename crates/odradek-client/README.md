@@ -21,14 +21,19 @@ one exception).
   classic consumer-group membership (join/sync/heartbeat/leave with
   Kafka-compatible range assignment).
 
+`Cluster` is a cheap clonable handle: clone it per component and they
+share one authenticated connection pool and metadata cache.
+
 ```rust
-use odradek_client::{ClientConfig, Cluster, Producer};
+use odradek_client::{ClientConfig, Cluster, Consumer, Producer};
 
 let mut config = ClientConfig::default();
 config.bootstrap_servers = vec!["localhost:9092".into()];
 config.client_id = "my-service".into();
 let cluster = Cluster::connect(config).await?;
-let mut producer = Producer::new(cluster);
+
+let mut producer = Producer::new(cluster.clone());
+let consumer = Consumer::new(cluster);   // shares the producer's pool
 ```
 
 See [`examples/`](examples/) for produce/consume, consumer groups, and

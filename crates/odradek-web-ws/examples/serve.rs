@@ -19,7 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = ClientConfig::default();
     config.bootstrap_servers = vec![bootstrap.clone()];
     config.client_id = "odradek-bridge".into();
-    let factory = KafkaSourceFactory { config };
+    let factory = KafkaSourceFactory::new(config);
     // Each transport keeps its own hub (and thus its own pumps); one
     // shared hub across transports lands with topic-level subscriptions.
     let sse = odradek_web_sse::router(odradek_web_sse::SseState::new(

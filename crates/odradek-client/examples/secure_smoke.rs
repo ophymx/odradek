@@ -56,10 +56,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis()
     );
-    let cluster = Cluster::connect(config.clone()).await?;
+    let cluster = Cluster::connect(config).await?;
     create_topic(&cluster, &topic).await?;
 
-    let mut producer = Producer::new(cluster);
+    let mut producer = Producer::new(cluster.clone());
     producer
         .produce(
             &topic,
@@ -71,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    let mut consumer = Consumer::new(Cluster::connect(config).await?);
+    let consumer = Consumer::new(cluster);
     let result = consumer.fetch(&topic, 0, 0).await?;
     assert_eq!(result.records.len(), 1);
     assert_eq!(

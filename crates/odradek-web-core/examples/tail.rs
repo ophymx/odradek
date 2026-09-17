@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("produced 5 historical records to {topic}");
 
     // A web-facing subscriber replays history, then rides the live tail.
-    let mut hub = Hub::new(KafkaSourceFactory { config }, PumpConfig::default());
+    let mut hub = Hub::new(KafkaSourceFactory::new(config), PumpConfig::default());
     let mut sub = hub
         .subscribe(&topic, 0, Position::Earliest, Filter::default())
         .await?;

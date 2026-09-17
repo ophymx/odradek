@@ -35,14 +35,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis()
     );
-    let cluster = Cluster::connect(config.clone()).await?;
+    let cluster = Cluster::connect(config).await?;
     create_topic(&cluster, &topic).await?;
     println!("created topic {topic}");
 
     // Produce one compressed batch of three records.
     let mut producer_config = ProducerConfig::default();
     producer_config.compression = codec;
-    let mut producer = Producer::with_config(cluster, producer_config);
+    let mut producer = Producer::with_config(cluster.clone(), producer_config);
     for i in 0..3 {
         producer
             .enqueue(
@@ -64,7 +64,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Fetch them back and commit a position.
-    let mut consumer = Consumer::new(Cluster::connect(config).await?);
+    // The consumer shares the producer's connections and metadata.
+    let consumer = Consumer::new(cluster);
     let result = consumer.fetch(&topic, 0, 0).await?;
     for record in &result.records {
         println!(
