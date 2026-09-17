@@ -192,7 +192,7 @@ impl Consumer {
         mut attempt: impl for<'a> FnMut(
             &'a mut Consumer,
         ) -> std::pin::Pin<
-            Box<dyn Future<Output = Result<T, ClientError>> + 'a>,
+            Box<dyn Future<Output = Result<T, ClientError>> + Send + 'a>,
         >,
     ) -> Result<T, ClientError> {
         let mut last = None;
@@ -320,7 +320,7 @@ impl Consumer {
         mut attempt: impl for<'a> FnMut(
             &'a mut Consumer,
         ) -> std::pin::Pin<
-            Box<dyn Future<Output = Result<T, ClientError>> + 'a>,
+            Box<dyn Future<Output = Result<T, ClientError>> + Send + 'a>,
         >,
     ) -> Result<T, ClientError> {
         let mut last = None;

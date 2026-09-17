@@ -13,10 +13,10 @@ the protocol as the first-class artifact and builds outward from it.
 | [`odradek-protocol`](crates/odradek-protocol) | Sans-I/O wire protocol: primitive codecs (varints, compact strings, tagged fields), API key registry, and — next — versioned message types generated from the upstream schemas. |
 | [`odradek-client`](crates/odradek-client) | Async, Rust-native Kafka client built on tokio: connections, metadata routing, producer, consumer. |
 | [`odradek-acceptance`](crates/odradek-acceptance) | Acceptance suite that validates *either side* of the protocol: run it against a server (suite acts as client) or against a client (suite acts as server harness). |
+| [`odradek-web-core`](crates/odradek-web-core) | Transport-agnostic bridge from Kafka partitions to web-shaped subscribers: fan-out, replay from offsets, filtering, self-healing backpressure. |
 
-Planned once the above are solid: `odradek-web-*` proxy crates providing
-building blocks that bridge Kafka to web clients — fan-out, filtering,
-replay, and friends — over WebSocket/SSE.
+Next in the constellation: transport crates over `odradek-web-core`
+serving the bridge to actual web clients via SSE and WebSocket.
 
 ## Design principles
 
@@ -103,9 +103,18 @@ Early but functional end to end:
   enforced by test: a check no fault can trip, or a fault no check
   detects, fails calibration.
 
-Next: snappy/zstd codecs, the KIP-848 consumer protocol, and the
-`odradek-web-*` proxy crates the constellation has been building
-toward.
+- `odradek-web-core`: the bridging engine, transport-agnostic — one
+  pump per (topic, partition) fans out to any number of subscribers,
+  each starting earliest/latest/at-an-offset with per-subscriber
+  filters (key prefix, header match). Backpressure is self-healing: a
+  slow subscriber falls out of the live path into catch-up (from the
+  in-memory ring, or from Kafka past it) and rejoins as it drains —
+  offset order, no gaps, no duplicates, at any speed. Engine-tested
+  over an in-memory source; the `tail` example replays and live-tails
+  a real broker.
+
+Next: SSE/WebSocket transport crates over `odradek-web-core`,
+snappy/zstd codecs, and the KIP-848 consumer protocol.
 
 ```sh
 cargo test --workspace       # everything
