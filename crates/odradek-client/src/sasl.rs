@@ -167,7 +167,7 @@ async fn scram<D>(
     nonce: &str,
 ) -> Result<(), ClientError>
 where
-    D: Digest + BlockSizeUser + Clone,
+    D: Digest + BlockSizeUser + Clone + Sync,
 {
     let client_first_bare = format!("n={},r={nonce}", saslname(&sasl.username));
     let client_first = format!("n,,{client_first_bare}");
@@ -227,7 +227,7 @@ fn scram_client_final<D>(
     server_nonce: &str,
 ) -> Result<(String, Vec<u8>), ClientError>
 where
-    D: Digest + BlockSizeUser + Clone,
+    D: Digest + BlockSizeUser + Clone + Sync,
 {
     let salted = hi::<D>(password.as_bytes(), salt, iterations);
     let client_key = hmac::<D>(&salted, b"Client Key");
@@ -248,27 +248,20 @@ where
     ))
 }
 
-/// `Hi()` from RFC 5802: PBKDF2 with HMAC-D, one block.
+/// `Hi()` from RFC 5802 is PBKDF2 with HMAC-D at one block width.
 fn hi<D>(password: &[u8], salt: &[u8], iterations: u32) -> Vec<u8>
 where
-    D: Digest + BlockSizeUser + Clone,
+    D: Digest + BlockSizeUser + Clone + Sync,
 {
-    let mut block = salt.to_vec();
-    block.extend_from_slice(&1u32.to_be_bytes());
-    let mut u = hmac::<D>(password, &block);
-    let mut out = u.clone();
-    for _ in 1..iterations {
-        u = hmac::<D>(password, &u);
-        for (o, b) in out.iter_mut().zip(u.iter()) {
-            *o ^= b;
-        }
-    }
+    let mut out = vec![0u8; <D as Digest>::output_size()];
+    pbkdf2::pbkdf2::<SimpleHmac<D>>(password, salt, iterations, &mut out)
+        .expect("output length matches the digest");
     out
 }
 
 fn hmac<D>(key: &[u8], data: &[u8]) -> Vec<u8>
 where
-    D: Digest + BlockSizeUser + Clone,
+    D: Digest + BlockSizeUser + Clone + Sync,
 {
     let mut mac = <SimpleHmac<D> as Mac>::new_from_slice(key).expect("hmac accepts any key length");
     mac.update(data);

@@ -15,6 +15,7 @@ flate2 = { workspace = true }
 getrandom = { workspace = true }
 hmac = { workspace = true }
 lz4_flex = { workspace = true }
+pbkdf2 = { workspace = true }
 rustls-pemfile = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
