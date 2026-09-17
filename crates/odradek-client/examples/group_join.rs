@@ -20,7 +20,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = ClientConfig::default();
     config.bootstrap_servers = vec![bootstrap];
     config.client_id = "odradek-group-example".into();
-    let config_b = config.clone();
     let topic = format!(
         "odradek-group-{}-{}",
         std::process::id(),
@@ -37,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("created {topic} with {PARTITIONS} partitions");
 
     // Member A joins alone and owns everything.
-    let mut a = GroupMember::join(cluster, &group, &[&topic], group_config()).await?;
+    let mut a = GroupMember::join(cluster.clone(), &group, &[&topic], group_config()).await?;
     println!(
         "A joined as {} (leader: {}), assignment {:?}",
         a.member_id(),
@@ -71,14 +70,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Member B joins on its own Cluster. Two members of one group must
-    // not share a Cluster: they would share one connection to the
-    // coordinator, and Kafka processes a connection's requests strictly
-    // in order — B's JoinGroup parks for the whole rebalance and would
-    // block A's heartbeats until A is evicted. One member per Cluster
-    // (the natural one-per-process topology) sidesteps it.
-    let cluster_b = Cluster::connect(config_b).await?;
-    let b = GroupMember::join(cluster_b, &group, &[&topic], group_config()).await?;
+    // Member B shares A's cluster handle. Safe because the join/sync
+    // dance runs on a leased connection from the per-broker blocking
+    // pool: B's parked JoinGroup cannot starve A's heartbeats, which
+    // ride the shared fast lane.
+    let b = GroupMember::join(cluster, &group, &[&topic], group_config()).await?;
     println!(
         "B joined as {} (leader: {}), assignment {:?}",
         b.member_id(),

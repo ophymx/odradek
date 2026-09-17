@@ -26,8 +26,15 @@ type Arrivals = Arc<Mutex<Vec<(i32, i32)>>>; // (broker node_id, partition)
 /// broker node_id).
 type Offsets = Arc<Mutex<std::collections::HashMap<(String, String, i32), (i64, i32)>>>;
 
+/// Accepted connections per broker node id.
+type Accepts = Arc<Mutex<std::collections::HashMap<i32, u32>>>;
+
 /// The fake group coordinator's node id.
 const COORDINATOR: i32 = 1;
+
+/// Fetching at this offset makes the fake park the connection a while,
+/// like a long-poll waiting out max_wait_ms.
+const SLOW_FETCH_OFFSET: i64 = 777_777;
 
 /// Stored record sets per (topic, partition), verbatim as produced.
 type Logs = Arc<Mutex<std::collections::HashMap<(String, i32), BytesMut>>>;
@@ -69,6 +76,7 @@ struct FakeCluster {
     )]
     logs: Logs,
     group: Group,
+    accepts: Accepts,
 }
 
 /// Spawn `n` fake brokers. Every broker answers ApiVersions and full
@@ -88,6 +96,7 @@ async fn spawn_fake_cluster(n: i32, no_leader: &'static [i32]) -> FakeCluster {
     let logs: Logs = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let group: Group = Arc::new(Mutex::new(GroupState::default()));
     let created: Created = Arc::new(Mutex::new(std::collections::HashSet::new()));
+    let accepts: Accepts = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
     let mut brokers = Vec::new();
     for (node_id, listener) in listeners {
@@ -97,6 +106,7 @@ async fn spawn_fake_cluster(n: i32, no_leader: &'static [i32]) -> FakeCluster {
         let logs = Arc::clone(&logs);
         let group = Arc::clone(&group);
         let created = Arc::clone(&created);
+        let accepts = Arc::clone(&accepts);
         let handle = tokio::spawn(async move {
             // The accept loop owns its connections' tasks: aborting the
             // loop drops the JoinSet, which aborts them all — the whole
@@ -106,6 +116,7 @@ async fn spawn_fake_cluster(n: i32, no_leader: &'static [i32]) -> FakeCluster {
                 tokio::select! {
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { return };
+                        *accepts.lock().unwrap().entry(node_id).or_insert(0) += 1;
                         conns.spawn(serve_conn(
                             stream,
                             node_id,
@@ -132,6 +143,7 @@ async fn spawn_fake_cluster(n: i32, no_leader: &'static [i32]) -> FakeCluster {
         created,
         logs,
         group,
+        accepts,
     }
 }
 
@@ -284,6 +296,10 @@ async fn serve_conn(
                 let topic = &fetch.topics[0];
                 assert_eq!(topic.topic, TOPIC);
                 let partition = topic.partitions[0].partition;
+                if topic.partitions[0].fetch_offset == SLOW_FETCH_OFFSET {
+                    // Model a long-poll parked on this connection.
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                }
                 // Serve whatever was produced; the canned log otherwise.
                 let stored = logs
                     .lock()
@@ -1110,4 +1126,63 @@ async fn stale_generation_commit_is_fenced() {
     // The fenced commit changed nothing.
     let (offset, _) = fake.offsets.lock().unwrap()[&("g1".into(), TOPIC.into(), 0)];
     assert_eq!(offset, 11);
+}
+
+#[tokio::test]
+async fn parked_fetch_does_not_block_produce_to_the_same_broker() {
+    use odradek_client::{Consumer, Producer};
+    use odradek_protocol::records::Record;
+
+    let fake = spawn_fake_cluster(1, &[]).await;
+    let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+
+    // Park a long fetch on its leased connection...
+    let consumer = Consumer::new(cluster.clone());
+    let parked = tokio::spawn(async move {
+        // The fake sleeps ~1.5s before answering this offset.
+        let _ = consumer.fetch(TOPIC, 0, SLOW_FETCH_OFFSET).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // ...and a produce to the same broker must not wait behind it.
+    let mut producer = Producer::new(cluster);
+    let started = std::time::Instant::now();
+    producer
+        .produce(
+            TOPIC,
+            0,
+            vec![Record {
+                value: Some(Bytes::from_static(b"unblocked")),
+                ..Default::default()
+            }],
+        )
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "produce should not queue behind the parked fetch (took {elapsed:?})"
+    );
+    assert!(!parked.is_finished(), "the fetch must still be parked");
+    parked.await.unwrap();
+}
+
+#[tokio::test]
+async fn released_fetch_leases_are_reused_not_redialed() {
+    use odradek_client::Consumer;
+
+    let fake = spawn_fake_cluster(1, &[]).await;
+    let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+    let consumer = Consumer::new(cluster);
+
+    consumer.fetch(TOPIC, 0, 0).await.unwrap();
+    let after_first = *fake.accepts.lock().unwrap().get(&0).unwrap();
+    for _ in 0..3 {
+        consumer.fetch(TOPIC, 0, 0).await.unwrap();
+    }
+    let after_more = *fake.accepts.lock().unwrap().get(&0).unwrap();
+    assert_eq!(
+        after_first, after_more,
+        "sequential fetches must reuse the released lease"
+    );
 }

@@ -229,8 +229,14 @@ impl Consumer {
         partition: i32,
         offset: i64,
     ) -> Result<FetchResult, ClientError> {
-        let broker = self.cluster.partition_leader(topic, partition).await?;
+        // Long-poll fetches hold their connection for up to max_wait_ms;
+        // a leased connection keeps them off the shared fast lane.
+        let lease = self
+            .cluster
+            .blocking_partition_leader(topic, partition)
+            .await?;
         let leader = self.cluster.leader_id(topic, partition);
+        let broker = lease.broker();
         let version = broker.ranges.pick(FetchRequest::API_KEY, FETCH_SUPPORTED)?;
 
         let mut fetch_partition = FetchPartition::default();
@@ -260,6 +266,8 @@ impl Consumer {
         {
             Ok(resp) => resp,
             Err(e) => {
+                // The lease drops here, discarding the possibly-poisoned
+                // connection; also drop the fast-lane pool entry.
                 if matches!(
                     e,
                     ClientError::ConnectionClosed | ClientError::Io(_) | ClientError::Timeout(_)
@@ -271,6 +279,8 @@ impl Consumer {
                 return Err(e);
             }
         };
+        // The exchange completed; the connection is clean for reuse.
+        lease.release();
         let resp = FetchResponse::decode(&mut resp, version)?;
         let code = ErrorCode(resp.error_code);
         if !code.is_ok() {

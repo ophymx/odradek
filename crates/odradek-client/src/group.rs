@@ -172,7 +172,11 @@ impl GroupMember {
 
     async fn join_round(&mut self) -> Result<(), ClientError> {
         let subscription = encode_subscription(&self.topics);
-        let broker = self.cluster.coordinator(&self.group_id).await?;
+        // JoinGroup parks for the whole rebalance; a leased connection
+        // keeps it from starving the shared fast lane (where our own —
+        // and any co-resident member's — heartbeats run).
+        let lease = self.cluster.blocking_coordinator(&self.group_id).await?;
+        let broker = lease.broker().clone();
         let join_version = broker
             .ranges
             .pick(JoinGroupRequest::API_KEY, JOIN_SUPPORTED)?;
@@ -260,6 +264,8 @@ impl GroupMember {
             return Err(ClientError::Broker(code));
         }
         self.assignment = decode_assignment(&resp.assignment)?;
+        // The dance completed; the connection is clean for reuse.
+        lease.release();
         Ok(())
     }
 

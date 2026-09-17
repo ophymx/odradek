@@ -15,24 +15,24 @@
 //!
 //! # Connection sharing and blocking requests
 //!
-//! The pool keeps one connection per broker, and a Kafka broker processes
-//! a single connection's requests strictly in order: it will not begin
-//! the next request until the current one's response is sent. Fast
-//! requests (Produce, Metadata) pipeline freely, but a *blocking* request
-//! holds the connection for its whole duration, so concurrent work to the
-//! same broker over one shared handle serializes behind it:
+//! A Kafka broker processes a single connection's requests strictly in
+//! order: it will not begin the next request until the current one's
+//! response is sent. Fast requests (Produce, Metadata, Heartbeat)
+//! pipeline freely on the one shared connection per broker, but a
+//! *blocking* request — a long-poll Fetch waiting out `max_wait_ms`, a
+//! JoinGroup parked for a whole rebalance — would hold that connection
+//! and starve everything queued behind it.
 //!
-//! - A long-poll `Fetch` (up to `max_wait_ms`) delays a concurrent
-//!   `Produce` to the same broker until it returns. Lower `max_wait_ms`,
-//!   or give the latency-sensitive path its own [`Cluster`], if that
-//!   coupling matters.
-//! - Two members of the *same* group must not share a `Cluster`: a
-//!   parked `JoinGroup` blocks the other member's heartbeats for the
-//!   whole rebalance, evicting it. Use one `Cluster` per member (the
-//!   natural one-member-per-process topology).
-//!
-//! A growable per-broker connection pool would lift these; it is future
-//! work.
+//! Blocking requests therefore run on *leased* connections instead:
+//! [`Cluster::blocking_partition_leader`] and
+//! [`Cluster::blocking_coordinator`] check a dedicated connection out
+//! of a per-broker pool (dialing when the pool is dry), and
+//! [`BrokerLease::release`] returns it for reuse on success. The
+//! consumer's fetch path and the group join/sync dance use leases, so a
+//! parked fetch never delays a produce to the same broker, concurrent
+//! bridge pumps do not serialize their long-polls, and two members of
+//! one group can share a `Cluster` — heartbeats ride the never-parked
+//! fast lane.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -86,6 +86,36 @@ pub struct Broker {
     pub ranges: ApiVersionRanges,
 }
 
+/// A dedicated connection checked out of the blocking pool for one
+/// blocking request (or one uninterrupted sequence, like join → sync).
+///
+/// Call [`BrokerLease::release`] after a *successful* exchange to hand
+/// the connection back for reuse. Dropping the lease instead discards
+/// the connection — the right outcome after an error, when it may be
+/// poisoned or mid-frame.
+#[derive(Debug)]
+pub struct BrokerLease {
+    broker: Broker,
+    node_id: i32,
+    cluster: Cluster,
+}
+
+impl BrokerLease {
+    /// The leased connection and its negotiated version ranges.
+    pub fn broker(&self) -> &Broker {
+        &self.broker
+    }
+
+    /// Return the connection to the pool for reuse.
+    pub fn release(self) {
+        let mut state = self.cluster.state();
+        let idle = state.blocking.entry(self.node_id).or_default();
+        if idle.len() < BLOCKING_IDLE_CAP {
+            idle.push(self.broker.clone());
+        }
+    }
+}
+
 /// The mutable half of a cluster: caches every handle shares.
 #[derive(Debug, Default)]
 struct State {
@@ -96,9 +126,15 @@ struct State {
     brokers: HashMap<i32, BrokerInfo>,
     topics: HashMap<String, Vec<PartitionInfo>>,
     conns: HashMap<i32, Broker>,
+    /// Idle leased connections for blocking requests, per broker.
+    blocking: HashMap<i32, Vec<Broker>>,
     /// Group id → coordinator node id, as last discovered.
     coordinators: HashMap<String, i32>,
 }
+
+/// How many idle blocking connections to keep per broker; releases past
+/// this cap drop the connection instead.
+const BLOCKING_IDLE_CAP: usize = 8;
 
 #[derive(Debug)]
 struct Inner {
@@ -328,10 +364,68 @@ impl Cluster {
         self.state().topics.remove(topic);
     }
 
-    /// Drop the pooled connection to `node_id` (e.g. after it failed);
-    /// the next use redials.
+    /// Drop the pooled connections to `node_id` (e.g. after it failed);
+    /// the next use redials. Leases already checked out are unaffected.
     pub fn forget_broker(&self, node_id: i32) {
-        self.state().conns.remove(&node_id);
+        let mut state = self.state();
+        state.conns.remove(&node_id);
+        state.blocking.remove(&node_id);
+    }
+
+    /// Check a dedicated connection to `node_id` out of the blocking
+    /// pool, dialing if none is idle. Use for requests that hold their
+    /// connection (long-poll fetches, parked joins); fast requests
+    /// belong on the shared [`Cluster::broker`] connection.
+    pub async fn blocking_broker(&self, node_id: i32) -> Result<BrokerLease, ClientError> {
+        let idle = {
+            let mut state = self.state();
+            let idle = state.blocking.get_mut(&node_id).and_then(Vec::pop);
+            if idle.is_none() && !state.brokers.contains_key(&node_id) {
+                return Err(ClientError::UnknownLeader {
+                    topic: format!("<broker {node_id}>"),
+                    partition: -1,
+                });
+            }
+            idle
+        };
+        let broker = match idle {
+            Some(broker) => broker,
+            None => {
+                let info = self.state().brokers.get(&node_id).cloned().ok_or(
+                    ClientError::UnknownLeader {
+                        topic: format!("<broker {node_id}>"),
+                        partition: -1,
+                    },
+                )?;
+                dial(&info.addr(), &self.inner.config).await?
+            }
+        };
+        Ok(BrokerLease {
+            broker,
+            node_id,
+            cluster: Cluster {
+                inner: Arc::clone(&self.inner),
+            },
+        })
+    }
+
+    /// Like [`Cluster::partition_leader`], but checking a dedicated
+    /// connection out of the blocking pool.
+    pub async fn blocking_partition_leader(
+        &self,
+        topic: &str,
+        partition: i32,
+    ) -> Result<BrokerLease, ClientError> {
+        if self.leader_id(topic, partition).is_none() {
+            self.refresh_metadata(&[topic]).await?;
+        }
+        let leader =
+            self.leader_id(topic, partition)
+                .ok_or_else(|| ClientError::UnknownLeader {
+                    topic: topic.to_owned(),
+                    partition,
+                })?;
+        self.blocking_broker(leader).await
     }
 
     /// A negotiated connection to the current leader of
@@ -421,7 +515,26 @@ impl Cluster {
         let mut state = self.state();
         if let Some(node_id) = state.coordinators.remove(group) {
             state.conns.remove(&node_id);
+            state.blocking.remove(&node_id);
         }
+    }
+
+    /// Like [`Cluster::coordinator`], but checking a dedicated
+    /// connection out of the blocking pool — for the join/sync dance,
+    /// which can park for a whole rebalance.
+    pub async fn blocking_coordinator(&self, group: &str) -> Result<BrokerLease, ClientError> {
+        // Discovery (a fast exchange) rides the shared path; only the
+        // blocking work itself needs a lease.
+        self.coordinator(group).await?;
+        let node_id =
+            self.state()
+                .coordinators
+                .get(group)
+                .copied()
+                .ok_or(ClientError::ProtocolViolation(
+                    "coordinator vanished after discovery".into(),
+                ))?;
+        self.blocking_broker(node_id).await
     }
 }
 
