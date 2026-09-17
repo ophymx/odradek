@@ -49,6 +49,9 @@ pub use error::ClientError;
 pub use group::{GroupConfig, GroupMember, HeartbeatStatus};
 pub use negotiate::ApiVersionRanges;
 pub use odradek_protocol as protocol;
+/// The record vocabulary users hand to [`Producer`] and get back from
+/// [`Consumer`], re-exported from the protocol crate.
+pub use odradek_protocol::records::{Compression, Record, RecordHeader};
 pub use producer::{Delivery, Producer, ProducerConfig};
 #[cfg(feature = "sasl")]
 pub use sasl::{Mechanism, SaslConfig};

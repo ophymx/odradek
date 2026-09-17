@@ -7,8 +7,7 @@
 //! # or connect a WebSocket to ws://127.0.0.1:8080/topics/demo/partitions/0/ws
 //! ```
 
-use odradek_client::ClientConfig;
-use odradek_web_core::{KafkaSourceFactory, PumpConfig};
+use odradek_web_ws::{ClientConfig, KafkaSourceFactory, PumpConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

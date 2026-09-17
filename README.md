@@ -10,7 +10,7 @@ the protocol as the first-class artifact and builds outward from it.
 
 | Crate | Purpose |
 |---|---|
-| [`odradek-protocol`](crates/odradek-protocol) | Sans-I/O wire protocol: primitive codecs (varints, compact strings, tagged fields), API key registry, and — next — versioned message types generated from the upstream schemas. |
+| [`odradek-protocol`](crates/odradek-protocol) | Sans-I/O wire protocol: primitive codecs (varints, compact strings, tagged fields), the API key registry, versioned message types generated from the upstream schemas, and the record-batch codec with the byte-identical proxy guarantee. |
 | [`odradek-client`](crates/odradek-client) | Async, Rust-native Kafka client built on tokio: connections, metadata routing, producer, consumer. TLS, SASL, and each compression codec are default-on cargo features you can opt out of. |
 | [`odradek-acceptance`](crates/odradek-acceptance) | Acceptance suite that validates *either side* of the protocol: run it against a server (suite acts as client) or against a client (suite acts as server harness). |
 | [`odradek-web-core`](crates/odradek-web-core) | Transport-agnostic bridge from Kafka partitions to web-shaped subscribers: fan-out, replay from offsets, filtering, self-healing backpressure. |
@@ -121,8 +121,9 @@ Early but functional end to end:
   broker.
 - `odradek-web-sse`: the first transport — an embeddable axum `Router`
   (mount it in your own service, layer your own auth) streaming
-  `GET /topics/{topic}/partitions/{p}/events` as SSE with offsets as
-  event ids, `Last-Event-ID` reconnect resume, `from=` positions, and
+  `GET /topics/{topic}/partitions/{p}/events` as SSE with resume
+  tokens (next offset) as event ids, `Last-Event-ID` reconnect
+  resume, `from=` positions, and
   key/header filters; UTF-8 payloads as strings, binary as base64.
   Tested over a real listener with a raw HTTP client; the `serve`
   example bridges a real broker to `curl -N`.

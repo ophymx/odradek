@@ -23,6 +23,9 @@ pub mod raw;
 pub mod report;
 pub mod subject;
 
+/// The wire codec the suite speaks, re-exported for embedders writing
+/// their own checks against [`raw`] connections or the [`subject`].
+pub use odradek_protocol as protocol;
 pub use report::{CheckOutcome, Report};
 
 /// Which side of the wire the subject implements.

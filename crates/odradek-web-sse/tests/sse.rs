@@ -168,7 +168,8 @@ async fn replays_then_streams_live() {
     .await;
     for i in 0..3 {
         let (id, json) = client.next_event().await;
-        assert_eq!(id, i);
+        // The id is the resume token: the offset after this event.
+        assert_eq!(id, i + 1);
         assert_eq!(value_of(&json), format!("old-{i}"));
         assert_eq!(json["topic"], TOPIC);
         assert_eq!(json["offset"], i);
@@ -176,7 +177,7 @@ async fn replays_then_streams_live() {
 
     log.append(TOPIC, 0, None, b"fresh", Vec::new());
     let (id, json) = client.next_event().await;
-    assert_eq!(id, 3);
+    assert_eq!(id, 4);
     assert_eq!(value_of(&json), "fresh");
 }
 
@@ -188,16 +189,18 @@ async fn last_event_id_resumes_exactly_after() {
     }
     let addr = serve(log.clone()).await;
 
-    // A reconnecting EventSource sends the last id it saw; the stream
-    // must resume at the next offset even though `from` says earliest.
+    // A reconnecting EventSource sends the last id it saw; ids are
+    // resume tokens (next offset) used verbatim, so id 3 — received
+    // with the event at offset 2 — resumes at offset 3 even though
+    // `from` says earliest.
     let mut client = SseClient::get(
         addr,
         &format!("/topics/{TOPIC}/partitions/0/events?from=earliest"),
-        &[("Last-Event-ID", "2")],
+        &[("Last-Event-ID", "3")],
     )
     .await;
     let (id, json) = client.next_event().await;
-    assert_eq!(id, 3);
+    assert_eq!(id, 4);
     assert_eq!(value_of(&json), "v3");
 }
 
@@ -215,7 +218,7 @@ async fn default_position_is_latest() {
 
     log.append(TOPIC, 0, None, b"new", Vec::new());
     let (id, json) = client.next_event().await;
-    assert_eq!(id, 1);
+    assert_eq!(id, 2); // resume token for the event at offset 1
     assert_eq!(value_of(&json), "new");
 }
 
@@ -234,10 +237,11 @@ async fn key_prefix_filter_applies() {
     )
     .await;
     let (id, json) = client.next_event().await;
-    assert_eq!((id, value_of(&json)), (0, "keep".into()));
+    assert_eq!((id, value_of(&json)), (1, "keep".into()));
     assert_eq!(json["key"], "user:1");
     let (id, json) = client.next_event().await;
-    assert_eq!((id, value_of(&json)), (2, "keep-too".into()));
+    // Filtered-out records still advance the resume token.
+    assert_eq!((id, value_of(&json)), (3, "keep-too".into()));
 }
 
 #[tokio::test]

@@ -33,7 +33,16 @@ pub mod source;
 
 pub use event::{Event, Filter, Position, TopicPosition};
 pub use hub::{Hub, TopicSubscription};
+pub use json::event_json;
+pub use memory::{MemoryFactory, MemoryLog};
 pub use pump::{HubError, PumpConfig, PumpHandle, Subscription};
 #[cfg(feature = "kafka")]
 pub use source::{KafkaSource, KafkaSourceFactory};
 pub use source::{RecordSource, SourceBatch, SourceError, SourceFactory};
+
+/// The Kafka client behind [`KafkaSource`], re-exported so integrators
+/// configure it without naming another crate.
+#[cfg(feature = "kafka")]
+pub use odradek_client as client;
+#[cfg(feature = "kafka")]
+pub use odradek_client::ClientConfig;

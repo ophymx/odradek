@@ -489,7 +489,6 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -510,7 +509,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rustls",
- "tracing",
  "webpki-roots",
  "zstd",
 ]
@@ -548,7 +546,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-stream",
- "tracing",
 ]
 
 [[package]]
@@ -563,7 +560,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tracing",
 ]
 
 [[package]]

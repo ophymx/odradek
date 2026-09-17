@@ -14,9 +14,11 @@
 //! Each record arrives as one JSON text frame (the same shape as the
 //! SSE transport's `data`), carrying its partition and offset.
 //! WebSocket has no `Last-Event-ID`, so resume is explicit: reconnect
-//! with `from=<last offset + 1>` (partition streams) or
-//! `from=<partition:next_offset,...>` (topic streams). Parameter
-//! errors are rejected as plain HTTP responses before the upgrade.
+//! with the resume token — `from=<next offset>` (partition streams) or
+//! `from=<partition:next_offset,...>` (topic streams). Tokens mean
+//! "start here" and are interchangeable with the SSE transport's event
+//! ids. Parameter errors are rejected as plain HTTP responses before
+//! the upgrade.
 
 use std::sync::Arc;
 
@@ -30,9 +32,14 @@ use bytes::Bytes;
 use serde::Deserialize;
 
 use odradek_web_core::json::event_json;
-use odradek_web_core::{
-    Event, Filter, Hub, Position, PumpConfig, SourceFactory, TopicPosition, cursor,
-};
+use odradek_web_core::{Event, Filter, Hub, Position, TopicPosition, cursor};
+
+/// Everything needed to stand the router up, re-exported so embedders
+/// depend on this crate alone; the full engine is under [`web_core`].
+pub use odradek_web_core as web_core;
+#[cfg(feature = "kafka")]
+pub use odradek_web_core::{ClientConfig, KafkaSourceFactory};
+pub use odradek_web_core::{PumpConfig, SourceFactory};
 
 /// Shared state behind the routes: the hub, guarded for subscribe-time
 /// mutation only (each socket runs lock-free once subscribed).

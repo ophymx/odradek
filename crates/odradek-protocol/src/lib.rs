@@ -12,10 +12,16 @@
 //!   zigzag varints, (compact/nullable) strings and bytes, array length
 //!   prefixes, and tagged fields (flexible versions / KIP-482).
 //! - [`api_key`]: the API key registry identifying each request type.
+//! - [`messages`]: versioned request/response structs generated from the
+//!   vendored upstream schemas (`cargo xtask codegen`); unknown tagged
+//!   fields round-trip raw.
+//! - [`header`]: request/response header codecs and header-version
+//!   selection, including the ApiVersions response-header quirk.
+//! - [`records`]: the record batch (v2) codec with CRC-32C validation;
+//!   compressed and unknown-codec payloads stay raw and re-encode
+//!   byte-identically (the proxy guarantee).
+//! - [`error_code`]: the open-world Kafka error code registry.
 //! - [`error`]: encode/decode error types.
-//!
-//! Versioned message types (request/response structs generated from the
-//! upstream message schemas) are the next layer to land here.
 
 pub mod api_key;
 pub mod error;

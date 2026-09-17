@@ -20,6 +20,10 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: docs build warning-free
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
       - name: lean client builds (no tls/sasl/codecs)
         run: cargo check -p odradek-client --no-default-features
       - name: lean web transports build (no kafka)

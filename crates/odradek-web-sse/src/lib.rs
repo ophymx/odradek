@@ -12,11 +12,14 @@
 //!     &header=<name>:<value>             only records with this header
 //! ```
 //!
-//! Each record becomes one SSE event: `event: record`, `id` = its
-//! offset, `data` = one JSON object. Browsers reconnect with
-//! `Last-Event-ID`, which overrides `from` and resumes exactly after
-//! the last delivered offset — replay is the engine's job, so a
-//! reconnecting `EventSource` never misses or repeats a record.
+//! Each record becomes one SSE event: `event: record`, `data` = one
+//! JSON object (which carries the record's own offset), and `id` = the
+//! *resume token*: the next offset after this event. Browsers reconnect
+//! with `Last-Event-ID`, which overrides `from` and is used verbatim as
+//! the start position — so a reconnecting `EventSource` never misses or
+//! repeats a record. Every resume token in the constellation means
+//! "start here": SSE ids, WebSocket `from=`, and the topic-level
+//! cursors are interchangeable across transports.
 //!
 //! Keys, values, and header values arrive as UTF-8 strings when they
 //! are valid UTF-8 (`key`, `value`), else base64 (`key_base64`,
@@ -36,7 +39,14 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
 use odradek_web_core::json::event_json;
-use odradek_web_core::{Filter, Hub, Position, PumpConfig, SourceFactory, TopicPosition, cursor};
+use odradek_web_core::{Filter, Hub, Position, TopicPosition, cursor};
+
+/// Everything needed to stand the router up, re-exported so embedders
+/// depend on this crate alone; the full engine is under [`web_core`].
+pub use odradek_web_core as web_core;
+#[cfg(feature = "kafka")]
+pub use odradek_web_core::{ClientConfig, KafkaSourceFactory};
+pub use odradek_web_core::{PumpConfig, SourceFactory};
 
 /// Shared state behind the routes: the hub, guarded for subscribe-time
 /// mutation only (streams run lock-free once created).
@@ -75,12 +85,13 @@ impl StreamParams {
     /// `Last-Event-ID` (a reconnect) wins over `from`.
     fn position(&self, headers: &HeaderMap) -> Result<Position, String> {
         if let Some(last) = headers.get("last-event-id") {
+            // Ids are resume tokens (next offset), used verbatim.
             let last: i64 = last
                 .to_str()
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| "Last-Event-ID must be an offset".to_owned())?;
-            return Ok(Position::Offset(last + 1));
+            return Ok(Position::Offset(last));
         }
         match self.from.as_deref() {
             None | Some("latest") => Ok(Position::Latest),
@@ -135,7 +146,7 @@ async fn stream_partition<F: SourceFactory>(
     let stream = ReceiverStream::new(subscription.into_receiver()).map(|event| {
         Ok(SseEvent::default()
             .event("record")
-            .id(event.offset.to_string())
+            .id((event.offset + 1).to_string())
             .data(event_json(&event).to_string()))
     });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))

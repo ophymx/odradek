@@ -1,10 +1,8 @@
 //! The Kafka API key registry.
 //!
 //! Every request on the wire opens with an `i16` API key identifying the
-//! message type. This module covers the client-facing surface; it will be
-//! generated from the upstream message schemas once codegen lands, at which
-//! point [`ApiKey::Unknown`] should only appear for keys newer than the
-//! schema snapshot.
+//! message type. This registry names the client-facing surface; keys newer
+//! than this snapshot decode to [`DecodeError::UnknownDiscriminant`].
 
 use crate::error::DecodeError;
 

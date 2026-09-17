@@ -4,9 +4,10 @@ Server-Sent Events transport over
 [`odradek-web-core`](https://crates.io/crates/odradek-web-core): an
 embeddable axum `Router` that streams Kafka topics to browsers.
 
-- `GET /topics/{topic}/partitions/{p}/events` — one partition, offsets
-  as SSE event ids, so a reconnecting `EventSource` resumes via
-  `Last-Event-ID` without missing or repeating a record.
+- `GET /topics/{topic}/partitions/{p}/events` — one partition; each
+  event's id is its resume token (the next offset), so a reconnecting
+  `EventSource` resumes via `Last-Event-ID` without missing or
+  repeating a record.
 - `GET /topics/{topic}/events` — every partition merged into one
   stream (order holds within partitions), with a multi-partition
   cursor (`partition:next_offset,...`) as the resume token.

@@ -5,9 +5,7 @@
 //! curl -N 'http://127.0.0.1:8080/topics/demo/partitions/0/events?from=earliest'
 //! ```
 
-use odradek_client::ClientConfig;
-use odradek_web_core::{KafkaSourceFactory, PumpConfig};
-use odradek_web_sse::{SseState, router};
+use odradek_web_sse::{ClientConfig, KafkaSourceFactory, PumpConfig, SseState, router};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
