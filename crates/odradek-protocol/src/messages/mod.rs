@@ -9,10 +9,16 @@ pub mod create_topics_request;
 pub mod create_topics_response;
 pub mod fetch_request;
 pub mod fetch_response;
+pub mod find_coordinator_request;
+pub mod find_coordinator_response;
 pub mod list_offsets_request;
 pub mod list_offsets_response;
 pub mod metadata_request;
 pub mod metadata_response;
+pub mod offset_commit_request;
+pub mod offset_commit_response;
+pub mod offset_fetch_request;
+pub mod offset_fetch_response;
 pub mod produce_request;
 pub mod produce_response;
 pub mod request_header;
@@ -24,10 +30,16 @@ pub use create_topics_request::CreateTopicsRequest;
 pub use create_topics_response::CreateTopicsResponse;
 pub use fetch_request::FetchRequest;
 pub use fetch_response::FetchResponse;
+pub use find_coordinator_request::FindCoordinatorRequest;
+pub use find_coordinator_response::FindCoordinatorResponse;
 pub use list_offsets_request::ListOffsetsRequest;
 pub use list_offsets_response::ListOffsetsResponse;
 pub use metadata_request::MetadataRequest;
 pub use metadata_response::MetadataResponse;
+pub use offset_commit_request::OffsetCommitRequest;
+pub use offset_commit_response::OffsetCommitResponse;
+pub use offset_fetch_request::OffsetFetchRequest;
+pub use offset_fetch_response::OffsetFetchResponse;
 pub use produce_request::ProduceRequest;
 pub use produce_response::ProduceResponse;
 pub use request_header::RequestHeader;
@@ -41,8 +53,11 @@ pub fn request_is_flexible(api_key: i16, api_version: i16) -> Option<bool> {
         18 => Some(api_versions_request::is_flexible(api_version)),
         19 => Some(create_topics_request::is_flexible(api_version)),
         1 => Some(fetch_request::is_flexible(api_version)),
+        10 => Some(find_coordinator_request::is_flexible(api_version)),
         2 => Some(list_offsets_request::is_flexible(api_version)),
         3 => Some(metadata_request::is_flexible(api_version)),
+        8 => Some(offset_commit_request::is_flexible(api_version)),
+        9 => Some(offset_fetch_request::is_flexible(api_version)),
         0 => Some(produce_request::is_flexible(api_version)),
         _ => None,
     }

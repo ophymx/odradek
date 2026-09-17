@@ -39,7 +39,8 @@ Early but functional end to end:
 - `odradek-protocol`: wire primitives; message types generated from the
   Kafka 4.1.0 schemas vendored in `crates/odradek-protocol/schemas/`
   (headers, ApiVersions, Metadata, Produce, Fetch, CreateTopics,
-  ListOffsets) via `cargo xtask codegen`;
+  ListOffsets, FindCoordinator, OffsetCommit/Fetch) via
+  `cargo xtask codegen`;
   header-version selection including the ApiVersions response-header quirk;
   record batch (v2) encoding with CRC-32C validation — compressed and
   unknown-codec payloads stay raw and re-encode byte-identically (the
@@ -56,8 +57,10 @@ Early but functional end to end:
   and retries through leadership changes by invalidating stale metadata;
   the consumer fetches and materializes records with absolute offsets,
   skipping control batches and pre-offset records, with earliest/latest
-  lookup via ListOffsets — tested against in-process fake single- and
-  multi-broker clusters.
+  lookup via ListOffsets and durable positions as a simple (non-member)
+  consumer — coordinator discovery plus offset commit/fetch under a
+  group id — tested against in-process fake single- and multi-broker
+  clusters.
 - `odradek-acceptance`: conformance checks for **both roles** over raw
   connections independent of the client crate — `api-versions/*`,
   `metadata/*`, `produce/*`, and `fetch/*` server checks (including a
@@ -94,8 +97,8 @@ Early but functional end to end:
   enforced by test: a check no fault can trip, or a fault no check
   detects, fails calibration.
 
-Next: producer batching/compression, consumer groups and offset
-commits, and vendor the group-protocol schemas.
+Next: producer batching/compression, and full consumer-group
+membership (join/sync/heartbeat) on top of the coordinator layer.
 
 ```sh
 cargo test --workspace       # everything

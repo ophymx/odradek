@@ -11,6 +11,8 @@ use std::collections::HashMap;
 
 use bytes::BytesMut;
 use odradek_protocol::ErrorCode;
+use odradek_protocol::messages::find_coordinator_request::FindCoordinatorRequest;
+use odradek_protocol::messages::find_coordinator_response::FindCoordinatorResponse;
 use odradek_protocol::messages::metadata_request::{MetadataRequest, MetadataRequestTopic};
 use odradek_protocol::messages::metadata_response::MetadataResponse;
 
@@ -61,6 +63,8 @@ pub struct Cluster {
     brokers: HashMap<i32, BrokerInfo>,
     topics: HashMap<String, Vec<PartitionInfo>>,
     conns: HashMap<i32, Broker>,
+    /// Group id → coordinator node id, as last discovered.
+    coordinators: HashMap<String, i32>,
 }
 
 impl Cluster {
@@ -77,6 +81,7 @@ impl Cluster {
                         brokers: HashMap::new(),
                         topics: HashMap::new(),
                         conns: HashMap::new(),
+                        coordinators: HashMap::new(),
                     });
                 }
                 Err(e) => last = format!("{addr}: {e}"),
@@ -217,6 +222,61 @@ impl Cluster {
                     partition,
                 })?;
         self.broker(leader).await
+    }
+}
+
+/// FindCoordinator versions this client speaks: the single-key shape
+/// (v4+ switches to batched keys).
+const FIND_COORDINATOR_SUPPORTED: (i16, i16) = (0, 3);
+
+impl Cluster {
+    /// A negotiated connection to `group`'s coordinator, discovering it
+    /// via FindCoordinator on first use.
+    pub async fn coordinator(&mut self, group: &str) -> Result<&Broker, ClientError> {
+        if !self.coordinators.contains_key(group) {
+            let version = self
+                .bootstrap
+                .ranges
+                .pick(FindCoordinatorRequest::API_KEY, FIND_COORDINATOR_SUPPORTED)?;
+            let request = FindCoordinatorRequest {
+                key: group.to_owned(),
+                key_type: 0, // group coordinator
+                ..Default::default()
+            };
+            let mut body = BytesMut::new();
+            request.encode(&mut body, version)?;
+            let mut resp = self
+                .bootstrap
+                .conn
+                .request(FindCoordinatorRequest::API_KEY, version, &body)
+                .await?;
+            let resp = FindCoordinatorResponse::decode(&mut resp, version)?;
+            let code = ErrorCode(resp.error_code);
+            if !code.is_ok() {
+                return Err(ClientError::Broker(code));
+            }
+            // The response names the coordinator's endpoint directly;
+            // make it dialable even before any metadata refresh.
+            self.brokers.insert(
+                resp.node_id,
+                BrokerInfo {
+                    node_id: resp.node_id,
+                    host: resp.host.clone(),
+                    port: resp.port,
+                },
+            );
+            self.coordinators.insert(group.to_owned(), resp.node_id);
+        }
+        let node_id = self.coordinators[group];
+        self.broker(node_id).await
+    }
+
+    /// Forget `group`'s discovered coordinator — e.g. after
+    /// NOT_COORDINATOR — so the next use rediscovers it.
+    pub fn forget_coordinator(&mut self, group: &str) {
+        if let Some(node_id) = self.coordinators.remove(group) {
+            self.conns.remove(&node_id);
+        }
     }
 }
 

@@ -50,6 +50,9 @@ impl ClientError {
                     || *code == ErrorCode::LEADER_NOT_AVAILABLE
                     || *code == ErrorCode::UNKNOWN_TOPIC_OR_PARTITION
                     || *code == ErrorCode::UNKNOWN_TOPIC_ID
+                    || *code == ErrorCode::COORDINATOR_LOAD_IN_PROGRESS
+                    || *code == ErrorCode::COORDINATOR_NOT_AVAILABLE
+                    || *code == ErrorCode::NOT_COORDINATOR
             }
             _ => false,
         }

@@ -22,10 +22,18 @@ const TOPIC: &str = "routing";
 /// Which broker each produced partition arrived at.
 type Arrivals = Arc<Mutex<Vec<(i32, i32)>>>; // (broker node_id, partition)
 
+/// Committed offsets: (group, topic, partition) -> (offset, committed at
+/// broker node_id).
+type Offsets = Arc<Mutex<std::collections::HashMap<(String, String, i32), (i64, i32)>>>;
+
+/// The fake group coordinator's node id.
+const COORDINATOR: i32 = 1;
+
 struct FakeCluster {
     /// node_id -> host:port
     endpoints: Vec<(i32, String)>,
     arrivals: Arrivals,
+    offsets: Offsets,
 }
 
 /// Spawn `n` fake brokers. Every broker answers ApiVersions and full
@@ -41,10 +49,12 @@ async fn spawn_fake_cluster(n: i32, no_leader: &'static [i32]) -> FakeCluster {
         listeners.push((node_id, listener));
     }
     let arrivals: Arrivals = Arc::new(Mutex::new(Vec::new()));
+    let offsets: Offsets = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
     for (node_id, listener) in listeners {
         let endpoints = endpoints.clone();
         let arrivals = Arc::clone(&arrivals);
+        let offsets = Arc::clone(&offsets);
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -55,6 +65,7 @@ async fn spawn_fake_cluster(n: i32, no_leader: &'static [i32]) -> FakeCluster {
                     node_id,
                     endpoints.clone(),
                     Arc::clone(&arrivals),
+                    Arc::clone(&offsets),
                     no_leader,
                 ));
             }
@@ -63,6 +74,7 @@ async fn spawn_fake_cluster(n: i32, no_leader: &'static [i32]) -> FakeCluster {
     FakeCluster {
         endpoints,
         arrivals,
+        offsets,
     }
 }
 
@@ -71,6 +83,7 @@ async fn serve_conn(
     node_id: i32,
     endpoints: Vec<(i32, String)>,
     arrivals: Arrivals,
+    offsets: Offsets,
     no_leader: &'static [i32],
 ) {
     loop {
@@ -92,15 +105,24 @@ async fn serve_conn(
         let body = match api_key {
             18 => {
                 let resp = ApiVersionsResponse {
-                    api_keys: [(18, 0, 4), (3, 0, 13), (0, 3, 12), (1, 4, 17), (2, 1, 10)]
-                        .into_iter()
-                        .map(|(api_key, min_version, max_version)| ApiVersion {
-                            api_key,
-                            min_version,
-                            max_version,
-                            ..Default::default()
-                        })
-                        .collect(),
+                    api_keys: [
+                        (18, 0, 4),
+                        (3, 0, 13),
+                        (0, 3, 12),
+                        (1, 4, 17),
+                        (2, 1, 10),
+                        (10, 0, 6),
+                        (8, 2, 10),
+                        (9, 1, 10),
+                    ]
+                    .into_iter()
+                    .map(|(api_key, min_version, max_version)| ApiVersion {
+                        api_key,
+                        min_version,
+                        max_version,
+                        ..Default::default()
+                    })
+                    .collect(),
                     ..Default::default()
                 };
                 let mut buf = BytesMut::new();
@@ -223,6 +245,85 @@ async fn serve_conn(
                             error_code: 0,
                             timestamp: -1,
                             offset,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                let mut buf = BytesMut::new();
+                resp.encode(&mut buf, api_version).unwrap();
+                buf.freeze()
+            }
+            10 => {
+                use odradek_protocol::messages::find_coordinator_request::FindCoordinatorRequest;
+                use odradek_protocol::messages::find_coordinator_response::FindCoordinatorResponse;
+                let req = FindCoordinatorRequest::decode(&mut frame, api_version).unwrap();
+                assert!(!req.key.is_empty());
+                let (host, port) = endpoints[COORDINATOR as usize].1.rsplit_once(':').unwrap();
+                let resp = FindCoordinatorResponse {
+                    error_code: 0,
+                    node_id: COORDINATOR,
+                    host: host.into(),
+                    port: port.parse().unwrap(),
+                    ..Default::default()
+                };
+                let mut buf = BytesMut::new();
+                resp.encode(&mut buf, api_version).unwrap();
+                buf.freeze()
+            }
+            8 => {
+                use odradek_protocol::messages::offset_commit_request::OffsetCommitRequest;
+                use odradek_protocol::messages::offset_commit_response::{
+                    OffsetCommitResponse, OffsetCommitResponsePartition, OffsetCommitResponseTopic,
+                };
+                let req = OffsetCommitRequest::decode(&mut frame, api_version).unwrap();
+                assert_eq!(req.generation_id_or_member_epoch, -1);
+                assert!(req.member_id.is_empty());
+                let topic = &req.topics[0];
+                let p = &topic.partitions[0];
+                offsets.lock().unwrap().insert(
+                    (req.group_id.clone(), topic.name.clone(), p.partition_index),
+                    (p.committed_offset, node_id),
+                );
+                let resp = OffsetCommitResponse {
+                    topics: vec![OffsetCommitResponseTopic {
+                        name: topic.name.clone(),
+                        partitions: vec![OffsetCommitResponsePartition {
+                            partition_index: p.partition_index,
+                            error_code: 0,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                let mut buf = BytesMut::new();
+                resp.encode(&mut buf, api_version).unwrap();
+                buf.freeze()
+            }
+            9 => {
+                use odradek_protocol::messages::offset_fetch_request::OffsetFetchRequest;
+                use odradek_protocol::messages::offset_fetch_response::{
+                    OffsetFetchResponse, OffsetFetchResponsePartition, OffsetFetchResponseTopic,
+                };
+                let req = OffsetFetchRequest::decode(&mut frame, api_version).unwrap();
+                let topic = &req.topics.as_ref().unwrap()[0];
+                let partition = topic.partition_indexes[0];
+                let committed = offsets
+                    .lock()
+                    .unwrap()
+                    .get(&(req.group_id.clone(), topic.name.clone(), partition))
+                    .map_or(-1, |(offset, _)| *offset);
+                let resp = OffsetFetchResponse {
+                    topics: vec![OffsetFetchResponseTopic {
+                        name: topic.name.clone(),
+                        partitions: vec![OffsetFetchResponsePartition {
+                            partition_index: partition,
+                            committed_offset: committed,
+                            committed_leader_epoch: -1,
+                            metadata: Some(String::new()),
+                            error_code: 0,
                             ..Default::default()
                         }],
                         ..Default::default()
@@ -410,6 +511,42 @@ async fn producer_delivers_a_batch_and_returns_the_offset() {
         .unwrap();
     assert_eq!(offset, 7); // the fake's fixed base offset
     assert!(fake.arrivals.lock().unwrap().contains(&(2, 2)));
+}
+
+#[tokio::test]
+async fn offsets_commit_through_the_coordinator_and_read_back() {
+    use odradek_client::Consumer;
+
+    let fake = spawn_fake_cluster(3, &[]).await;
+    let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+    let mut consumer = Consumer::new(cluster);
+
+    // Nothing committed yet.
+    assert_eq!(
+        consumer.committed_offset("g1", TOPIC, 2).await.unwrap(),
+        None
+    );
+
+    consumer.commit_offset("g1", TOPIC, 2, 41).await.unwrap();
+    assert_eq!(
+        consumer.committed_offset("g1", TOPIC, 2).await.unwrap(),
+        Some(41)
+    );
+    // Other groups and partitions stay independent.
+    assert_eq!(
+        consumer.committed_offset("g2", TOPIC, 2).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        consumer.committed_offset("g1", TOPIC, 0).await.unwrap(),
+        None
+    );
+
+    // The commit went to the coordinator FindCoordinator named — not to
+    // the bootstrap broker the consumer happened to be connected to.
+    let (offset, committed_at) = fake.offsets.lock().unwrap()[&("g1".into(), TOPIC.into(), 2)];
+    assert_eq!(offset, 41);
+    assert_eq!(committed_at, COORDINATOR);
 }
 
 #[tokio::test]

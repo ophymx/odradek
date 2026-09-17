@@ -18,6 +18,14 @@ use odradek_protocol::messages::list_offsets_request::{
     ListOffsetsPartition, ListOffsetsRequest, ListOffsetsTopic,
 };
 use odradek_protocol::messages::list_offsets_response::ListOffsetsResponse;
+use odradek_protocol::messages::offset_commit_request::{
+    OffsetCommitRequest, OffsetCommitRequestPartition, OffsetCommitRequestTopic,
+};
+use odradek_protocol::messages::offset_commit_response::OffsetCommitResponse;
+use odradek_protocol::messages::offset_fetch_request::{
+    OffsetFetchRequest, OffsetFetchRequestTopic,
+};
+use odradek_protocol::messages::offset_fetch_response::OffsetFetchResponse;
 use odradek_protocol::records::{Compression, RecordHeader, Records, decode_set};
 
 use crate::cluster::Cluster;
@@ -34,6 +42,14 @@ const LIST_OFFSETS_SUPPORTED: (i16, i16) = (1, ListOffsetsRequest::MAX_VERSION);
 /// ListOffsets sentinel timestamps.
 const EARLIEST: i64 = -2;
 const LATEST: i64 = -1;
+
+/// OffsetCommit versions this client speaks: the classic name-addressed
+/// shape (v9+ carries member epochs for KIP-848 groups, v10 topic ids).
+const OFFSET_COMMIT_SUPPORTED: (i16, i16) = (2, 8);
+
+/// OffsetFetch versions this client speaks: the single-group shape
+/// (v8+ switches to batched groups).
+const OFFSET_FETCH_SUPPORTED: (i16, i16) = (1, 7);
 
 /// Fetch tuning knobs.
 #[derive(Debug, Clone)]
@@ -134,6 +150,166 @@ impl Consumer {
             Box::pin(this.list_offset_once(topic.to_owned(), partition, LATEST))
         })
         .await
+    }
+
+    /// Durably commit `offset` for `topic[partition]` under `group`, as a
+    /// simple (non-member) consumer: no group membership required, the
+    /// caller owns partition assignment.
+    pub async fn commit_offset(
+        &mut self,
+        group: &str,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+    ) -> Result<(), ClientError> {
+        self.with_group_retries(group, |this| {
+            Box::pin(this.commit_once(group.to_owned(), topic.to_owned(), partition, offset))
+        })
+        .await
+    }
+
+    /// The offset last committed for `topic[partition]` under `group`, or
+    /// `None` when nothing was ever committed.
+    pub async fn committed_offset(
+        &mut self,
+        group: &str,
+        topic: &str,
+        partition: i32,
+    ) -> Result<Option<i64>, ClientError> {
+        self.with_group_retries(group, |this| {
+            Box::pin(this.committed_once(group.to_owned(), topic.to_owned(), partition))
+        })
+        .await
+    }
+
+    /// Like [`Self::with_retries`], but coordinator-scoped: a retriable
+    /// error invalidates the discovered coordinator, not topic metadata.
+    async fn with_group_retries<T>(
+        &mut self,
+        group: &str,
+        mut attempt: impl for<'a> FnMut(
+            &'a mut Consumer,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = Result<T, ClientError>> + 'a>,
+        >,
+    ) -> Result<T, ClientError> {
+        let mut last = None;
+        for round in 0..self.config.max_attempts {
+            if round > 0 {
+                tokio::time::sleep(self.config.retry_backoff).await;
+            }
+            match attempt(self).await {
+                Ok(v) => return Ok(v),
+                Err(e) if e.is_retriable() => {
+                    self.cluster.forget_coordinator(group);
+                    last = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last.unwrap_or(ClientError::ConnectionClosed))
+    }
+
+    async fn commit_once(
+        &mut self,
+        group: String,
+        topic: String,
+        partition: i32,
+        offset: i64,
+    ) -> Result<(), ClientError> {
+        let broker = self.cluster.coordinator(&group).await?.clone();
+        let version = broker
+            .ranges
+            .pick(OffsetCommitRequest::API_KEY, OFFSET_COMMIT_SUPPORTED)?;
+        let request = OffsetCommitRequest {
+            group_id: group,
+            // Simple consumer: no generation, no member.
+            generation_id_or_member_epoch: -1,
+            member_id: String::new(),
+            group_instance_id: None,
+            retention_time_ms: -1,
+            topics: vec![OffsetCommitRequestTopic {
+                name: topic.clone(),
+                partitions: vec![OffsetCommitRequestPartition {
+                    partition_index: partition,
+                    committed_offset: offset,
+                    committed_leader_epoch: -1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut body = BytesMut::new();
+        request.encode(&mut body, version)?;
+        let mut resp = broker
+            .conn
+            .request(OffsetCommitRequest::API_KEY, version, &body)
+            .await?;
+        let resp = OffsetCommitResponse::decode(&mut resp, version)?;
+        let entry = resp
+            .topics
+            .iter()
+            .find(|t| t.name == topic)
+            .and_then(|t| t.partitions.iter().find(|p| p.partition_index == partition))
+            .ok_or_else(|| {
+                ClientError::ProtocolViolation(format!(
+                    "offset commit response omits {topic}[{partition}]"
+                ))
+            })?;
+        let code = ErrorCode(entry.error_code);
+        if code.is_ok() {
+            Ok(())
+        } else {
+            Err(ClientError::Broker(code))
+        }
+    }
+
+    async fn committed_once(
+        &mut self,
+        group: String,
+        topic: String,
+        partition: i32,
+    ) -> Result<Option<i64>, ClientError> {
+        let broker = self.cluster.coordinator(&group).await?.clone();
+        let version = broker
+            .ranges
+            .pick(OffsetFetchRequest::API_KEY, OFFSET_FETCH_SUPPORTED)?;
+        let request = OffsetFetchRequest {
+            group_id: group,
+            topics: Some(vec![OffsetFetchRequestTopic {
+                name: topic.clone(),
+                partition_indexes: vec![partition],
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let mut body = BytesMut::new();
+        request.encode(&mut body, version)?;
+        let mut resp = broker
+            .conn
+            .request(OffsetFetchRequest::API_KEY, version, &body)
+            .await?;
+        let resp = OffsetFetchResponse::decode(&mut resp, version)?;
+        let code = ErrorCode(resp.error_code);
+        if !code.is_ok() {
+            return Err(ClientError::Broker(code));
+        }
+        let entry = resp
+            .topics
+            .iter()
+            .find(|t| t.name == topic)
+            .and_then(|t| t.partitions.iter().find(|p| p.partition_index == partition))
+            .ok_or_else(|| {
+                ClientError::ProtocolViolation(format!(
+                    "offset fetch response omits {topic}[{partition}]"
+                ))
+            })?;
+        let code = ErrorCode(entry.error_code);
+        if !code.is_ok() {
+            return Err(ClientError::Broker(code));
+        }
+        Ok((entry.committed_offset >= 0).then_some(entry.committed_offset))
     }
 
     async fn with_retries<T>(
