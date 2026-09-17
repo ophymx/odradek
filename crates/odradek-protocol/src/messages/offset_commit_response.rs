@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `OffsetCommitResponse`, versions 2-10.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct OffsetCommitResponse {
     /// The duration in milliseconds for which the request was throttled due to a quota violation, or zero if the request did not violate any quota.
     pub throttle_time_ms: i32,
@@ -98,6 +99,7 @@ impl OffsetCommitResponse {
 
 /// `OffsetCommitResponseTopic` (nested in [`OffsetCommitResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct OffsetCommitResponseTopic {
     /// The topic name.
     pub name: String,
@@ -184,6 +186,7 @@ impl OffsetCommitResponseTopic {
 
 /// `OffsetCommitResponsePartition` (nested in [`OffsetCommitResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct OffsetCommitResponsePartition {
     /// The partition index.
     pub partition_index: i32,

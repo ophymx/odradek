@@ -63,6 +63,7 @@ pub enum HarnessFault {
 
 /// Limits for one observation session.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ObserveConfig {
     /// Stop after this many requests (the checks need finite input).
     pub max_requests: usize,
@@ -488,38 +489,37 @@ async fn respond(
         3 => {
             let v = api_version.clamp(0, 13);
             let leaders = view.leaders.lock().unwrap().clone();
-            let resp = MetadataResponse {
-                brokers: view
-                    .ports
-                    .iter()
-                    .enumerate()
-                    .map(|(i, port)| MetadataResponseBroker {
-                        node_id: i32::try_from(i).unwrap_or(0),
-                        host: "127.0.0.1".into(),
-                        port: i32::from(*port),
-                        ..Default::default()
-                    })
-                    .collect(),
-                cluster_id: Some("odradek-harness".into()),
-                controller_id: 0,
-                topics: vec![MetadataResponseTopic {
-                    name: Some(ROUTING_TOPIC.into()),
-                    topic_id: ROUTING_TOPIC_ID,
-                    partitions: leaders
-                        .iter()
-                        .enumerate()
-                        .map(|(i, leader)| MetadataResponsePartition {
-                            partition_index: i32::try_from(i).unwrap_or(0),
-                            leader_id: *leader,
-                            replica_nodes: vec![*leader],
-                            isr_nodes: vec![*leader],
-                            ..Default::default()
-                        })
-                        .collect(),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            };
+            let mut resp = MetadataResponse::default();
+            resp.brokers = view
+                .ports
+                .iter()
+                .enumerate()
+                .map(|(i, port)| {
+                    let mut broker = MetadataResponseBroker::default();
+                    broker.node_id = i32::try_from(i).unwrap_or(0);
+                    broker.host = "127.0.0.1".into();
+                    broker.port = i32::from(*port);
+                    broker
+                })
+                .collect();
+            resp.cluster_id = Some("odradek-harness".into());
+            resp.controller_id = 0;
+            let mut topic = MetadataResponseTopic::default();
+            topic.name = Some(ROUTING_TOPIC.into());
+            topic.topic_id = ROUTING_TOPIC_ID;
+            topic.partitions = leaders
+                .iter()
+                .enumerate()
+                .map(|(i, leader)| {
+                    let mut partition = MetadataResponsePartition::default();
+                    partition.partition_index = i32::try_from(i).unwrap_or(0);
+                    partition.leader_id = *leader;
+                    partition.replica_nodes = vec![*leader];
+                    partition.isr_nodes = vec![*leader];
+                    partition
+                })
+                .collect();
+            resp.topics = vec![topic];
             let mut buf = BytesMut::new();
             let Ok(()) = resp.encode(&mut buf, v) else {
                 return;
@@ -540,33 +540,30 @@ async fn respond(
                 } else {
                     3 // UNKNOWN_TOPIC_OR_PARTITION
                 };
-                let entry = PartitionProduceResponse {
-                    index: *partition,
-                    error_code,
-                    base_offset: if error_code == 0 { 0 } else { -1 },
-                    log_append_time_ms: -1,
-                    ..Default::default()
-                };
+                let mut entry = PartitionProduceResponse::default();
+                entry.index = *partition;
+                entry.error_code = error_code;
+                entry.base_offset = if error_code == 0 { 0 } else { -1 };
+                entry.log_append_time_ms = -1;
                 match responses.iter_mut().find(|t| &t.name == topic) {
                     Some(t) => t.partition_responses.push(entry),
-                    None => responses.push(TopicProduceResponse {
-                        name: topic.clone(),
-                        topic_id: if topic == ROUTING_TOPIC {
+                    None => {
+                        let mut topic_resp = TopicProduceResponse::default();
+                        topic_resp.name = topic.clone();
+                        topic_resp.topic_id = if topic == ROUTING_TOPIC {
                             ROUTING_TOPIC_ID
                         } else {
                             [0u8; 16]
-                        },
-                        partition_responses: vec![entry],
-                        ..Default::default()
-                    }),
+                        };
+                        topic_resp.partition_responses = vec![entry];
+                        responses.push(topic_resp);
+                    }
                 }
             }
+            let mut resp = ProduceResponse::default();
+            resp.responses = responses;
             let mut buf = BytesMut::new();
-            let Ok(()) = ProduceResponse {
-                responses,
-                ..Default::default()
-            }
-            .encode(&mut buf, v) else {
+            let Ok(()) = resp.encode(&mut buf, v) else {
                 return;
             };
             (buf.freeze(), response_header_version(0, v).unwrap_or(0))
@@ -585,35 +582,32 @@ async fn respond(
                 } else {
                     3 // UNKNOWN_TOPIC_OR_PARTITION
                 };
-                let entry = PartitionData {
-                    partition_index: *partition,
-                    error_code,
-                    high_watermark: 0,
-                    last_stable_offset: 0,
-                    log_start_offset: 0,
-                    records: Some(Bytes::new()),
-                    ..Default::default()
-                };
+                let mut entry = PartitionData::default();
+                entry.partition_index = *partition;
+                entry.error_code = error_code;
+                entry.high_watermark = 0;
+                entry.last_stable_offset = 0;
+                entry.log_start_offset = 0;
+                entry.records = Some(Bytes::new());
                 match responses.iter_mut().find(|t| &t.topic == topic) {
                     Some(t) => t.partitions.push(entry),
-                    None => responses.push(FetchableTopicResponse {
-                        topic: topic.clone(),
-                        topic_id: if topic == ROUTING_TOPIC {
+                    None => {
+                        let mut topic_resp = FetchableTopicResponse::default();
+                        topic_resp.topic = topic.clone();
+                        topic_resp.topic_id = if topic == ROUTING_TOPIC {
                             ROUTING_TOPIC_ID
                         } else {
                             [0u8; 16]
-                        },
-                        partitions: vec![entry],
-                        ..Default::default()
-                    }),
+                        };
+                        topic_resp.partitions = vec![entry];
+                        responses.push(topic_resp);
+                    }
                 }
             }
+            let mut resp = FetchResponse::default();
+            resp.responses = responses;
             let mut buf = BytesMut::new();
-            let Ok(()) = FetchResponse {
-                responses,
-                ..Default::default()
-            }
-            .encode(&mut buf, v) else {
+            let Ok(()) = resp.encode(&mut buf, v) else {
                 return;
             };
             (buf.freeze(), response_header_version(1, v).unwrap_or(0))
@@ -622,10 +616,8 @@ async fn respond(
         _ => return,
     };
 
-    let resp_header = ResponseHeader {
-        correlation_id: header.correlation_id,
-        unknown_tagged_fields: Vec::new(),
-    };
+    let mut resp_header = ResponseHeader::default();
+    resp_header.correlation_id = header.correlation_id;
     let mut out = BytesMut::new();
     out.put_i32(0);
     let Ok(()) = resp_header.encode(&mut out, header_version) else {
@@ -640,19 +632,18 @@ async fn respond(
 }
 
 fn encode_api_versions(error_code: i16, version: i16) -> Bytes {
-    let resp = ApiVersionsResponse {
-        error_code,
-        api_keys: ADVERTISED
-            .iter()
-            .map(|&(api_key, min_version, max_version)| ApiVersion {
-                api_key,
-                min_version,
-                max_version,
-                ..Default::default()
-            })
-            .collect(),
-        ..Default::default()
-    };
+    let mut resp = ApiVersionsResponse::default();
+    resp.error_code = error_code;
+    resp.api_keys = ADVERTISED
+        .iter()
+        .map(|&(api_key, min_version, max_version)| {
+            let mut v = ApiVersion::default();
+            v.api_key = api_key;
+            v.min_version = min_version;
+            v.max_version = max_version;
+            v
+        })
+        .collect();
     let mut buf = BytesMut::new();
     resp.encode(&mut buf, version)
         .expect("infallible for this shape");

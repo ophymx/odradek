@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `MetadataResponse`, versions 0-13.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct MetadataResponse {
     /// The duration in milliseconds for which the request was throttled due to a quota violation, or zero if the request did not violate any quota.
     pub throttle_time_ms: i32,
@@ -179,6 +180,7 @@ impl MetadataResponse {
 
 /// `MetadataResponseBroker` (nested in [`MetadataResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct MetadataResponseBroker {
     /// The broker ID.
     pub node_id: i32,
@@ -260,6 +262,7 @@ impl MetadataResponseBroker {
 
 /// `MetadataResponseTopic` (nested in [`MetadataResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct MetadataResponseTopic {
     /// The topic error, or 0 if there was no error.
     pub error_code: i16,
@@ -374,6 +377,7 @@ impl MetadataResponseTopic {
 
 /// `MetadataResponsePartition` (nested in [`MetadataResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct MetadataResponsePartition {
     /// The partition error, or 0 if there was no error.
     pub error_code: i16,

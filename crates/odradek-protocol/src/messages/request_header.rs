@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `RequestHeader`, versions 1-2.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct RequestHeader {
     /// The API key of this request.
     pub request_api_key: i16,

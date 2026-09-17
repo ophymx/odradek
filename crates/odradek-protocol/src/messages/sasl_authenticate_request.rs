@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `SaslAuthenticateRequest`, versions 0-2.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct SaslAuthenticateRequest {
     /// The SASL authentication bytes from the client, as defined by the SASL mechanism.
     pub auth_bytes: bytes::Bytes,

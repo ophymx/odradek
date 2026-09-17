@@ -62,11 +62,9 @@ impl Connection {
     /// Exchange ApiVersions with the broker and return its advertised
     /// version ranges.
     pub async fn negotiate(&self) -> Result<ApiVersionRanges, ClientError> {
-        let request = ApiVersionsRequest {
-            client_software_name: "odradek".into(),
-            client_software_version: env!("CARGO_PKG_VERSION").into(),
-            unknown_tagged_fields: Vec::new(),
-        };
+        let mut request = ApiVersionsRequest::default();
+        request.client_software_name = "odradek".into();
+        request.client_software_version = env!("CARGO_PKG_VERSION").into();
 
         let resp = self
             .api_versions_at(&request, ApiVersionsRequest::MAX_VERSION)

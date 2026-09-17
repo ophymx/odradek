@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `ConsumerProtocolAssignment`, versions 0-3.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ConsumerProtocolAssignment {
     /// The list of topics and partitions assigned to this consumer.
     pub assigned_partitions: Vec<TopicPartition>,
@@ -101,6 +102,7 @@ impl ConsumerProtocolAssignment {
 
 /// `TopicPartition` (nested in [`ConsumerProtocolAssignment`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct TopicPartition {
     /// The topic name.
     pub topic: String,

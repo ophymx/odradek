@@ -23,11 +23,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("none") | None => Compression::None,
         Some(other) => return Err(format!("unknown codec {other}").into()),
     };
-    let config = ClientConfig {
-        bootstrap_servers: vec![bootstrap],
-        client_id: "odradek-example".into(),
-        ..Default::default()
-    };
+    let mut config = ClientConfig::default();
+    config.bootstrap_servers = vec![bootstrap];
+    config.client_id = "odradek-example".into();
 
     // A fresh topic per run.
     let topic = format!(
@@ -42,13 +40,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("created topic {topic}");
 
     // Produce one compressed batch of three records.
-    let mut producer = Producer::with_config(
-        cluster,
-        ProducerConfig {
-            compression: codec,
-            ..Default::default()
-        },
-    );
+    let mut producer_config = ProducerConfig::default();
+    producer_config.compression = codec;
+    let mut producer = Producer::with_config(cluster, producer_config);
     for i in 0..3 {
         producer
             .enqueue(
@@ -98,16 +92,13 @@ async fn create_topic(cluster: &Cluster, topic: &str) -> Result<(), Box<dyn std:
     // the bootstrap connection.
     let broker = cluster.bootstrap_broker();
     let version = broker.ranges.pick(CreateTopicsRequest::API_KEY, (2, 7))?;
-    let request = CreateTopicsRequest {
-        topics: vec![CreatableTopic {
-            name: topic.to_owned(),
-            num_partitions: 1,
-            replication_factor: 1,
-            ..Default::default()
-        }],
-        timeout_ms: 30_000,
-        ..Default::default()
-    };
+    let mut creatable = CreatableTopic::default();
+    creatable.name = topic.to_owned();
+    creatable.num_partitions = 1;
+    creatable.replication_factor = 1;
+    let mut request = CreateTopicsRequest::default();
+    request.topics = vec![creatable];
+    request.timeout_ms = 30_000;
     let mut body = BytesMut::new();
     request.encode(&mut body, version)?;
     let mut resp = broker

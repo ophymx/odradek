@@ -30,6 +30,7 @@ const PRODUCE_SUPPORTED: (i16, i16) = (3, 12);
 
 /// Delivery knobs.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ProducerConfig {
     /// Acknowledgement level; -1 = full ISR.
     pub acks: i16,
@@ -220,21 +221,17 @@ impl Producer {
             .ranges
             .pick(ProduceRequest::API_KEY, PRODUCE_SUPPORTED)?;
 
-        let request = ProduceRequest {
-            transactional_id: None,
-            acks: self.config.acks,
-            timeout_ms: self.config.request_timeout_ms,
-            topic_data: vec![TopicProduceData {
-                name: topic.to_owned(),
-                partition_data: vec![PartitionProduceData {
-                    index: partition,
-                    records: Some(bytes::Bytes::copy_from_slice(set)),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
+        let mut partition_data = PartitionProduceData::default();
+        partition_data.index = partition;
+        partition_data.records = Some(bytes::Bytes::copy_from_slice(set));
+        let mut topic_data = TopicProduceData::default();
+        topic_data.name = topic.to_owned();
+        topic_data.partition_data = vec![partition_data];
+        let mut request = ProduceRequest::default();
+        request.transactional_id = None;
+        request.acks = self.config.acks;
+        request.timeout_ms = self.config.request_timeout_ms;
+        request.topic_data = vec![topic_data];
         let mut body = BytesMut::new();
         request.encode(&mut body, version)?;
 

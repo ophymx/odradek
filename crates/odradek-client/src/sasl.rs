@@ -68,10 +68,8 @@ pub async fn authenticate(
 ) -> Result<(), ClientError> {
     // Handshake v1: v0 predates SaslAuthenticate framing.
     let version = ranges.pick(SaslHandshakeRequest::API_KEY, (1, 1))?;
-    let request = SaslHandshakeRequest {
-        mechanism: sasl.mechanism.name().to_owned(),
-        ..Default::default()
-    };
+    let mut request = SaslHandshakeRequest::default();
+    request.mechanism = sasl.mechanism.name().to_owned();
     let mut body = BytesMut::new();
     request.encode(&mut body, version)?;
     let mut resp = conn
@@ -115,10 +113,8 @@ async fn sasl_round(
             SaslAuthenticateRequest::MAX_VERSION,
         ),
     )?;
-    let request = SaslAuthenticateRequest {
-        auth_bytes: token,
-        ..Default::default()
-    };
+    let mut request = SaslAuthenticateRequest::default();
+    request.auth_bytes = token;
     let mut body = BytesMut::new();
     request.encode(&mut body, version)?;
     let mut resp = conn

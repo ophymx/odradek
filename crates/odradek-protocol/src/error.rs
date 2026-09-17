@@ -2,6 +2,7 @@
 
 /// A value could not be encoded into the Kafka wire format.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EncodeError {
     /// A string or byte sequence exceeds the maximum length its wire
     /// representation can carry (e.g. a `STRING` longer than `i16::MAX`).
@@ -15,6 +16,7 @@ pub enum EncodeError {
 
 /// Bytes on the wire could not be decoded.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DecodeError {
     /// The buffer ended before the value was complete.
     #[error("buffer truncated: needed {needed} more byte(s)")]

@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `MetadataRequest`, versions 0-13.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct MetadataRequest {
     /// The topics to fetch metadata for.
     pub topics: Option<Vec<MetadataRequestTopic>>,
@@ -135,6 +136,7 @@ impl MetadataRequest {
 
 /// `MetadataRequestTopic` (nested in [`MetadataRequest`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct MetadataRequestTopic {
     /// The topic id.
     pub topic_id: [u8; 16],

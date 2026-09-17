@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `HeartbeatRequest`, versions 0-4.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct HeartbeatRequest {
     /// The group id.
     pub group_id: String,

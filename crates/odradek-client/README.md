@@ -24,16 +24,24 @@ one exception).
 ```rust
 use odradek_client::{ClientConfig, Cluster, Producer};
 
-let cluster = Cluster::connect(ClientConfig {
-    bootstrap_servers: vec!["localhost:9092".into()],
-    client_id: "my-service".into(),
-    ..Default::default()
-}).await?;
+let mut config = ClientConfig::default();
+config.bootstrap_servers = vec!["localhost:9092".into()];
+config.client_id = "my-service".into();
+let cluster = Cluster::connect(config).await?;
 let mut producer = Producer::new(cluster);
 ```
 
 See [`examples/`](examples/) for produce/consume, consumer groups, and
 TLS/SASL smoke tests against a real broker.
+
+## Features
+
+All on by default: `tls`, `sasl`, `gzip`, `lz4`, `snappy`, `zstd`.
+Opting out slims the build: `--no-default-features` is a plaintext,
+unauthenticated client whose only codec is uncompressed (a fetched
+batch in a disabled codec is a typed runtime error, not a crash).
+Skipping `zstd` drops the one C dependency — `tls,sasl,gzip,lz4,snappy`
+is an all-Rust build.
 
 Part of the [odradek](https://github.com/ophymx/odradek) constellation.
 

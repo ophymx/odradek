@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `SaslHandshakeRequest`, versions 0-1.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct SaslHandshakeRequest {
     /// The SASL mechanism chosen by the client.
     pub mechanism: String,

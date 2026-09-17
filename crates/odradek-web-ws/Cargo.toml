@@ -11,8 +11,15 @@ readme = "README.md"
 keywords = ["kafka", "websocket", "axum", "streaming"]
 categories = ["web-programming::websocket", "network-programming", "asynchronous"]
 
+[features]
+default = ["kafka"]
+## Pass-through to odradek-web-core's real-cluster source.
+kafka = ["odradek-web-core/kafka"]
+
 [dependencies]
-odradek-web-core = { workspace = true }
+# Not workspace-inherited: cargo cannot un-set default-features on an
+# inherited dependency, and lean builds need it off.
+odradek-web-core = { path = "../odradek-web-core", version = "0.1.0", default-features = false }
 axum = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
@@ -23,6 +30,10 @@ tracing = { workspace = true }
 [dev-dependencies]
 odradek-client = { workspace = true }
 odradek-web-sse = { path = "../odradek-web-sse", version = "0.1.0" }
+
+[[example]]
+name = "serve"
+required-features = ["kafka"]
 
 [lints]
 workspace = true

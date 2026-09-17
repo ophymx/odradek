@@ -11,24 +11,41 @@ readme = "README.md"
 keywords = ["kafka", "client", "async", "tokio", "producer"]
 categories = ["network-programming", "asynchronous"]
 
+[features]
+default = ["tls", "sasl", "gzip", "lz4", "snappy", "zstd"]
+## TLS broker connections via rustls.
+tls = ["dep:tokio-rustls", "dep:webpki-roots", "dep:rustls-pemfile"]
+## SASL authentication (PLAIN, SCRAM-SHA-256/512).
+sasl = ["dep:base64", "dep:getrandom", "dep:hmac", "dep:pbkdf2", "dep:sha2"]
+## Compression codecs; a disabled codec is a typed runtime error, not a
+## compile error, since a fetch can encounter any codec.
+gzip = ["dep:flate2"]
+lz4 = ["dep:lz4_flex"]
+snappy = ["dep:snap"]
+zstd = ["dep:zstd"]
+
 [dependencies]
 odradek-protocol = { workspace = true }
-base64 = { workspace = true }
+base64 = { workspace = true, optional = true }
 bytes = { workspace = true }
-flate2 = { workspace = true }
-getrandom = { workspace = true }
-hmac = { workspace = true }
-lz4_flex = { workspace = true }
-pbkdf2 = { workspace = true }
-rustls-pemfile = { workspace = true }
-sha2 = { workspace = true }
-snap = { workspace = true }
+flate2 = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
+lz4_flex = { workspace = true, optional = true }
+pbkdf2 = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+snap = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tokio-rustls = { workspace = true }
+tokio-rustls = { workspace = true, optional = true }
 tracing = { workspace = true }
-webpki-roots = { workspace = true }
-zstd = { workspace = true }
+webpki-roots = { workspace = true, optional = true }
+zstd = { workspace = true, optional = true }
+
+[[example]]
+name = "secure_smoke"
+required-features = ["tls", "sasl"]
 
 [lints]
 workspace = true

@@ -28,6 +28,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `CreateTopicsResponse`, versions 2-7.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct CreateTopicsResponse {
     /// The duration in milliseconds for which the request was throttled due to a quota violation, or zero if the request did not violate any quota.
     pub throttle_time_ms: i32,
@@ -97,6 +98,7 @@ impl CreateTopicsResponse {
 
 /// `CreatableTopicResult` (nested in [`CreateTopicsResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct CreatableTopicResult {
     /// The topic name.
     pub name: String,
@@ -270,6 +272,7 @@ impl CreatableTopicResult {
 
 /// `CreatableTopicConfigs` (nested in [`CreateTopicsResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct CreatableTopicConfigs {
     /// The configuration name.
     pub name: String,

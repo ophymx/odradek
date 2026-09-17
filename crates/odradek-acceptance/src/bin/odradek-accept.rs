@@ -95,10 +95,8 @@ async fn main() -> ExitCode {
             }
         };
         eprintln!("waiting for a client connection on {addr} ...");
-        let config = checks::client::ObserveConfig {
-            fault: args.fault,
-            ..Default::default()
-        };
+        let mut config = checks::client::ObserveConfig::default();
+        config.fault = args.fault;
         checks::client::run(&listener, &config).await
     };
 

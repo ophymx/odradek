@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `ApiVersionsRequest`, versions 0-4.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ApiVersionsRequest {
     /// The name of the client.
     pub client_software_name: String,

@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `LeaveGroupRequest`, versions 0-5.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct LeaveGroupRequest {
     /// The ID of the group to leave.
     pub group_id: String,
@@ -123,6 +124,7 @@ impl LeaveGroupRequest {
 
 /// `MemberIdentity` (nested in [`LeaveGroupRequest`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct MemberIdentity {
     /// The member ID to remove from the group.
     pub member_id: String,

@@ -50,6 +50,7 @@ pub struct PartitionInfo {
 /// A negotiated connection to one broker, with the version ranges that
 /// broker advertised.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Broker {
     pub conn: Connection,
     pub ranges: ApiVersionRanges,
@@ -97,19 +98,18 @@ impl Cluster {
             .bootstrap
             .ranges
             .pick(MetadataRequest::API_KEY, METADATA_SUPPORTED)?;
-        let request = MetadataRequest {
-            topics: Some(
-                topics
-                    .iter()
-                    .map(|name| MetadataRequestTopic {
-                        name: Some((*name).to_owned()),
-                        ..Default::default()
-                    })
-                    .collect(),
-            ),
-            allow_auto_topic_creation: false,
-            ..Default::default()
-        };
+        let mut request = MetadataRequest::default();
+        request.topics = Some(
+            topics
+                .iter()
+                .map(|name| {
+                    let mut topic = MetadataRequestTopic::default();
+                    topic.name = Some((*name).to_owned());
+                    topic
+                })
+                .collect(),
+        );
+        request.allow_auto_topic_creation = false;
         let mut body = BytesMut::new();
         request.encode(&mut body, version)?;
         let mut resp = self
@@ -244,11 +244,9 @@ impl Cluster {
                 .bootstrap
                 .ranges
                 .pick(FindCoordinatorRequest::API_KEY, FIND_COORDINATOR_SUPPORTED)?;
-            let request = FindCoordinatorRequest {
-                key: group.to_owned(),
-                key_type: 0, // group coordinator
-                ..Default::default()
-            };
+            let mut request = FindCoordinatorRequest::default();
+            request.key = group.to_owned();
+            request.key_type = 0; // group coordinator
             let mut body = BytesMut::new();
             request.encode(&mut body, version)?;
             let mut resp = self
@@ -289,6 +287,7 @@ impl Cluster {
 async fn dial(addr: &str, config: &ClientConfig) -> Result<Broker, ClientError> {
     let conn = Connection::connect(addr, config).await?;
     let ranges = conn.negotiate().await?;
+    #[cfg(feature = "sasl")]
     if let Some(sasl) = &config.sasl {
         crate::sasl::authenticate(&conn, &ranges, sasl).await?;
     }

@@ -28,6 +28,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `ApiVersionsResponse`, versions 0-4.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ApiVersionsResponse {
     /// The top-level error code.
     pub error_code: i16,
@@ -262,6 +263,7 @@ impl ApiVersionsResponse {
 
 /// `ApiVersion` (nested in [`ApiVersionsResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ApiVersion {
     /// The API index.
     pub api_key: i16,
@@ -309,6 +311,7 @@ impl ApiVersion {
 
 /// `SupportedFeatureKey` (nested in [`ApiVersionsResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct SupportedFeatureKey {
     /// The name of the feature.
     pub name: String,
@@ -376,6 +379,7 @@ impl SupportedFeatureKey {
 
 /// `FinalizedFeatureKey` (nested in [`ApiVersionsResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct FinalizedFeatureKey {
     /// The name of the feature.
     pub name: String,

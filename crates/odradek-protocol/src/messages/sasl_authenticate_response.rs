@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `SaslAuthenticateResponse`, versions 0-2.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct SaslAuthenticateResponse {
     /// The error code, or 0 if there was no error.
     pub error_code: i16,

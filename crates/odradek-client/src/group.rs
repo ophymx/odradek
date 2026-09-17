@@ -46,6 +46,7 @@ const ASSIGNOR: &str = "range";
 
 /// Membership knobs.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct GroupConfig {
     /// The coordinator evicts a member silent for this long.
     pub session_timeout_ms: i32,
@@ -175,20 +176,17 @@ impl GroupMember {
             .ranges
             .pick(JoinGroupRequest::API_KEY, JOIN_SUPPORTED)?;
 
-        let mut join = JoinGroupRequest {
-            group_id: self.group_id.clone(),
-            session_timeout_ms: self.config.session_timeout_ms,
-            rebalance_timeout_ms: self.config.rebalance_timeout_ms,
-            member_id: self.member_id.clone(),
-            group_instance_id: None,
-            protocol_type: PROTOCOL_TYPE.into(),
-            protocols: vec![JoinGroupRequestProtocol {
-                name: ASSIGNOR.into(),
-                metadata: subscription.clone(),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
+        let mut protocol = JoinGroupRequestProtocol::default();
+        protocol.name = ASSIGNOR.into();
+        protocol.metadata = subscription.clone();
+        let mut join = JoinGroupRequest::default();
+        join.group_id = self.group_id.clone();
+        join.session_timeout_ms = self.config.session_timeout_ms;
+        join.rebalance_timeout_ms = self.config.rebalance_timeout_ms;
+        join.member_id = self.member_id.clone();
+        join.group_instance_id = None;
+        join.protocol_type = PROTOCOL_TYPE.into();
+        join.protocols = vec![protocol];
         let mut resp = self.join_once(&broker, &join, join_version).await?;
         if ErrorCode(resp.error_code) == ErrorCode::MEMBER_ID_REQUIRED {
             // The coordinator minted us an id; rejoin with it at once.
@@ -227,10 +225,11 @@ impl GroupMember {
             }
             range_assign(&counts, &subscriptions)
                 .into_iter()
-                .map(|(member_id, parts)| SyncGroupRequestAssignment {
-                    member_id,
-                    assignment: encode_assignment(&parts),
-                    ..Default::default()
+                .map(|(member_id, parts)| {
+                    let mut entry = SyncGroupRequestAssignment::default();
+                    entry.member_id = member_id;
+                    entry.assignment = encode_assignment(&parts);
+                    entry
                 })
                 .collect()
         } else {
@@ -240,16 +239,14 @@ impl GroupMember {
         let sync_version = broker
             .ranges
             .pick(SyncGroupRequest::API_KEY, SYNC_SUPPORTED)?;
-        let sync = SyncGroupRequest {
-            group_id: self.group_id.clone(),
-            generation_id: self.generation_id,
-            member_id: self.member_id.clone(),
-            group_instance_id: None,
-            protocol_type: Some(PROTOCOL_TYPE.into()),
-            protocol_name: Some(ASSIGNOR.into()),
-            assignments,
-            ..Default::default()
-        };
+        let mut sync = SyncGroupRequest::default();
+        sync.group_id = self.group_id.clone();
+        sync.generation_id = self.generation_id;
+        sync.member_id = self.member_id.clone();
+        sync.group_instance_id = None;
+        sync.protocol_type = Some(PROTOCOL_TYPE.into());
+        sync.protocol_name = Some(ASSIGNOR.into());
+        sync.assignments = assignments;
         let mut body = BytesMut::new();
         sync.encode(&mut body, sync_version)?;
         let mut resp = broker
@@ -292,12 +289,10 @@ impl GroupMember {
             let version = broker
                 .ranges
                 .pick(HeartbeatRequest::API_KEY, HEARTBEAT_SUPPORTED)?;
-            let request = HeartbeatRequest {
-                group_id: self.group_id.clone(),
-                generation_id: self.generation_id,
-                member_id: self.member_id.clone(),
-                ..Default::default()
-            };
+            let mut request = HeartbeatRequest::default();
+            request.group_id = self.group_id.clone();
+            request.generation_id = self.generation_id;
+            request.member_id = self.member_id.clone();
             let mut body = BytesMut::new();
             request.encode(&mut body, version)?;
             let resp = broker
@@ -341,17 +336,14 @@ impl GroupMember {
         let version = broker
             .ranges
             .pick(LeaveGroupRequest::API_KEY, LEAVE_SUPPORTED)?;
-        let request = LeaveGroupRequest {
-            group_id: self.group_id.clone(),
-            // v0-2 carries the flat member id, v3+ the members array; the
-            // encode gates pick whichever the version uses.
-            member_id: self.member_id.clone(),
-            members: vec![MemberIdentity {
-                member_id: self.member_id.clone(),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
+        let mut identity = MemberIdentity::default();
+        identity.member_id = self.member_id.clone();
+        let mut request = LeaveGroupRequest::default();
+        request.group_id = self.group_id.clone();
+        // v0-2 carries the flat member id, v3+ the members array; the
+        // encode gates pick whichever the version uses.
+        request.member_id = self.member_id.clone();
+        request.members = vec![identity];
         let mut body = BytesMut::new();
         request.encode(&mut body, version)?;
         let mut resp = broker
@@ -371,10 +363,8 @@ impl GroupMember {
 // --- consumer protocol payloads (version-prefixed, non-flexible) ------------
 
 fn encode_subscription(topics: &[String]) -> Bytes {
-    let body = ConsumerProtocolSubscription {
-        topics: topics.to_vec(),
-        ..Default::default()
-    };
+    let mut body = ConsumerProtocolSubscription::default();
+    body.topics = topics.to_vec();
     let mut out = BytesMut::new();
     out.put_i16(0);
     body.encode(&mut out, 0).expect("v0 subscription encodes");
@@ -396,17 +386,16 @@ fn decode_subscription(data: &[u8]) -> Result<Vec<String>, ClientError> {
 }
 
 fn encode_assignment(partitions: &[(String, Vec<i32>)]) -> Bytes {
-    let body = ConsumerProtocolAssignment {
-        assigned_partitions: partitions
-            .iter()
-            .map(|(topic, parts)| TopicPartition {
-                topic: topic.clone(),
-                partitions: parts.clone(),
-                ..Default::default()
-            })
-            .collect(),
-        ..Default::default()
-    };
+    let mut body = ConsumerProtocolAssignment::default();
+    body.assigned_partitions = partitions
+        .iter()
+        .map(|(topic, parts)| {
+            let mut tp = TopicPartition::default();
+            tp.topic = topic.clone();
+            tp.partitions = parts.clone();
+            tp
+        })
+        .collect();
     let mut out = BytesMut::new();
     out.put_i16(0);
     body.encode(&mut out, 0).expect("v0 assignment encodes");

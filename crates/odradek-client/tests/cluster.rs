@@ -50,6 +50,16 @@ struct FakeCluster {
     endpoints: Vec<(i32, String)>,
     arrivals: Arrivals,
     offsets: Offsets,
+    // Read back only by the codec roundtrip test, which needs every codec.
+    #[cfg_attr(
+        not(all(
+            feature = "gzip",
+            feature = "lz4",
+            feature = "snappy",
+            feature = "zstd"
+        )),
+        allow(dead_code)
+    )]
     logs: Logs,
     group: Group,
 }
@@ -135,65 +145,61 @@ async fn serve_conn(
 
         let body = match api_key {
             18 => {
-                let resp = ApiVersionsResponse {
-                    api_keys: [
-                        (18, 0, 4),
-                        (3, 0, 13),
-                        (0, 3, 12),
-                        (1, 4, 17),
-                        (2, 1, 10),
-                        (10, 0, 6),
-                        (8, 2, 10),
-                        (9, 1, 10),
-                        (11, 4, 9),
-                        (14, 3, 5),
-                        (12, 0, 4),
-                        (13, 0, 5),
-                    ]
-                    .into_iter()
-                    .map(|(api_key, min_version, max_version)| ApiVersion {
-                        api_key,
-                        min_version,
-                        max_version,
-                        ..Default::default()
-                    })
-                    .collect(),
-                    ..Default::default()
-                };
+                let mut resp = ApiVersionsResponse::default();
+                resp.api_keys = [
+                    (18, 0, 4),
+                    (3, 0, 13),
+                    (0, 3, 12),
+                    (1, 4, 17),
+                    (2, 1, 10),
+                    (10, 0, 6),
+                    (8, 2, 10),
+                    (9, 1, 10),
+                    (11, 4, 9),
+                    (14, 3, 5),
+                    (12, 0, 4),
+                    (13, 0, 5),
+                ]
+                .into_iter()
+                .map(|(api_key, min_version, max_version)| {
+                    let mut v = ApiVersion::default();
+                    v.api_key = api_key;
+                    v.min_version = min_version;
+                    v.max_version = max_version;
+                    v
+                })
+                .collect();
                 let mut buf = BytesMut::new();
                 resp.encode(&mut buf, api_version).unwrap();
                 buf.freeze()
             }
             3 => {
-                let resp = MetadataResponse {
-                    brokers: endpoints
-                        .iter()
-                        .map(|(id, addr)| {
-                            let (host, port) = addr.rsplit_once(':').unwrap();
-                            MetadataResponseBroker {
-                                node_id: *id,
-                                host: host.into(),
-                                port: port.parse().unwrap(),
-                                ..Default::default()
-                            }
-                        })
-                        .collect(),
-                    cluster_id: Some("fake-cluster".into()),
-                    controller_id: 0,
-                    topics: vec![MetadataResponseTopic {
-                        name: Some(TOPIC.into()),
-                        partitions: endpoints
-                            .iter()
-                            .map(|(id, _)| MetadataResponsePartition {
-                                partition_index: *id,
-                                leader_id: if no_leader.contains(id) { -1 } else { *id },
-                                ..Default::default()
-                            })
-                            .collect(),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                };
+                let mut resp = MetadataResponse::default();
+                resp.brokers = endpoints
+                    .iter()
+                    .map(|(id, addr)| {
+                        let (host, port) = addr.rsplit_once(':').unwrap();
+                        let mut broker = MetadataResponseBroker::default();
+                        broker.node_id = *id;
+                        broker.host = host.into();
+                        broker.port = port.parse().unwrap();
+                        broker
+                    })
+                    .collect();
+                resp.cluster_id = Some("fake-cluster".into());
+                resp.controller_id = 0;
+                let mut topic = MetadataResponseTopic::default();
+                topic.name = Some(TOPIC.into());
+                topic.partitions = endpoints
+                    .iter()
+                    .map(|(id, _)| {
+                        let mut p = MetadataResponsePartition::default();
+                        p.partition_index = *id;
+                        p.leader_id = if no_leader.contains(id) { -1 } else { *id };
+                        p
+                    })
+                    .collect();
+                resp.topics = vec![topic];
                 let mut buf = BytesMut::new();
                 resp.encode(&mut buf, api_version).unwrap();
                 buf.freeze()
@@ -216,27 +222,22 @@ async fn serve_conn(
                                 .or_default()
                                 .extend_from_slice(records);
                         }
-                        partitions.push(PartitionProduceResponse {
-                            index: p.index,
-                            error_code: 0,
-                            base_offset: 7,
-                            log_append_time_ms: -1,
-                            ..Default::default()
-                        });
+                        let mut presp = PartitionProduceResponse::default();
+                        presp.index = p.index;
+                        presp.error_code = 0;
+                        presp.base_offset = 7;
+                        presp.log_append_time_ms = -1;
+                        partitions.push(presp);
                     }
-                    responses.push(TopicProduceResponse {
-                        name: topic.name.clone(),
-                        partition_responses: partitions,
-                        ..Default::default()
-                    });
+                    let mut tresp = TopicProduceResponse::default();
+                    tresp.name = topic.name.clone();
+                    tresp.partition_responses = partitions;
+                    responses.push(tresp);
                 }
                 let mut buf = BytesMut::new();
-                ProduceResponse {
-                    responses,
-                    ..Default::default()
-                }
-                .encode(&mut buf, api_version)
-                .unwrap();
+                let mut resp = ProduceResponse::default();
+                resp.responses = responses;
+                resp.encode(&mut buf, api_version).unwrap();
                 buf.freeze()
             }
             1 => {
@@ -254,22 +255,18 @@ async fn serve_conn(
                     .unwrap()
                     .get(&(TOPIC.to_owned(), partition))
                     .map(|b| b.clone().freeze());
-                let resp = FetchResponse {
-                    responses: vec![FetchableTopicResponse {
-                        topic: TOPIC.into(),
-                        partitions: vec![PartitionData {
-                            partition_index: partition,
-                            error_code: 0,
-                            high_watermark: 9,
-                            last_stable_offset: 9,
-                            log_start_offset: 5,
-                            records: Some(stored.unwrap_or_else(fake_log)),
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                };
+                let mut pdata = PartitionData::default();
+                pdata.partition_index = partition;
+                pdata.error_code = 0;
+                pdata.high_watermark = 9;
+                pdata.last_stable_offset = 9;
+                pdata.log_start_offset = 5;
+                pdata.records = Some(stored.unwrap_or_else(fake_log));
+                let mut tresp = FetchableTopicResponse::default();
+                tresp.topic = TOPIC.into();
+                tresp.partitions = vec![pdata];
+                let mut resp = FetchResponse::default();
+                resp.responses = vec![tresp];
                 let mut buf = BytesMut::new();
                 resp.encode(&mut buf, api_version).unwrap();
                 buf.freeze()
@@ -286,20 +283,16 @@ async fn serve_conn(
                     -1 => 9, // latest: the log end
                     other => panic!("fake broker got list offsets timestamp {other}"),
                 };
-                let resp = ListOffsetsResponse {
-                    topics: vec![ListOffsetsTopicResponse {
-                        name: TOPIC.into(),
-                        partitions: vec![ListOffsetsPartitionResponse {
-                            partition_index: partition.partition_index,
-                            error_code: 0,
-                            timestamp: -1,
-                            offset,
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                };
+                let mut presp = ListOffsetsPartitionResponse::default();
+                presp.partition_index = partition.partition_index;
+                presp.error_code = 0;
+                presp.timestamp = -1;
+                presp.offset = offset;
+                let mut tresp = ListOffsetsTopicResponse::default();
+                tresp.name = TOPIC.into();
+                tresp.partitions = vec![presp];
+                let mut resp = ListOffsetsResponse::default();
+                resp.topics = vec![tresp];
                 let mut buf = BytesMut::new();
                 resp.encode(&mut buf, api_version).unwrap();
                 buf.freeze()
@@ -315,13 +308,11 @@ async fn serve_conn(
                     .get(COORDINATOR as usize)
                     .unwrap_or_else(|| endpoints.last().unwrap());
                 let (host, port) = coord.1.rsplit_once(':').unwrap();
-                let resp = FindCoordinatorResponse {
-                    error_code: 0,
-                    node_id: coord.0,
-                    host: host.into(),
-                    port: port.parse().unwrap(),
-                    ..Default::default()
-                };
+                let mut resp = FindCoordinatorResponse::default();
+                resp.error_code = 0;
+                resp.node_id = coord.0;
+                resp.host = host.into();
+                resp.port = port.parse().unwrap();
                 let mut buf = BytesMut::new();
                 resp.encode(&mut buf, api_version).unwrap();
                 buf.freeze()
@@ -340,18 +331,14 @@ async fn serve_conn(
                     (req.group_id.clone(), topic.name.clone(), p.partition_index),
                     (p.committed_offset, node_id),
                 );
-                let resp = OffsetCommitResponse {
-                    topics: vec![OffsetCommitResponseTopic {
-                        name: topic.name.clone(),
-                        partitions: vec![OffsetCommitResponsePartition {
-                            partition_index: p.partition_index,
-                            error_code: 0,
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                };
+                let mut presp = OffsetCommitResponsePartition::default();
+                presp.partition_index = p.partition_index;
+                presp.error_code = 0;
+                let mut tresp = OffsetCommitResponseTopic::default();
+                tresp.name = topic.name.clone();
+                tresp.partitions = vec![presp];
+                let mut resp = OffsetCommitResponse::default();
+                resp.topics = vec![tresp];
                 let mut buf = BytesMut::new();
                 resp.encode(&mut buf, api_version).unwrap();
                 buf.freeze()
@@ -369,21 +356,17 @@ async fn serve_conn(
                     .unwrap()
                     .get(&(req.group_id.clone(), topic.name.clone(), partition))
                     .map_or(-1, |(offset, _)| *offset);
-                let resp = OffsetFetchResponse {
-                    topics: vec![OffsetFetchResponseTopic {
-                        name: topic.name.clone(),
-                        partitions: vec![OffsetFetchResponsePartition {
-                            partition_index: partition,
-                            committed_offset: committed,
-                            committed_leader_epoch: -1,
-                            metadata: Some(String::new()),
-                            error_code: 0,
-                            ..Default::default()
-                        }],
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                };
+                let mut presp = OffsetFetchResponsePartition::default();
+                presp.partition_index = partition;
+                presp.committed_offset = committed;
+                presp.committed_leader_epoch = -1;
+                presp.metadata = Some(String::new());
+                presp.error_code = 0;
+                let mut tresp = OffsetFetchResponseTopic::default();
+                tresp.name = topic.name.clone();
+                tresp.partitions = vec![presp];
+                let mut resp = OffsetFetchResponse::default();
+                resp.topics = vec![tresp];
                 let mut buf = BytesMut::new();
                 resp.encode(&mut buf, api_version).unwrap();
                 buf.freeze()
@@ -399,33 +382,32 @@ async fn serve_conn(
                 let mut state = group.lock().unwrap();
                 let resp = if req.member_id.is_empty() {
                     state.next_member += 1;
-                    JoinGroupResponse {
-                        error_code: 79, // MEMBER_ID_REQUIRED
-                        member_id: format!("member-{}", state.next_member),
-                        ..Default::default()
-                    }
+                    let mut resp = JoinGroupResponse::default();
+                    resp.error_code = 79; // MEMBER_ID_REQUIRED
+                    resp.member_id = format!("member-{}", state.next_member);
+                    resp
                 } else {
                     state.rebalancing = false;
                     state.generation += 1;
                     state.members =
                         vec![(req.member_id.clone(), req.protocols[0].metadata.clone())];
-                    JoinGroupResponse {
-                        error_code: 0,
-                        generation_id: state.generation,
-                        protocol_name: Some("range".into()),
-                        leader: req.member_id.clone(),
-                        member_id: req.member_id.clone(),
-                        members: state
-                            .members
-                            .iter()
-                            .map(|(id, meta)| JoinGroupResponseMember {
-                                member_id: id.clone(),
-                                metadata: meta.clone(),
-                                ..Default::default()
-                            })
-                            .collect(),
-                        ..Default::default()
-                    }
+                    let mut resp = JoinGroupResponse::default();
+                    resp.error_code = 0;
+                    resp.generation_id = state.generation;
+                    resp.protocol_name = Some("range".into());
+                    resp.leader = req.member_id.clone();
+                    resp.member_id = req.member_id.clone();
+                    resp.members = state
+                        .members
+                        .iter()
+                        .map(|(id, meta)| {
+                            let mut member = JoinGroupResponseMember::default();
+                            member.member_id = id.clone();
+                            member.metadata = meta.clone();
+                            member
+                        })
+                        .collect();
+                    resp
                 };
                 let mut buf = BytesMut::new();
                 resp.encode(&mut buf, api_version).unwrap();
@@ -442,15 +424,13 @@ async fn serve_conn(
                         .assignments
                         .insert(a.member_id.clone(), a.assignment.clone());
                 }
-                let resp = SyncGroupResponse {
-                    error_code: 0,
-                    assignment: state
-                        .assignments
-                        .get(&req.member_id)
-                        .cloned()
-                        .unwrap_or_default(),
-                    ..Default::default()
-                };
+                let mut resp = SyncGroupResponse::default();
+                resp.error_code = 0;
+                resp.assignment = state
+                    .assignments
+                    .get(&req.member_id)
+                    .cloned()
+                    .unwrap_or_default();
                 let mut buf = BytesMut::new();
                 resp.encode(&mut buf, api_version).unwrap();
                 buf.freeze()
@@ -461,15 +441,13 @@ async fn serve_conn(
                 let req = HeartbeatRequest::decode(&mut frame, api_version).unwrap();
                 let state = group.lock().unwrap();
                 let known = state.members.iter().any(|(id, _)| *id == req.member_id);
-                let resp = HeartbeatResponse {
-                    error_code: if !known {
-                        25 // UNKNOWN_MEMBER_ID
-                    } else if state.rebalancing {
-                        27 // REBALANCE_IN_PROGRESS
-                    } else {
-                        0
-                    },
-                    ..Default::default()
+                let mut resp = HeartbeatResponse::default();
+                resp.error_code = if !known {
+                    25 // UNKNOWN_MEMBER_ID
+                } else if state.rebalancing {
+                    27 // REBALANCE_IN_PROGRESS
+                } else {
+                    0
                 };
                 let mut buf = BytesMut::new();
                 resp.encode(&mut buf, api_version).unwrap();
@@ -489,10 +467,8 @@ async fn serve_conn(
             other => panic!("fake broker got api key {other}"),
         };
 
-        let resp_header = ResponseHeader {
-            correlation_id: header.correlation_id,
-            unknown_tagged_fields: Vec::new(),
-        };
+        let mut resp_header = ResponseHeader::default();
+        resp_header.correlation_id = header.correlation_id;
         let mut out = BytesMut::new();
         out.put_i32(0);
         resp_header
@@ -511,29 +487,24 @@ async fn serve_conn(
 }
 
 fn config_for(cluster: &FakeCluster) -> ClientConfig {
-    ClientConfig {
-        bootstrap_servers: vec![cluster.endpoints[0].1.clone()],
-        client_id: "odradek".into(),
-        ..Default::default()
-    }
+    let mut config = ClientConfig::default();
+    config.bootstrap_servers = vec![cluster.endpoints[0].1.clone()];
+    config.client_id = "odradek".into();
+    config
 }
 
 fn probe_produce_body(partition: i32, version: i16) -> Bytes {
     use odradek_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
-    let req = ProduceRequest {
-        acks: -1,
-        timeout_ms: 5_000,
-        topic_data: vec![TopicProduceData {
-            name: TOPIC.into(),
-            partition_data: vec![PartitionProduceData {
-                index: partition,
-                records: Some(Bytes::new()),
-                ..Default::default()
-            }],
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
+    let mut partition_data = PartitionProduceData::default();
+    partition_data.index = partition;
+    partition_data.records = Some(Bytes::new());
+    let mut topic_data = TopicProduceData::default();
+    topic_data.name = TOPIC.into();
+    topic_data.partition_data = vec![partition_data];
+    let mut req = ProduceRequest::default();
+    req.acks = -1;
+    req.timeout_ms = 5_000;
+    req.topic_data = vec![topic_data];
     let mut body = BytesMut::new();
     req.encode(&mut body, version).unwrap();
     body.freeze()
@@ -673,13 +644,9 @@ async fn enqueue_batches_until_flush_or_size_trigger() {
 
     let fake = spawn_fake_cluster(3, &[]).await;
     let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
-    let mut producer = Producer::with_config(
-        cluster,
-        ProducerConfig {
-            batch_max_bytes: 200,
-            ..Default::default()
-        },
-    );
+    let mut producer_config = ProducerConfig::default();
+    producer_config.batch_max_bytes = 200;
+    let mut producer = Producer::with_config(cluster, producer_config);
     let record = |v: &'static str| Record {
         value: Some(Bytes::from_static(v.as_bytes())),
         ..Default::default()
@@ -725,6 +692,12 @@ async fn enqueue_batches_until_flush_or_size_trigger() {
 }
 
 #[tokio::test]
+#[cfg(all(
+    feature = "gzip",
+    feature = "lz4",
+    feature = "snappy",
+    feature = "zstd"
+))]
 async fn compressed_batches_roundtrip_end_to_end() {
     use odradek_client::{Consumer, Producer, ProducerConfig};
     use odradek_protocol::records::{Compression, Record, decode_set};
@@ -737,13 +710,9 @@ async fn compressed_batches_roundtrip_end_to_end() {
     ] {
         let fake = spawn_fake_cluster(1, &[]).await;
         let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
-        let mut producer = Producer::with_config(
-            cluster,
-            ProducerConfig {
-                compression: codec,
-                ..Default::default()
-            },
-        );
+        let mut producer_config = ProducerConfig::default();
+        producer_config.compression = codec;
+        let mut producer = Producer::with_config(cluster, producer_config);
         for i in 0..3 {
             producer
                 .enqueue(
@@ -891,11 +860,9 @@ async fn bootstrap_falls_through_dead_servers() {
     let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dead_addr = dead.local_addr().unwrap().to_string();
     drop(dead);
-    let config = ClientConfig {
-        bootstrap_servers: vec![dead_addr, fake.endpoints[0].1.clone()],
-        client_id: "odradek".into(),
-        ..Default::default()
-    };
+    let mut config = ClientConfig::default();
+    config.bootstrap_servers = vec![dead_addr, fake.endpoints[0].1.clone()];
+    config.client_id = "odradek".into();
     let mut cluster = Cluster::connect(config).await.unwrap();
     cluster.refresh_metadata(&[TOPIC]).await.unwrap();
     assert_eq!(cluster.brokers().count(), 1);

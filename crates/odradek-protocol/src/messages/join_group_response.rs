@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `JoinGroupResponse`, versions 0-9.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct JoinGroupResponse {
     /// The duration in milliseconds for which the request was throttled due to a quota violation, or zero if the request did not violate any quota.
     pub throttle_time_ms: i32,
@@ -191,6 +192,7 @@ impl JoinGroupResponse {
 
 /// `JoinGroupResponseMember` (nested in [`JoinGroupResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct JoinGroupResponseMember {
     /// The group member ID.
     pub member_id: String,

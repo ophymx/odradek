@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `ListOffsetsResponse`, versions 1-10.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ListOffsetsResponse {
     /// The duration in milliseconds for which the request was throttled due to a quota violation, or zero if the request did not violate any quota.
     pub throttle_time_ms: i32,
@@ -98,6 +99,7 @@ impl ListOffsetsResponse {
 
 /// `ListOffsetsTopicResponse` (nested in [`ListOffsetsResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ListOffsetsTopicResponse {
     /// The topic name.
     pub name: String,
@@ -171,6 +173,7 @@ impl ListOffsetsTopicResponse {
 
 /// `ListOffsetsPartitionResponse` (nested in [`ListOffsetsResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ListOffsetsPartitionResponse {
     /// The partition index.
     pub partition_index: i32,

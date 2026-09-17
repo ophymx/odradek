@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `OffsetFetchResponse`, versions 1-10.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct OffsetFetchResponse {
     /// The duration in milliseconds for which the request was throttled due to a quota violation, or zero if the request did not violate any quota.
     pub throttle_time_ms: i32,
@@ -143,6 +144,7 @@ impl OffsetFetchResponse {
 
 /// `OffsetFetchResponseTopic` (nested in [`OffsetFetchResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct OffsetFetchResponseTopic {
     /// The topic name.
     pub name: String,
@@ -224,6 +226,7 @@ impl OffsetFetchResponseTopic {
 
 /// `OffsetFetchResponsePartition` (nested in [`OffsetFetchResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct OffsetFetchResponsePartition {
     /// The partition index.
     pub partition_index: i32,
@@ -318,6 +321,7 @@ impl OffsetFetchResponsePartition {
 
 /// `OffsetFetchResponseGroup` (nested in [`OffsetFetchResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct OffsetFetchResponseGroup {
     /// The group ID.
     pub group_id: String,
@@ -408,6 +412,7 @@ impl OffsetFetchResponseGroup {
 
 /// `OffsetFetchResponseTopics` (nested in [`OffsetFetchResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct OffsetFetchResponseTopics {
     /// The topic name.
     pub name: String,
@@ -498,6 +503,7 @@ impl OffsetFetchResponseTopics {
 
 /// `OffsetFetchResponsePartitions` (nested in [`OffsetFetchResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct OffsetFetchResponsePartitions {
     /// The partition index.
     pub partition_index: i32,

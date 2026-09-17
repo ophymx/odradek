@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `ProduceRequest`, versions 3-13.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ProduceRequest {
     /// The transactional ID, or null if the producer is not transactional.
     pub transactional_id: Option<String>,
@@ -112,6 +113,7 @@ impl ProduceRequest {
 
 /// `TopicProduceData` (nested in [`ProduceRequest`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct TopicProduceData {
     /// The topic name.
     pub name: String,
@@ -198,6 +200,7 @@ impl TopicProduceData {
 
 /// `PartitionProduceData` (nested in [`ProduceRequest`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct PartitionProduceData {
     /// The partition index.
     pub index: i32,

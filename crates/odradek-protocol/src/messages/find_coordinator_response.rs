@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `FindCoordinatorResponse`, versions 0-6.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct FindCoordinatorResponse {
     /// The duration in milliseconds for which the request was throttled due to a quota violation, or zero if the request did not violate any quota.
     pub throttle_time_ms: i32,
@@ -172,6 +173,7 @@ impl FindCoordinatorResponse {
 
 /// `Coordinator` (nested in [`FindCoordinatorResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct Coordinator {
     /// The coordinator key.
     pub key: String,

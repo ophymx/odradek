@@ -28,6 +28,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `ProduceResponse`, versions 3-13.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ProduceResponse {
     /// Each produce response.
     pub responses: Vec<TopicProduceResponse>,
@@ -152,6 +153,7 @@ impl ProduceResponse {
 
 /// `TopicProduceResponse` (nested in [`ProduceResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct TopicProduceResponse {
     /// The topic name.
     pub name: String,
@@ -238,6 +240,7 @@ impl TopicProduceResponse {
 
 /// `PartitionProduceResponse` (nested in [`ProduceResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct PartitionProduceResponse {
     /// The partition index.
     pub index: i32,
@@ -389,6 +392,7 @@ impl PartitionProduceResponse {
 
 /// `BatchIndexAndErrorMessage` (nested in [`ProduceResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct BatchIndexAndErrorMessage {
     /// The batch index of the record that caused the batch to be dropped.
     pub batch_index: i32,
@@ -456,6 +460,7 @@ impl BatchIndexAndErrorMessage {
 
 /// `LeaderIdAndEpoch` (nested in [`ProduceResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct LeaderIdAndEpoch {
     /// The ID of the current leader or -1 if the leader is unknown.
     pub leader_id: i32,
@@ -506,6 +511,7 @@ impl LeaderIdAndEpoch {
 
 /// `NodeEndpoint` (nested in [`ProduceResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct NodeEndpoint {
     /// The ID of the associated node.
     pub node_id: i32,

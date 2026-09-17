@@ -4,6 +4,7 @@ use odradek_protocol::{DecodeError, EncodeError, ErrorCode};
 
 /// Errors surfaced by the client.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ClientError {
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),

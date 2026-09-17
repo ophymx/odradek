@@ -28,6 +28,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `FetchResponse`, versions 4-18.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct FetchResponse {
     /// The duration in milliseconds for which the request was throttled due to a quota violation, or zero if the request did not violate any quota.
     pub throttle_time_ms: i32,
@@ -170,6 +171,7 @@ impl FetchResponse {
 
 /// `FetchableTopicResponse` (nested in [`FetchResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct FetchableTopicResponse {
     /// The topic name.
     pub topic: String,
@@ -256,6 +258,7 @@ impl FetchableTopicResponse {
 
 /// `PartitionData` (nested in [`FetchResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct PartitionData {
     /// The partition index.
     pub partition_index: i32,
@@ -462,6 +465,7 @@ impl PartitionData {
 
 /// `EpochEndOffset` (nested in [`FetchResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct EpochEndOffset {
     /// The largest epoch.
     pub epoch: i32,
@@ -512,6 +516,7 @@ impl EpochEndOffset {
 
 /// `LeaderIdAndEpoch` (nested in [`FetchResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct LeaderIdAndEpoch {
     /// The ID of the current leader or -1 if the leader is unknown.
     pub leader_id: i32,
@@ -562,6 +567,7 @@ impl LeaderIdAndEpoch {
 
 /// `SnapshotId` (nested in [`FetchResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct SnapshotId {
     /// The end offset of the epoch.
     pub end_offset: i64,
@@ -604,6 +610,7 @@ impl SnapshotId {
 
 /// `AbortedTransaction` (nested in [`FetchResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct AbortedTransaction {
     /// The producer id associated with the aborted transaction.
     pub producer_id: i64,
@@ -646,6 +653,7 @@ impl AbortedTransaction {
 
 /// `NodeEndpoint` (nested in [`FetchResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct NodeEndpoint {
     /// The ID of the associated node.
     pub node_id: i32,

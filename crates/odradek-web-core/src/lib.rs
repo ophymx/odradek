@@ -34,6 +34,6 @@ pub mod source;
 pub use event::{Event, Filter, Position, TopicPosition};
 pub use hub::{Hub, TopicSubscription};
 pub use pump::{HubError, PumpConfig, PumpHandle, Subscription};
-pub use source::{
-    KafkaSource, KafkaSourceFactory, RecordSource, SourceBatch, SourceError, SourceFactory,
-};
+#[cfg(feature = "kafka")]
+pub use source::{KafkaSource, KafkaSourceFactory};
+pub use source::{RecordSource, SourceBatch, SourceError, SourceFactory};

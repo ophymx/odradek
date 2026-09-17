@@ -20,11 +20,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "localhost:9092".into());
-    let config = ClientConfig {
-        bootstrap_servers: vec![bootstrap],
-        client_id: "odradek-group-example".into(),
-        ..Default::default()
-    };
+    let mut config = ClientConfig::default();
+    config.bootstrap_servers = vec![bootstrap];
+    config.client_id = "odradek-group-example".into();
     let topic = format!(
         "odradek-group-{}-{}",
         std::process::id(),
@@ -112,11 +110,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn group_config() -> GroupConfig {
-    GroupConfig {
-        session_timeout_ms: 10_000,
-        rebalance_timeout_ms: 30_000,
-        ..Default::default()
-    }
+    let mut config = GroupConfig::default();
+    config.session_timeout_ms = 10_000;
+    config.rebalance_timeout_ms = 30_000;
+    config
 }
 
 fn partition_count(m: &GroupMember) -> usize {
@@ -126,16 +123,13 @@ fn partition_count(m: &GroupMember) -> usize {
 async fn create_topic(cluster: &Cluster, topic: &str) -> Result<(), Box<dyn std::error::Error>> {
     let broker = cluster.bootstrap_broker();
     let version = broker.ranges.pick(CreateTopicsRequest::API_KEY, (2, 7))?;
-    let request = CreateTopicsRequest {
-        topics: vec![CreatableTopic {
-            name: topic.to_owned(),
-            num_partitions: PARTITIONS,
-            replication_factor: 1,
-            ..Default::default()
-        }],
-        timeout_ms: 30_000,
-        ..Default::default()
-    };
+    let mut creatable = CreatableTopic::default();
+    creatable.name = topic.to_owned();
+    creatable.num_partitions = PARTITIONS;
+    creatable.replication_factor = 1;
+    let mut request = CreateTopicsRequest::default();
+    request.topics = vec![creatable];
+    request.timeout_ms = 30_000;
     let mut body = BytesMut::new();
     request.encode(&mut body, version)?;
     let mut resp = broker

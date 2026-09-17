@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `SyncGroupResponse`, versions 0-5.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct SyncGroupResponse {
     /// The duration in milliseconds for which the request was throttled due to a quota violation, or zero if the request did not violate any quota.
     pub throttle_time_ms: i32,

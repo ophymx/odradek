@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `ListOffsetsRequest`, versions 1-10.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ListOffsetsRequest {
     /// The broker ID of the requester, or -1 if this request is being made by a normal consumer.
     pub replica_id: i32,
@@ -112,6 +113,7 @@ impl ListOffsetsRequest {
 
 /// `ListOffsetsTopic` (nested in [`ListOffsetsRequest`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ListOffsetsTopic {
     /// The topic name.
     pub name: String,
@@ -185,6 +187,7 @@ impl ListOffsetsTopic {
 
 /// `ListOffsetsPartition` (nested in [`ListOffsetsRequest`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ListOffsetsPartition {
     /// The partition index.
     pub partition_index: i32,

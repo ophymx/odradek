@@ -21,6 +21,7 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Errors while exchanging raw frames with the subject.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum WireError {
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),

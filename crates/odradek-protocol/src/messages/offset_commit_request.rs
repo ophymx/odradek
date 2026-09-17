@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `OffsetCommitRequest`, versions 2-10.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct OffsetCommitRequest {
     /// The unique group identifier.
     pub group_id: String,
@@ -155,6 +156,7 @@ impl OffsetCommitRequest {
 
 /// `OffsetCommitRequestTopic` (nested in [`OffsetCommitRequest`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct OffsetCommitRequestTopic {
     /// The topic name.
     pub name: String,
@@ -241,6 +243,7 @@ impl OffsetCommitRequestTopic {
 
 /// `OffsetCommitRequestPartition` (nested in [`OffsetCommitRequest`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct OffsetCommitRequestPartition {
     /// The partition index.
     pub partition_index: i32,

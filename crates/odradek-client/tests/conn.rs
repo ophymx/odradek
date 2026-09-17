@@ -39,10 +39,8 @@ async fn read_request(stream: &mut TcpStream) -> Request {
 async fn write_response(stream: &mut TcpStream, req: &RequestHeader, body: &[u8]) {
     let header_version =
         response_header_version(req.request_api_key, req.request_api_version).unwrap();
-    let header = ResponseHeader {
-        correlation_id: req.correlation_id,
-        unknown_tagged_fields: Vec::new(),
-    };
+    let mut header = ResponseHeader::default();
+    header.correlation_id = req.correlation_id;
     let mut frame = BytesMut::new();
     frame.put_i32(0);
     header.encode(&mut frame, header_version).unwrap();
@@ -53,19 +51,18 @@ async fn write_response(stream: &mut TcpStream, req: &RequestHeader, body: &[u8]
 }
 
 fn api_versions_body(version: i16, error_code: i16, keys: &[(i16, i16, i16)]) -> Bytes {
-    let resp = ApiVersionsResponse {
-        error_code,
-        api_keys: keys
-            .iter()
-            .map(|&(api_key, min_version, max_version)| ApiVersion {
-                api_key,
-                min_version,
-                max_version,
-                ..Default::default()
-            })
-            .collect(),
-        ..Default::default()
-    };
+    let mut resp = ApiVersionsResponse::default();
+    resp.error_code = error_code;
+    resp.api_keys = keys
+        .iter()
+        .map(|&(api_key, min_version, max_version)| {
+            let mut v = ApiVersion::default();
+            v.api_key = api_key;
+            v.min_version = min_version;
+            v.max_version = max_version;
+            v
+        })
+        .collect();
     let mut body = BytesMut::new();
     resp.encode(&mut body, version).unwrap();
     body.freeze()
@@ -161,10 +158,8 @@ async fn responses_match_by_correlation_id_out_of_order() {
                 MetadataRequest::decode(&mut req.body.clone(), req.header.request_api_version)
                     .unwrap();
             let topic = parsed.topics.unwrap()[0].name.clone();
-            let resp = MetadataResponse {
-                cluster_id: topic,
-                ..Default::default()
-            };
+            let mut resp = MetadataResponse::default();
+            resp.cluster_id = topic;
             let mut body = BytesMut::new();
             resp.encode(&mut body, req.header.request_api_version)
                 .unwrap();
@@ -179,15 +174,11 @@ async fn responses_match_by_correlation_id_out_of_order() {
         let conn = conn.clone();
         let name = name.to_owned();
         async move {
-            let req = MetadataRequest {
-                topics: Some(vec![
-                    odradek_protocol::messages::metadata_request::MetadataRequestTopic {
-                        name: Some(name),
-                        ..Default::default()
-                    },
-                ]),
-                ..Default::default()
-            };
+            let mut topic =
+                odradek_protocol::messages::metadata_request::MetadataRequestTopic::default();
+            topic.name = Some(name);
+            let mut req = MetadataRequest::default();
+            req.topics = Some(vec![topic]);
             let mut body = BytesMut::new();
             req.encode(&mut body, 12).unwrap();
             let mut resp = conn.request(3, 12, &body).await.unwrap();

@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `ResponseHeader`, versions 0-1.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ResponseHeader {
     /// The correlation ID of this response.
     pub correlation_id: i32,

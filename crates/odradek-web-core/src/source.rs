@@ -6,6 +6,7 @@
 
 use std::future::Future;
 
+#[cfg(feature = "kafka")]
 use odradek_client::{ClientConfig, Cluster, Consumer};
 
 use crate::event::Event;
@@ -67,17 +68,20 @@ pub trait SourceFactory: Send + Sync + 'static {
 }
 
 /// A [`RecordSource`] over a real Kafka cluster.
+#[cfg(feature = "kafka")]
 #[derive(Debug)]
 pub struct KafkaSource {
     consumer: Consumer,
 }
 
+#[cfg(feature = "kafka")]
 impl KafkaSource {
     pub fn new(consumer: Consumer) -> KafkaSource {
         KafkaSource { consumer }
     }
 }
 
+#[cfg(feature = "kafka")]
 impl RecordSource for KafkaSource {
     async fn fetch(
         &mut self,
@@ -125,11 +129,13 @@ impl RecordSource for KafkaSource {
 }
 
 /// Dials a fresh Kafka connection per pump.
+#[cfg(feature = "kafka")]
 #[derive(Debug, Clone)]
 pub struct KafkaSourceFactory {
     pub config: ClientConfig,
 }
 
+#[cfg(feature = "kafka")]
 impl SourceFactory for KafkaSourceFactory {
     type Source = KafkaSource;
 

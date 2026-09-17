@@ -20,6 +20,10 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: lean client builds (no tls/sasl/codecs)
+        run: cargo check -p odradek-client --no-default-features
+      - name: lean web transports build (no kafka)
+        run: cargo check -p odradek-web-sse -p odradek-web-ws --no-default-features
       - name: generated code is in sync with the schemas
         # codegen output is committed formatted, so format before diffing
         run: cargo xtask codegen && cargo fmt && git diff --exit-code

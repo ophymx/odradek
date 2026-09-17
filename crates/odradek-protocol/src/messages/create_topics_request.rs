@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `CreateTopicsRequest`, versions 2-7.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct CreateTopicsRequest {
     /// The topics to create.
     pub topics: Vec<CreatableTopic>,
@@ -99,6 +100,7 @@ impl CreateTopicsRequest {
 
 /// `CreatableTopic` (nested in [`CreateTopicsRequest`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct CreatableTopic {
     /// The topic name.
     pub name: String,
@@ -210,6 +212,7 @@ impl CreatableTopic {
 
 /// `CreatableReplicaAssignment` (nested in [`CreateTopicsRequest`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct CreatableReplicaAssignment {
     /// The partition index.
     pub partition_index: i32,
@@ -275,6 +278,7 @@ impl CreatableReplicaAssignment {
 
 /// `CreatableTopicConfig` (nested in [`CreateTopicsRequest`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct CreatableTopicConfig {
     /// The configuration name.
     pub name: String,

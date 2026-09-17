@@ -27,7 +27,9 @@ pub mod error;
 pub mod group;
 pub mod negotiate;
 pub mod producer;
+#[cfg(feature = "sasl")]
 pub mod sasl;
+#[cfg(feature = "tls")]
 pub mod tls;
 
 pub use cluster::Cluster;
@@ -38,20 +40,25 @@ pub use group::{GroupConfig, GroupMember, HeartbeatStatus};
 pub use negotiate::ApiVersionRanges;
 pub use odradek_protocol as protocol;
 pub use producer::{Delivery, Producer, ProducerConfig};
+#[cfg(feature = "sasl")]
 pub use sasl::{Mechanism, SaslConfig};
+#[cfg(feature = "tls")]
 pub use tls::Tls;
 
 /// Configuration shared by every entry point of the client.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ClientConfig {
     /// Initial brokers used to bootstrap cluster metadata, as `host:port`.
     pub bootstrap_servers: Vec<String>,
     /// Client id reported to the broker in every request header.
     pub client_id: String,
     /// TLS for every broker connection (default: plaintext).
+    #[cfg(feature = "tls")]
     pub tls: Tls,
     /// SASL credentials, authenticated on every connection right after
     /// version negotiation (default: none).
+    #[cfg(feature = "sasl")]
     pub sasl: Option<SaslConfig>,
 }
 
@@ -60,7 +67,9 @@ impl Default for ClientConfig {
         Self {
             bootstrap_servers: vec!["localhost:9092".to_owned()],
             client_id: "odradek".to_owned(),
+            #[cfg(feature = "tls")]
             tls: Tls::None,
+            #[cfg(feature = "sasl")]
             sasl: None,
         }
     }

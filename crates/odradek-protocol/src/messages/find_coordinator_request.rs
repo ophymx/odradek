@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `FindCoordinatorRequest`, versions 0-6.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct FindCoordinatorRequest {
     /// The coordinator key.
     pub key: String,

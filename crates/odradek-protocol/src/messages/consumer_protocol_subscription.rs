@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `ConsumerProtocolSubscription`, versions 0-3.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ConsumerProtocolSubscription {
     /// The topics that the member wants to consume.
     pub topics: Vec<String>,
@@ -176,6 +177,7 @@ impl ConsumerProtocolSubscription {
 
 /// `TopicPartition` (nested in [`ConsumerProtocolSubscription`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct TopicPartition {
     /// The topic name.
     pub topic: String,

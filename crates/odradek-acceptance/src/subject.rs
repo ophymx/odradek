@@ -146,11 +146,12 @@ fn advertised_keys() -> Vec<ApiVersion> {
         (19, 2, 7),
     ]
     .into_iter()
-    .map(|(api_key, min_version, max_version)| ApiVersion {
-        api_key,
-        min_version,
-        max_version,
-        ..Default::default()
+    .map(|(api_key, min_version, max_version)| {
+        let mut v = ApiVersion::default();
+        v.api_key = api_key;
+        v.min_version = min_version;
+        v.max_version = max_version;
+        v
     })
     .collect()
 }
@@ -237,10 +238,8 @@ fn frame_response(
     body: impl FnOnce(&mut BytesMut),
     trailing_garbage: bool,
 ) -> Option<BytesMut> {
-    let resp_header = ResponseHeader {
-        correlation_id,
-        unknown_tagged_fields: Vec::new(),
-    };
+    let mut resp_header = ResponseHeader::default();
+    resp_header.correlation_id = correlation_id;
     let mut out = BytesMut::new();
     out.put_i32(0);
     resp_header.encode(&mut out, header_version).ok()?;
@@ -289,11 +288,9 @@ fn api_versions_exchange(mut frame: Bytes, api_version: i16, faults: &[Fault]) -
         (error_code, encode_at)
     };
 
-    let resp = ApiVersionsResponse {
-        error_code,
-        api_keys: keys,
-        ..Default::default()
-    };
+    let mut resp = ApiVersionsResponse::default();
+    resp.error_code = error_code;
+    resp.api_keys = keys;
     // ApiVersions responses always use header v0 (the negotiation
     // bootstrap quirk); the fault violates exactly that.
     let resp_header_version = if has(Fault::FlexibleHeaderOnV3) && supported && api_version >= 3 {
@@ -331,30 +328,26 @@ fn metadata_exchange(
     let brokers = if has(Fault::MetadataEmptyBrokers) {
         Vec::new()
     } else {
-        vec![MetadataResponseBroker {
-            node_id: 1,
-            host: "127.0.0.1".into(),
-            port: local_port,
-            ..Default::default()
-        }]
+        let mut broker = MetadataResponseBroker::default();
+        broker.node_id = 1;
+        broker.host = "127.0.0.1".into();
+        broker.port = local_port;
+        vec![broker]
     };
     // The subject hosts no topics: every response names no topics unless
     // the fault invents one the client never asked for.
     let topics = if has(Fault::MetadataUnrequestedTopic) && request.topics == Some(Vec::new()) {
-        vec![MetadataResponseTopic {
-            name: Some("phantom".into()),
-            ..Default::default()
-        }]
+        let mut topic = MetadataResponseTopic::default();
+        topic.name = Some("phantom".into());
+        vec![topic]
     } else {
         Vec::new()
     };
-    let resp = MetadataResponse {
-        brokers,
-        cluster_id: Some("odradek-reference".into()),
-        controller_id: 1,
-        topics,
-        ..Default::default()
-    };
+    let mut resp = MetadataResponse::default();
+    resp.brokers = brokers;
+    resp.cluster_id = Some("odradek-reference".into());
+    resp.controller_id = 1;
+    resp.topics = topics;
     // Unlike ApiVersions, flexible Metadata responses use header v1; the
     // fault answers with the non-flexible header anyway.
     let resp_header_version = if flexible && !has(Fault::MetadataNonFlexibleHeader) {
@@ -385,25 +378,22 @@ fn create_topics_exchange(
 
     // Every topic creates successfully (log state itself is lazy) and gets
     // an id, so id-addressed produce/fetch can resolve it later.
-    let resp = CreateTopicsResponse {
-        topics: request
-            .topics
-            .iter()
-            .map(|t| {
-                let topic_id = mint_topic_id(&t.name);
-                state.topic_names.insert(topic_id, t.name.clone());
-                CreatableTopicResult {
-                    name: t.name.clone(),
-                    topic_id,
-                    error_code: 0,
-                    num_partitions: t.num_partitions.max(1),
-                    replication_factor: t.replication_factor.max(1),
-                    ..Default::default()
-                }
-            })
-            .collect(),
-        ..Default::default()
-    };
+    let mut resp = CreateTopicsResponse::default();
+    resp.topics = request
+        .topics
+        .iter()
+        .map(|t| {
+            let topic_id = mint_topic_id(&t.name);
+            state.topic_names.insert(topic_id, t.name.clone());
+            let mut result = CreatableTopicResult::default();
+            result.name = t.name.clone();
+            result.topic_id = topic_id;
+            result.error_code = 0;
+            result.num_partitions = t.num_partitions.max(1);
+            result.replication_factor = t.replication_factor.max(1);
+            result
+        })
+        .collect();
     frame_response(
         req_header.correlation_id,
         response_header_version(CreateTopicsRequest::API_KEY, api_version),
@@ -439,13 +429,12 @@ fn produce_exchange(
         let mut partition_responses = Vec::new();
         for partition in &topic.partition_data {
             let (Some(name), false) = (&resolved, refuse_id) else {
-                partition_responses.push(PartitionProduceResponse {
-                    index: partition.index,
-                    error_code: 100, // UNKNOWN_TOPIC_ID
-                    base_offset: -1,
-                    log_append_time_ms: -1,
-                    ..Default::default()
-                });
+                let mut entry = PartitionProduceResponse::default();
+                entry.index = partition.index;
+                entry.error_code = 100; // UNKNOWN_TOPIC_ID
+                entry.base_offset = -1;
+                entry.log_append_time_ms = -1;
+                partition_responses.push(entry);
                 continue;
             };
             let log = state
@@ -465,26 +454,22 @@ fn produce_exchange(
             if faults.contains(&Fault::ProduceWrongBaseOffset) {
                 base_offset += 1;
             }
-            partition_responses.push(PartitionProduceResponse {
-                index: partition.index,
-                error_code: 0,
-                base_offset,
-                log_append_time_ms: -1,
-                log_start_offset: 0,
-                ..Default::default()
-            });
+            let mut entry = PartitionProduceResponse::default();
+            entry.index = partition.index;
+            entry.error_code = 0;
+            entry.base_offset = base_offset;
+            entry.log_append_time_ms = -1;
+            entry.log_start_offset = 0;
+            partition_responses.push(entry);
         }
-        responses.push(TopicProduceResponse {
-            name: topic.name.clone(),
-            topic_id: topic.topic_id,
-            partition_responses,
-            ..Default::default()
-        });
+        let mut topic_resp = TopicProduceResponse::default();
+        topic_resp.name = topic.name.clone();
+        topic_resp.topic_id = topic.topic_id;
+        topic_resp.partition_responses = partition_responses;
+        responses.push(topic_resp);
     }
-    let resp = ProduceResponse {
-        responses,
-        ..Default::default()
-    };
+    let mut resp = ProduceResponse::default();
+    resp.responses = responses;
     frame_response(
         req_header.correlation_id,
         response_header_version(ProduceRequest::API_KEY, api_version),
@@ -520,52 +505,49 @@ fn fetch_exchange(
             if faults.contains(&Fault::FetchWrongTopicId) {
                 echoed_id[0] ^= 0x80;
             }
-            FetchableTopicResponse {
-                topic: topic.topic.clone(),
-                topic_id: echoed_id,
-                partitions: topic
-                    .partitions
-                    .iter()
-                    .map(|p| {
-                        let log = resolved
-                            .as_ref()
-                            .and_then(|name| state.logs.get(&(name.clone(), p.partition)));
-                        match log {
-                            Some(log) => {
-                                let mut bytes = log.bytes.clone();
-                                if faults.contains(&Fault::FetchCorruptBatch) && !bytes.is_empty() {
-                                    let last = bytes.len() - 1;
-                                    bytes[last] ^= 0x01;
-                                }
-                                PartitionData {
-                                    partition_index: p.partition,
-                                    error_code: 0,
-                                    high_watermark: log.next_offset,
-                                    last_stable_offset: log.next_offset,
-                                    log_start_offset: 0,
-                                    records: Some(bytes.freeze()),
-                                    ..Default::default()
-                                }
+            let mut topic_resp = FetchableTopicResponse::default();
+            topic_resp.topic = topic.topic.clone();
+            topic_resp.topic_id = echoed_id;
+            topic_resp.partitions = topic
+                .partitions
+                .iter()
+                .map(|p| {
+                    let log = resolved
+                        .as_ref()
+                        .and_then(|name| state.logs.get(&(name.clone(), p.partition)));
+                    match log {
+                        Some(log) => {
+                            let mut bytes = log.bytes.clone();
+                            if faults.contains(&Fault::FetchCorruptBatch) && !bytes.is_empty() {
+                                let last = bytes.len() - 1;
+                                bytes[last] ^= 0x01;
                             }
-                            None => PartitionData {
-                                partition_index: p.partition,
-                                // Unknown id vs unknown name/partition.
-                                error_code: if topic.topic.is_empty() { 100 } else { 3 },
-                                ..Default::default()
-                            },
+                            let mut data = PartitionData::default();
+                            data.partition_index = p.partition;
+                            data.error_code = 0;
+                            data.high_watermark = log.next_offset;
+                            data.last_stable_offset = log.next_offset;
+                            data.log_start_offset = 0;
+                            data.records = Some(bytes.freeze());
+                            data
                         }
-                    })
-                    .collect(),
-                ..Default::default()
-            }
+                        None => {
+                            let mut data = PartitionData::default();
+                            data.partition_index = p.partition;
+                            // Unknown id vs unknown name/partition.
+                            data.error_code = if topic.topic.is_empty() { 100 } else { 3 };
+                            data
+                        }
+                    }
+                })
+                .collect();
+            topic_resp
         })
         .collect();
-    let resp = FetchResponse {
-        error_code: 0,
-        session_id: 0,
-        responses,
-        ..Default::default()
-    };
+    let mut resp = FetchResponse::default();
+    resp.error_code = 0;
+    resp.session_id = 0;
+    resp.responses = responses;
     frame_response(
         req_header.correlation_id,
         response_header_version(FetchRequest::API_KEY, api_version),

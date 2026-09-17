@@ -28,6 +28,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `FetchRequest`, versions 4-18.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct FetchRequest {
     /// The broker ID of the follower, of -1 if this request is from a consumer.
     pub replica_id: i32,
@@ -263,6 +264,7 @@ impl FetchRequest {
 
 /// `ReplicaState` (nested in [`FetchRequest`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ReplicaState {
     /// The replica ID of the follower, or -1 if this request is from a consumer.
     pub replica_id: i32,
@@ -313,6 +315,7 @@ impl ReplicaState {
 
 /// `FetchTopic` (nested in [`FetchRequest`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct FetchTopic {
     /// The name of the topic to fetch.
     pub topic: String,
@@ -399,6 +402,7 @@ impl FetchTopic {
 
 /// `FetchPartition` (nested in [`FetchRequest`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct FetchPartition {
     /// The partition index.
     pub partition: i32,
@@ -531,6 +535,7 @@ impl FetchPartition {
 
 /// `ForgottenTopic` (nested in [`FetchRequest`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ForgottenTopic {
     /// The topic name.
     pub topic: String,

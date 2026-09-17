@@ -132,13 +132,12 @@ fn advertised_range(keys: &[ApiVersion], api_key: i16) -> Option<(i16, i16)> {
 }
 
 fn header(version: i16, correlation_id: i32) -> RequestHeader {
-    RequestHeader {
-        request_api_key: ApiVersionsRequest::API_KEY,
-        request_api_version: version,
-        correlation_id,
-        client_id: Some(CLIENT_ID.into()),
-        unknown_tagged_fields: Vec::new(),
-    }
+    let mut header = RequestHeader::default();
+    header.request_api_key = ApiVersionsRequest::API_KEY;
+    header.request_api_version = version;
+    header.correlation_id = correlation_id;
+    header.client_id = Some(CLIENT_ID.into());
+    header
 }
 
 /// One ApiVersions exchange; returns the decoded body after validating the
@@ -154,11 +153,9 @@ async fn exchange(
         .await
         .map_err(|e| e.to_string())?;
     let mut body = BytesMut::new();
-    let req = ApiVersionsRequest {
-        client_software_name: "odradek-acceptance".into(),
-        client_software_version: env!("CARGO_PKG_VERSION").into(),
-        unknown_tagged_fields: Vec::new(),
-    };
+    let mut req = ApiVersionsRequest::default();
+    req.client_software_name = "odradek-acceptance".into();
+    req.client_software_version = env!("CARGO_PKG_VERSION").into();
     // Encode the body at the newest shape the schema knows; for a probe of
     // an unknown future version this is the closest well-formed guess.
     req.encode(&mut body, api_version.min(ApiVersionsRequest::MAX_VERSION))
@@ -346,13 +343,11 @@ async fn request_response(
         .ok_or_else(|| format!("no header version known for api {api_key} v{version}"))?;
     let resp_hv = header::response_header_version(api_key, version)
         .expect("request header version implies response header version");
-    let req_header = RequestHeader {
-        request_api_key: api_key,
-        request_api_version: version,
-        correlation_id,
-        client_id: Some(CLIENT_ID.into()),
-        unknown_tagged_fields: Vec::new(),
-    };
+    let mut req_header = RequestHeader::default();
+    req_header.request_api_key = api_key;
+    req_header.request_api_version = version;
+    req_header.correlation_id = correlation_id;
+    req_header.client_id = Some(CLIENT_ID.into());
     let mut frame = conn
         .round_trip(&req_header, req_hv, body)
         .await
@@ -379,24 +374,20 @@ async fn metadata_exchange(
     let mut conn = RawConnection::connect(addr)
         .await
         .map_err(|e| e.to_string())?;
-    let req = MetadataRequest {
-        // An empty (non-null) topics array means "no topics" from v1 on;
-        // the checks only negotiate v1+.
-        topics: Some(Vec::new()),
-        allow_auto_topic_creation: false,
-        ..Default::default()
-    };
+    let mut req = MetadataRequest::default();
+    // An empty (non-null) topics array means "no topics" from v1 on;
+    // the checks only negotiate v1+.
+    req.topics = Some(Vec::new());
+    req.allow_auto_topic_creation = false;
     let mut body = BytesMut::new();
     req.encode(&mut body, version).map_err(|e| e.to_string())?;
 
     let flexible = metadata_request::is_flexible(version);
-    let header = RequestHeader {
-        request_api_key: MetadataRequest::API_KEY,
-        request_api_version: version,
-        correlation_id,
-        client_id: Some(CLIENT_ID.into()),
-        unknown_tagged_fields: Vec::new(),
-    };
+    let mut header = RequestHeader::default();
+    header.request_api_key = MetadataRequest::API_KEY;
+    header.request_api_version = version;
+    header.correlation_id = correlation_id;
+    header.client_id = Some(CLIENT_ID.into());
     let mut frame = conn
         .round_trip(&header, if flexible { 2 } else { 1 }, &body)
         .await
@@ -605,17 +596,14 @@ async fn produce_flow(
     let topic = unique_topic(tag);
 
     // Create the topic.
-    let create = CreateTopicsRequest {
-        topics: vec![CreatableTopic {
-            name: topic.clone(),
-            num_partitions: 1,
-            replication_factor: 1,
-            ..Default::default()
-        }],
-        timeout_ms: 30_000,
-        validate_only: false,
-        ..Default::default()
-    };
+    let mut creatable = CreatableTopic::default();
+    creatable.name = topic.clone();
+    creatable.num_partitions = 1;
+    creatable.replication_factor = 1;
+    let mut create = CreateTopicsRequest::default();
+    create.topics = vec![creatable];
+    create.timeout_ms = 30_000;
+    create.validate_only = false;
     let mut body = BytesMut::new();
     create
         .encode(&mut body, create_version)
@@ -660,29 +648,25 @@ async fn produce_flow(
         .map_err(|e| fail(e.to_string()))?;
     let sent = sent.freeze();
 
-    let produce = ProduceRequest {
-        transactional_id: None,
-        acks: -1,
-        timeout_ms: 10_000,
-        topic_data: vec![TopicProduceData {
-            // v13+ drops the name for the id; encode gates pick per version.
-            name: match addressing {
-                Addressing::Name => topic.clone(),
-                Addressing::TopicId => String::new(),
-            },
-            topic_id: match addressing {
-                Addressing::Name => [0u8; 16],
-                Addressing::TopicId => topic_id,
-            },
-            partition_data: vec![PartitionProduceData {
-                index: 0,
-                records: Some(sent.clone()),
-                ..Default::default()
-            }],
-            ..Default::default()
-        }],
-        ..Default::default()
+    let mut partition_data = PartitionProduceData::default();
+    partition_data.index = 0;
+    partition_data.records = Some(sent.clone());
+    let mut topic_data = TopicProduceData::default();
+    // v13+ drops the name for the id; encode gates pick per version.
+    topic_data.name = match addressing {
+        Addressing::Name => topic.clone(),
+        Addressing::TopicId => String::new(),
     };
+    topic_data.topic_id = match addressing {
+        Addressing::Name => [0u8; 16],
+        Addressing::TopicId => topic_id,
+    };
+    topic_data.partition_data = vec![partition_data];
+    let mut produce = ProduceRequest::default();
+    produce.transactional_id = None;
+    produce.acks = -1;
+    produce.timeout_ms = 10_000;
+    produce.topic_data = vec![topic_data];
     let mut body = BytesMut::new();
     produce
         .encode(&mut body, produce_version)
@@ -782,34 +766,30 @@ async fn run_fetch(
     fetch_version: i16,
     addressing: Addressing,
 ) -> Result<Bytes, String> {
-    let fetch = FetchRequest {
-        max_wait_ms: 500,
-        min_bytes: 1,
-        max_bytes: 8 << 20,
-        session_id: 0,
-        session_epoch: -1, // sessionless full fetch
-        topics: vec![FetchTopic {
-            topic: match addressing {
-                Addressing::Name => produced.topic.clone(),
-                Addressing::TopicId => String::new(),
-            },
-            topic_id: match addressing {
-                Addressing::Name => [0u8; 16],
-                Addressing::TopicId => produced.topic_id,
-            },
-            partitions: vec![FetchPartition {
-                partition: 0,
-                current_leader_epoch: -1,
-                fetch_offset: 0,
-                last_fetched_epoch: -1,
-                log_start_offset: -1,
-                partition_max_bytes: 1 << 20,
-                ..Default::default()
-            }],
-            ..Default::default()
-        }],
-        ..Default::default()
+    let mut fetch_partition = FetchPartition::default();
+    fetch_partition.partition = 0;
+    fetch_partition.current_leader_epoch = -1;
+    fetch_partition.fetch_offset = 0;
+    fetch_partition.last_fetched_epoch = -1;
+    fetch_partition.log_start_offset = -1;
+    fetch_partition.partition_max_bytes = 1 << 20;
+    let mut fetch_topic = FetchTopic::default();
+    fetch_topic.topic = match addressing {
+        Addressing::Name => produced.topic.clone(),
+        Addressing::TopicId => String::new(),
     };
+    fetch_topic.topic_id = match addressing {
+        Addressing::Name => [0u8; 16],
+        Addressing::TopicId => produced.topic_id,
+    };
+    fetch_topic.partitions = vec![fetch_partition];
+    let mut fetch = FetchRequest::default();
+    fetch.max_wait_ms = 500;
+    fetch.min_bytes = 1;
+    fetch.max_bytes = 8 << 20;
+    fetch.session_id = 0;
+    fetch.session_epoch = -1; // sessionless full fetch
+    fetch.topics = vec![fetch_topic];
     let mut body = BytesMut::new();
     fetch
         .encode(&mut body, fetch_version)

@@ -17,12 +17,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: consume <bootstrap> <topic> [partition]")?;
     let partition: i32 = args.next().map_or(Ok(0), |p| p.parse())?;
 
-    let cluster = Cluster::connect(ClientConfig {
-        bootstrap_servers: vec![bootstrap],
-        client_id: "odradek-consume".into(),
-        ..Default::default()
-    })
-    .await?;
+    let mut config = ClientConfig::default();
+    config.bootstrap_servers = vec![bootstrap];
+    config.client_id = "odradek-consume".into();
+    let cluster = Cluster::connect(config).await?;
     let mut consumer = Consumer::new(cluster);
 
     let mut offset = consumer.earliest_offset(&topic, partition).await?;

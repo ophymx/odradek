@@ -122,14 +122,10 @@ async fn filters_apply_to_replay_and_live() {
 #[tokio::test]
 async fn slow_subscriber_loses_nothing() {
     let log = MemoryLog::new();
-    let pump = pump_for(
-        &log,
-        PumpConfig {
-            queue_capacity: 2,
-            ring_capacity: 4, // force catch-up past the ring, from source
-            ..Default::default()
-        },
-    );
+    let mut config = PumpConfig::default();
+    config.queue_capacity = 2;
+    config.ring_capacity = 4; // force catch-up past the ring, from source
+    let pump = pump_for(&log, config);
     let mut sub = pump
         .subscribe(Position::Earliest, Filter::default())
         .await

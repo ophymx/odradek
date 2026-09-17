@@ -15,13 +15,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap = args.next().unwrap_or_else(|| "localhost:9092".into());
     let listen = args.next().unwrap_or_else(|| "127.0.0.1:8080".into());
 
-    let factory = KafkaSourceFactory {
-        config: ClientConfig {
-            bootstrap_servers: vec![bootstrap.clone()],
-            client_id: "odradek-sse".into(),
-            ..Default::default()
-        },
-    };
+    let mut config = ClientConfig::default();
+    config.bootstrap_servers = vec![bootstrap.clone()];
+    config.client_id = "odradek-sse".into();
+    let factory = KafkaSourceFactory { config };
     let app = router(SseState::new(factory, PumpConfig::default()));
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     println!("bridging {bootstrap} on http://{listen}");

@@ -39,11 +39,10 @@ macro_rules! roundtrip {
 
 #[test]
 fn api_versions_request_golden_v3() {
-    let req = ApiVersionsRequest {
-        client_software_name: "odradek".into(),
-        client_software_version: "0.1.0".into(),
-        unknown_tagged_fields: Vec::new(),
-    };
+    let mut req = ApiVersionsRequest::default();
+    req.client_software_name = "odradek".into();
+    req.client_software_version = "0.1.0".into();
+    req.unknown_tagged_fields = Vec::new();
     let bytes = encode(&req, 3, |m, b, v| m.encode(b, v));
     // compact "odradek" (len+1=8) + compact "0.1.0" (len+1=6) + empty tagged section
     let expected = [&[0x08][..], b"odradek", &[0x06], b"0.1.0", &[0x00]].concat();
@@ -61,25 +60,18 @@ fn api_versions_request_v0_is_empty_body() {
 
 #[test]
 fn api_versions_response_roundtrip_all_versions() {
-    let resp = ApiVersionsResponse {
-        error_code: 0,
-        api_keys: vec![
-            ApiVersion {
-                api_key: 0,
-                min_version: 3,
-                max_version: 13,
-                ..Default::default()
-            },
-            ApiVersion {
-                api_key: 18,
-                min_version: 0,
-                max_version: 4,
-                ..Default::default()
-            },
-        ],
-        throttle_time_ms: 0,
-        ..Default::default()
-    };
+    let mut produce_key = ApiVersion::default();
+    produce_key.api_key = 0;
+    produce_key.min_version = 3;
+    produce_key.max_version = 13;
+    let mut api_versions_key = ApiVersion::default();
+    api_versions_key.api_key = 18;
+    api_versions_key.min_version = 0;
+    api_versions_key.max_version = 4;
+    let mut resp = ApiVersionsResponse::default();
+    resp.error_code = 0;
+    resp.api_keys = vec![produce_key, api_versions_key];
+    resp.throttle_time_ms = 0;
     for version in ApiVersionsResponse::MIN_VERSION..=ApiVersionsResponse::MAX_VERSION {
         // throttle_time_ms only exists from v1; keep it default (0) so
         // equality holds across versions.
@@ -89,13 +81,11 @@ fn api_versions_response_roundtrip_all_versions() {
 
 #[test]
 fn unknown_tagged_fields_roundtrip() {
-    let resp = ApiVersionsResponse {
-        unknown_tagged_fields: vec![RawTaggedField {
-            tag: 99, // no known meaning; must survive raw
-            data: Bytes::from_static(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
-        }],
-        ..Default::default()
-    };
+    let mut resp = ApiVersionsResponse::default();
+    resp.unknown_tagged_fields = vec![RawTaggedField {
+        tag: 99, // no known meaning; must survive raw
+        data: Bytes::from_static(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+    }];
     // Flexible version keeps the raw tagged payload byte-for-byte.
     roundtrip!(ApiVersionsResponse, resp, 3);
 }
@@ -104,13 +94,11 @@ fn unknown_tagged_fields_roundtrip() {
 fn known_tagged_fields_materialize() {
     // A raw tag 1 payload (int64 -1) decodes into the materialized field,
     // not into unknown_tagged_fields.
-    let carrier = ApiVersionsResponse {
-        unknown_tagged_fields: vec![RawTaggedField {
-            tag: 1,
-            data: Bytes::from_static(&[0xff; 8]),
-        }],
-        ..Default::default()
-    };
+    let mut carrier = ApiVersionsResponse::default();
+    carrier.unknown_tagged_fields = vec![RawTaggedField {
+        tag: 1,
+        data: Bytes::from_static(&[0xff; 8]),
+    }];
     let bytes = encode(&carrier, 3, |m, b, v| m.encode(b, v));
     let decoded = ApiVersionsResponse::decode(&mut bytes.clone(), 3).unwrap();
     assert_eq!(decoded.finalized_features_epoch, Some(-1));
@@ -124,27 +112,22 @@ fn tagged_struct_fields_roundtrip_mixed_with_unknown() {
     use odradek_protocol::messages::fetch_response::{
         FetchResponse, FetchableTopicResponse, LeaderIdAndEpoch, PartitionData,
     };
-    let resp = FetchResponse {
-        responses: vec![FetchableTopicResponse {
-            topic_id: [7u8; 16],
-            partitions: vec![PartitionData {
-                partition_index: 3,
-                error_code: 6, // NOT_LEADER_OR_FOLLOWER
-                current_leader: Some(LeaderIdAndEpoch {
-                    leader_id: 2,
-                    leader_epoch: 9,
-                    ..Default::default()
-                }),
-                unknown_tagged_fields: vec![RawTaggedField {
-                    tag: 42,
-                    data: Bytes::from_static(b"future"),
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
+    let mut current_leader = LeaderIdAndEpoch::default();
+    current_leader.leader_id = 2;
+    current_leader.leader_epoch = 9;
+    let mut partition = PartitionData::default();
+    partition.partition_index = 3;
+    partition.error_code = 6; // NOT_LEADER_OR_FOLLOWER
+    partition.current_leader = Some(current_leader);
+    partition.unknown_tagged_fields = vec![RawTaggedField {
+        tag: 42,
+        data: Bytes::from_static(b"future"),
+    }];
+    let mut topic_response = FetchableTopicResponse::default();
+    topic_response.topic_id = [7u8; 16];
+    topic_response.partitions = vec![partition];
+    let mut resp = FetchResponse::default();
+    resp.responses = vec![topic_response];
     // v16 also exercises the top-level NodeEndpoints tag staying absent.
     roundtrip!(FetchResponse, resp, 16);
 }
@@ -155,10 +138,8 @@ fn tagged_nullable_string_distinguishes_absent_from_null() {
     // Absent, present-null, and present-value are three different wire
     // shapes; each must round-trip.
     for cluster_id in [None, Some(None), Some(Some("kRaft-cluster".to_owned()))] {
-        let req = FetchRequest {
-            cluster_id: cluster_id.clone(),
-            ..Default::default()
-        };
+        let mut req = FetchRequest::default();
+        req.cluster_id = cluster_id.clone();
         roundtrip!(FetchRequest, req, 13);
     }
 }
@@ -167,13 +148,11 @@ fn tagged_nullable_string_distinguishes_absent_from_null() {
 fn tag_data_with_trailing_bytes_is_rejected() {
     // Tag 3 of ApiVersionsResponse is a bool (1 byte); a 2-byte payload
     // must error, not silently drop bytes.
-    let resp = ApiVersionsResponse {
-        unknown_tagged_fields: vec![RawTaggedField {
-            tag: 3,
-            data: Bytes::from_static(&[0x01, 0x00]),
-        }],
-        ..Default::default()
-    };
+    let mut resp = ApiVersionsResponse::default();
+    resp.unknown_tagged_fields = vec![RawTaggedField {
+        tag: 3,
+        data: Bytes::from_static(&[0x01, 0x00]),
+    }];
     let bytes = encode(&resp, 3, |m, b, v| m.encode(b, v));
     assert!(ApiVersionsResponse::decode(&mut bytes.clone(), 3).is_err());
 }
@@ -182,13 +161,12 @@ fn tag_data_with_trailing_bytes_is_rejected() {
 fn request_header_v2_client_id_is_not_compact() {
     // KIP-482 quirk: RequestHeader v2 is flexible, but ClientId keeps the
     // classic i16-prefixed nullable string encoding.
-    let header = RequestHeader {
-        request_api_key: 18,
-        request_api_version: 3,
-        correlation_id: 7,
-        client_id: Some("abc".into()),
-        unknown_tagged_fields: Vec::new(),
-    };
+    let mut header = RequestHeader::default();
+    header.request_api_key = 18;
+    header.request_api_version = 3;
+    header.correlation_id = 7;
+    header.client_id = Some("abc".into());
+    header.unknown_tagged_fields = Vec::new();
     let bytes = encode(&header, 2, |m, b, v| m.encode(b, v));
     let expected = [
         &[0x00, 0x12][..],         // api key 18
@@ -205,10 +183,9 @@ fn request_header_v2_client_id_is_not_compact() {
 
 #[test]
 fn response_header_versions() {
-    let header = ResponseHeader {
-        correlation_id: 42,
-        unknown_tagged_fields: Vec::new(),
-    };
+    let mut header = ResponseHeader::default();
+    header.correlation_id = 42;
+    header.unknown_tagged_fields = Vec::new();
     let v0 = encode(&header, 0, |m, b, v| m.encode(b, v));
     assert_eq!(&v0[..], &[0, 0, 0, 42]);
     let v1 = encode(&header, 1, |m, b, v| m.encode(b, v));
@@ -219,10 +196,8 @@ fn response_header_versions() {
 
 #[test]
 fn metadata_request_null_topics_needs_v1() {
-    let req = MetadataRequest {
-        topics: None,
-        ..Default::default()
-    };
+    let mut req = MetadataRequest::default();
+    req.topics = None;
     // v0 does not allow a null topics array.
     let mut buf = BytesMut::new();
     assert!(matches!(
@@ -237,143 +212,126 @@ fn metadata_request_null_topics_needs_v1() {
 
 #[test]
 fn metadata_request_roundtrip_flexible() {
-    let req = MetadataRequest {
-        topics: Some(vec![MetadataRequestTopic {
-            topic_id: [0u8; 16],
-            name: Some("events".into()),
-            unknown_tagged_fields: Vec::new(),
-        }]),
-        allow_auto_topic_creation: false,
-        include_cluster_authorized_operations: false,
-        include_topic_authorized_operations: true,
-        unknown_tagged_fields: Vec::new(),
-    };
+    let mut topic = MetadataRequestTopic::default();
+    topic.topic_id = [0u8; 16];
+    topic.name = Some("events".into());
+    topic.unknown_tagged_fields = Vec::new();
+    let mut req = MetadataRequest::default();
+    req.topics = Some(vec![topic]);
+    req.allow_auto_topic_creation = false;
+    req.include_cluster_authorized_operations = false;
+    req.include_topic_authorized_operations = true;
+    req.unknown_tagged_fields = Vec::new();
     roundtrip!(MetadataRequest, req, 13);
 }
 
 #[test]
 fn metadata_response_roundtrip_v12() {
-    let resp = MetadataResponse {
-        throttle_time_ms: 5,
-        brokers: vec![MetadataResponseBroker {
-            node_id: 1,
-            host: "broker-1".into(),
-            port: 9092,
-            rack: None,
-            unknown_tagged_fields: Vec::new(),
-        }],
-        cluster_id: Some("cluster-x".into()),
-        controller_id: 1,
-        topics: vec![MetadataResponseTopic {
-            error_code: 0,
-            name: Some("events".into()),
-            topic_id: *b"0123456789abcdef",
-            is_internal: false,
-            partitions: vec![MetadataResponsePartition {
-                error_code: 0,
-                partition_index: 0,
-                leader_id: 1,
-                leader_epoch: 4,
-                replica_nodes: vec![1, 2, 3],
-                isr_nodes: vec![1, 3],
-                offline_replicas: vec![],
-                unknown_tagged_fields: Vec::new(),
-            }],
-            // absent before v8 is fine; v12 carries it
-            topic_authorized_operations: -2147483648,
-            unknown_tagged_fields: Vec::new(),
-        }],
-        // only in v8-v10, so leave at default for a v12 round-trip
-        ..Default::default()
-    };
+    let mut broker = MetadataResponseBroker::default();
+    broker.node_id = 1;
+    broker.host = "broker-1".into();
+    broker.port = 9092;
+    broker.rack = None;
+    broker.unknown_tagged_fields = Vec::new();
+    let mut partition = MetadataResponsePartition::default();
+    partition.error_code = 0;
+    partition.partition_index = 0;
+    partition.leader_id = 1;
+    partition.leader_epoch = 4;
+    partition.replica_nodes = vec![1, 2, 3];
+    partition.isr_nodes = vec![1, 3];
+    partition.offline_replicas = vec![];
+    partition.unknown_tagged_fields = Vec::new();
+    let mut topic = MetadataResponseTopic::default();
+    topic.error_code = 0;
+    topic.name = Some("events".into());
+    topic.topic_id = *b"0123456789abcdef";
+    topic.is_internal = false;
+    topic.partitions = vec![partition];
+    // absent before v8 is fine; v12 carries it
+    topic.topic_authorized_operations = -2147483648;
+    topic.unknown_tagged_fields = Vec::new();
+    // cluster_authorized_operations is only in v8-v10, so leave it at
+    // default for a v12 round-trip.
+    let mut resp = MetadataResponse::default();
+    resp.throttle_time_ms = 5;
+    resp.brokers = vec![broker];
+    resp.cluster_id = Some("cluster-x".into());
+    resp.controller_id = 1;
+    resp.topics = vec![topic];
     roundtrip!(MetadataResponse, resp, 12);
 }
 
 #[test]
 fn metadata_response_roundtrip_v1_non_flexible() {
-    let resp = MetadataResponse {
-        brokers: vec![MetadataResponseBroker {
-            node_id: 1,
-            host: "broker-1".into(),
-            port: 9092,
-            rack: Some("rack-a".into()),
-            unknown_tagged_fields: Vec::new(),
-        }],
-        controller_id: 1,
-        topics: vec![MetadataResponseTopic {
-            error_code: 0,
-            name: Some("events".into()),
-            is_internal: false,
-            partitions: vec![],
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
+    let mut broker = MetadataResponseBroker::default();
+    broker.node_id = 1;
+    broker.host = "broker-1".into();
+    broker.port = 9092;
+    broker.rack = Some("rack-a".into());
+    broker.unknown_tagged_fields = Vec::new();
+    let mut topic = MetadataResponseTopic::default();
+    topic.error_code = 0;
+    topic.name = Some("events".into());
+    topic.is_internal = false;
+    topic.partitions = vec![];
+    let mut resp = MetadataResponse::default();
+    resp.brokers = vec![broker];
+    resp.controller_id = 1;
+    resp.topics = vec![topic];
     roundtrip!(MetadataResponse, resp, 1);
 }
 
 #[test]
 fn fetch_request_roundtrip_min_and_flexible() {
-    let base_partition = FetchPartition {
-        partition: 3,
-        fetch_offset: 1000,
-        partition_max_bytes: 1 << 20,
-        ..Default::default()
-    };
+    let mut base_partition = FetchPartition::default();
+    base_partition.partition = 3;
+    base_partition.fetch_offset = 1000;
+    base_partition.partition_max_bytes = 1 << 20;
     // v4: oldest supported, classic encoding, topic addressed by name.
-    let v4 = FetchRequest {
-        replica_id: -1,
-        max_wait_ms: 500,
-        min_bytes: 1,
-        max_bytes: 50 << 20,
-        isolation_level: 1,
-        topics: vec![FetchTopic {
-            topic: "events".into(),
-            partitions: vec![base_partition.clone()],
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
+    let mut v4_topic = FetchTopic::default();
+    v4_topic.topic = "events".into();
+    v4_topic.partitions = vec![base_partition.clone()];
+    let mut v4 = FetchRequest::default();
+    v4.replica_id = -1;
+    v4.max_wait_ms = 500;
+    v4.min_bytes = 1;
+    v4.max_bytes = 50 << 20;
+    v4.isolation_level = 1;
+    v4.topics = vec![v4_topic];
     roundtrip!(FetchRequest, v4, 4);
 
     // v16: flexible, topic addressed by id, session fields present.
     // replica_id is left at its default (-1): the field is not encoded at
     // v15+ (replaced by the tagged ReplicaState), so only the default can
     // round-trip.
-    let v16 = FetchRequest {
-        max_wait_ms: 500,
-        min_bytes: 1,
-        max_bytes: 50 << 20,
-        isolation_level: 0,
-        session_id: 77,
-        session_epoch: 2,
-        topics: vec![FetchTopic {
-            topic_id: *b"0123456789abcdef",
-            partitions: vec![FetchPartition {
-                current_leader_epoch: 9,
-                last_fetched_epoch: 8,
-                log_start_offset: 10,
-                ..base_partition
-            }],
-            ..Default::default()
-        }],
-        rack_id: "rack-a".into(),
-        ..Default::default()
-    };
+    let mut v16_partition = base_partition;
+    v16_partition.current_leader_epoch = 9;
+    v16_partition.last_fetched_epoch = 8;
+    v16_partition.log_start_offset = 10;
+    let mut v16_topic = FetchTopic::default();
+    v16_topic.topic_id = *b"0123456789abcdef";
+    v16_topic.partitions = vec![v16_partition];
+    let mut v16 = FetchRequest::default();
+    v16.max_wait_ms = 500;
+    v16.min_bytes = 1;
+    v16.max_bytes = 50 << 20;
+    v16.isolation_level = 0;
+    v16.session_id = 77;
+    v16.session_epoch = 2;
+    v16.topics = vec![v16_topic];
+    v16.rack_id = "rack-a".into();
     roundtrip!(FetchRequest, v16, 16);
 }
 
 #[test]
 fn truncated_input_errors_cleanly() {
-    let resp = ApiVersionsResponse {
-        api_keys: vec![ApiVersion {
-            api_key: 0,
-            min_version: 0,
-            max_version: 9,
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
+    let mut key = ApiVersion::default();
+    key.api_key = 0;
+    key.min_version = 0;
+    key.max_version = 9;
+    let mut resp = ApiVersionsResponse::default();
+    resp.api_keys = vec![key];
     let bytes = encode(&resp, 3, |m, b, v| m.encode(b, v));
     // Every strict prefix must fail with an error, never panic.
     for cut in 0..bytes.len() {

@@ -459,6 +459,7 @@ fn generate_struct(w: &mut String, msg: &Message, def: &StructDef, is_top: bool)
         let _ = writeln!(w, "/// `{}` (nested in [`{}`]).", def.name, msg.name);
     }
     let _ = writeln!(w, "#[derive(Debug, Clone, PartialEq)]");
+    let _ = writeln!(w, "#[non_exhaustive]");
     let _ = writeln!(w, "pub struct {} {{", def.name);
     for f in &wire_fields {
         if let Some(about) = &f.about {

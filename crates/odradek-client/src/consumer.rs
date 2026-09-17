@@ -53,6 +53,7 @@ const OFFSET_FETCH_SUPPORTED: (i16, i16) = (1, 7);
 
 /// Fetch tuning knobs.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ConsumerConfig {
     /// How long the broker may hold the fetch waiting for data.
     pub max_wait_ms: i32,
@@ -223,25 +224,21 @@ impl Consumer {
         let version = broker
             .ranges
             .pick(OffsetCommitRequest::API_KEY, OFFSET_COMMIT_SUPPORTED)?;
-        let request = OffsetCommitRequest {
-            group_id: group,
-            // Simple consumer: no generation, no member.
-            generation_id_or_member_epoch: -1,
-            member_id: String::new(),
-            group_instance_id: None,
-            retention_time_ms: -1,
-            topics: vec![OffsetCommitRequestTopic {
-                name: topic.clone(),
-                partitions: vec![OffsetCommitRequestPartition {
-                    partition_index: partition,
-                    committed_offset: offset,
-                    committed_leader_epoch: -1,
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
+        let mut request_partition = OffsetCommitRequestPartition::default();
+        request_partition.partition_index = partition;
+        request_partition.committed_offset = offset;
+        request_partition.committed_leader_epoch = -1;
+        let mut request_topic = OffsetCommitRequestTopic::default();
+        request_topic.name = topic.clone();
+        request_topic.partitions = vec![request_partition];
+        let mut request = OffsetCommitRequest::default();
+        request.group_id = group;
+        // Simple consumer: no generation, no member.
+        request.generation_id_or_member_epoch = -1;
+        request.member_id = String::new();
+        request.group_instance_id = None;
+        request.retention_time_ms = -1;
+        request.topics = vec![request_topic];
         let mut body = BytesMut::new();
         request.encode(&mut body, version)?;
         let mut resp = broker
@@ -277,15 +274,12 @@ impl Consumer {
         let version = broker
             .ranges
             .pick(OffsetFetchRequest::API_KEY, OFFSET_FETCH_SUPPORTED)?;
-        let request = OffsetFetchRequest {
-            group_id: group,
-            topics: Some(vec![OffsetFetchRequestTopic {
-                name: topic.clone(),
-                partition_indexes: vec![partition],
-                ..Default::default()
-            }]),
-            ..Default::default()
-        };
+        let mut request_topic = OffsetFetchRequestTopic::default();
+        request_topic.name = topic.clone();
+        request_topic.partition_indexes = vec![partition];
+        let mut request = OffsetFetchRequest::default();
+        request.group_id = group;
+        request.topics = Some(vec![request_topic]);
         let mut body = BytesMut::new();
         request.encode(&mut body, version)?;
         let mut resp = broker
@@ -354,27 +348,23 @@ impl Consumer {
         let leader = self.cluster.leader_id(&topic, partition);
         let version = broker.ranges.pick(FetchRequest::API_KEY, FETCH_SUPPORTED)?;
 
-        let request = FetchRequest {
-            max_wait_ms: self.config.max_wait_ms,
-            min_bytes: self.config.min_bytes,
-            max_bytes: self.config.partition_max_bytes.saturating_mul(4),
-            session_id: 0,
-            session_epoch: -1, // sessionless full fetch
-            topics: vec![FetchTopic {
-                topic: topic.clone(),
-                partitions: vec![FetchPartition {
-                    partition,
-                    current_leader_epoch: -1,
-                    fetch_offset: offset,
-                    last_fetched_epoch: -1,
-                    log_start_offset: -1,
-                    partition_max_bytes: self.config.partition_max_bytes,
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
+        let mut fetch_partition = FetchPartition::default();
+        fetch_partition.partition = partition;
+        fetch_partition.current_leader_epoch = -1;
+        fetch_partition.fetch_offset = offset;
+        fetch_partition.last_fetched_epoch = -1;
+        fetch_partition.log_start_offset = -1;
+        fetch_partition.partition_max_bytes = self.config.partition_max_bytes;
+        let mut fetch_topic = FetchTopic::default();
+        fetch_topic.topic = topic.clone();
+        fetch_topic.partitions = vec![fetch_partition];
+        let mut request = FetchRequest::default();
+        request.max_wait_ms = self.config.max_wait_ms;
+        request.min_bytes = self.config.min_bytes;
+        request.max_bytes = self.config.partition_max_bytes.saturating_mul(4);
+        request.session_id = 0;
+        request.session_epoch = -1; // sessionless full fetch
+        request.topics = vec![fetch_topic];
         let mut body = BytesMut::new();
         request.encode(&mut body, version)?;
 
@@ -478,21 +468,17 @@ impl Consumer {
             .ranges
             .pick(ListOffsetsRequest::API_KEY, LIST_OFFSETS_SUPPORTED)?;
 
-        let request = ListOffsetsRequest {
-            replica_id: -1,
-            isolation_level: 0,
-            topics: vec![ListOffsetsTopic {
-                name: topic.clone(),
-                partitions: vec![ListOffsetsPartition {
-                    partition_index: partition,
-                    current_leader_epoch: -1,
-                    timestamp,
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
+        let mut request_partition = ListOffsetsPartition::default();
+        request_partition.partition_index = partition;
+        request_partition.current_leader_epoch = -1;
+        request_partition.timestamp = timestamp;
+        let mut request_topic = ListOffsetsTopic::default();
+        request_topic.name = topic.clone();
+        request_topic.partitions = vec![request_partition];
+        let mut request = ListOffsetsRequest::default();
+        request.replica_id = -1;
+        request.isolation_level = 0;
+        request.topics = vec![request_topic];
         let mut body = BytesMut::new();
         request.encode(&mut body, version)?;
         let mut resp = broker

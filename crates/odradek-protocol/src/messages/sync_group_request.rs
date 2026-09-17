@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `SyncGroupRequest`, versions 0-5.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct SyncGroupRequest {
     /// The unique group identifier.
     pub group_id: String,
@@ -198,6 +199,7 @@ impl SyncGroupRequest {
 
 /// `SyncGroupRequestAssignment` (nested in [`SyncGroupRequest`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct SyncGroupRequestAssignment {
     /// The ID of the member to assign.
     pub member_id: String,

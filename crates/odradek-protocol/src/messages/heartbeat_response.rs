@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `HeartbeatResponse`, versions 0-4.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct HeartbeatResponse {
     /// The duration in milliseconds for which the request was throttled due to a quota violation, or zero if the request did not violate any quota.
     pub throttle_time_ms: i32,

@@ -18,6 +18,7 @@ use crate::source::RecordSource;
 
 /// Tuning for one pump.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PumpConfig {
     /// Recent events kept in memory for catch-up without re-fetching.
     pub ring_capacity: usize,
@@ -48,6 +49,7 @@ impl Default for PumpConfig {
 
 /// Errors surfaced to subscribers at subscribe time.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum HubError {
     #[error("source error: {0}")]
     Source(String),

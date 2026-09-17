@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `OffsetFetchRequest`, versions 1-10.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct OffsetFetchRequest {
     /// The group to fetch offsets for.
     pub group_id: String,
@@ -170,6 +171,7 @@ impl OffsetFetchRequest {
 
 /// `OffsetFetchRequestTopic` (nested in [`OffsetFetchRequest`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct OffsetFetchRequestTopic {
     /// The topic name.
     pub name: String,
@@ -251,6 +253,7 @@ impl OffsetFetchRequestTopic {
 
 /// `OffsetFetchRequestGroup` (nested in [`OffsetFetchRequest`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct OffsetFetchRequestGroup {
     /// The group ID.
     pub group_id: String,
@@ -386,6 +389,7 @@ impl OffsetFetchRequestGroup {
 
 /// `OffsetFetchRequestTopics` (nested in [`OffsetFetchRequest`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct OffsetFetchRequestTopics {
     /// The topic name.
     pub name: String,

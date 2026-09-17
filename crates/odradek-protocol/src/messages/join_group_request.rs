@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `JoinGroupRequest`, versions 0-9.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct JoinGroupRequest {
     /// The group identifier.
     pub group_id: String,
@@ -194,6 +195,7 @@ impl JoinGroupRequest {
 
 /// `JoinGroupRequestProtocol` (nested in [`JoinGroupRequest`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct JoinGroupRequestProtocol {
     /// The protocol name.
     pub name: String,

@@ -25,6 +25,7 @@ pub fn is_flexible(version: i16) -> bool {
 
 /// `LeaveGroupResponse`, versions 0-5.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct LeaveGroupResponse {
     /// The duration in milliseconds for which the request was throttled due to a quota violation, or zero if the request did not violate any quota.
     pub throttle_time_ms: i32,
@@ -107,6 +108,7 @@ impl LeaveGroupResponse {
 
 /// `MemberResponse` (nested in [`LeaveGroupResponse`]).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct MemberResponse {
     /// The member ID to remove from the group.
     pub member_id: String,

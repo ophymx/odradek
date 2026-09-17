@@ -15,28 +15,23 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
 fn config() -> ObserveConfig {
-    ObserveConfig {
-        max_requests: 16,
-        idle_timeout: Duration::from_millis(1500),
-        fault: None,
-    }
+    let mut config = ObserveConfig::default();
+    config.max_requests = 16;
+    config.idle_timeout = Duration::from_millis(1500);
+    config
 }
 
 fn produce_body(partition: i32, version: i16) -> Bytes {
-    let req = ProduceRequest {
-        acks: -1,
-        timeout_ms: 5_000,
-        topic_data: vec![TopicProduceData {
-            name: ROUTING_TOPIC.into(),
-            partition_data: vec![PartitionProduceData {
-                index: partition,
-                records: Some(Bytes::new()),
-                ..Default::default()
-            }],
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
+    let mut partition_data = PartitionProduceData::default();
+    partition_data.index = partition;
+    partition_data.records = Some(Bytes::new());
+    let mut topic_data = TopicProduceData::default();
+    topic_data.name = ROUTING_TOPIC.into();
+    topic_data.partition_data = vec![partition_data];
+    let mut req = ProduceRequest::default();
+    req.acks = -1;
+    req.timeout_ms = 5_000;
+    req.topic_data = vec![topic_data];
     let mut body = BytesMut::new();
     req.encode(&mut body, version).unwrap();
     body.freeze()
@@ -51,13 +46,10 @@ async fn odradek_client_passes_the_client_checks() {
     let addr = listener.local_addr().unwrap().to_string();
     let harness = tokio::spawn(async move { run(&listener, &config()).await });
 
-    let mut cluster = Cluster::connect(ClientConfig {
-        bootstrap_servers: vec![addr],
-        client_id: "odradek".into(),
-        ..Default::default()
-    })
-    .await
-    .unwrap();
+    let mut client_config = ClientConfig::default();
+    client_config.bootstrap_servers = vec![addr];
+    client_config.client_id = "odradek".into();
+    let mut cluster = Cluster::connect(client_config).await.unwrap();
     for partition in 0..3 {
         let broker = cluster
             .partition_leader(ROUTING_TOPIC, partition)
@@ -133,20 +125,15 @@ async fn odradek_client_recovers_from_leader_change() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let harness = tokio::spawn(async move {
-        let config = ObserveConfig {
-            fault: Some(HarnessFault::LeaderMove),
-            ..config()
-        };
+        let mut config = config();
+        config.fault = Some(HarnessFault::LeaderMove);
         run(&listener, &config).await
     });
 
-    let cluster = Cluster::connect(ClientConfig {
-        bootstrap_servers: vec![addr],
-        client_id: "odradek".into(),
-        ..Default::default()
-    })
-    .await
-    .unwrap();
+    let mut client_config = ClientConfig::default();
+    client_config.bootstrap_servers = vec![addr];
+    client_config.client_id = "odradek".into();
+    let cluster = Cluster::connect(client_config).await.unwrap();
     let mut producer = Producer::new(cluster);
     let offset = producer
         .produce(
@@ -180,10 +167,8 @@ async fn client_that_abandons_after_leader_change_is_caught() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let harness = tokio::spawn(async move {
-        let config = ObserveConfig {
-            fault: Some(HarnessFault::LeaderMove),
-            ..config()
-        };
+        let mut config = config();
+        config.fault = Some(HarnessFault::LeaderMove);
         run(&listener, &config).await
     });
 
@@ -252,13 +237,11 @@ async fn misrouted_produce_is_caught() {
 }
 
 fn request_frame(api_key: i16, api_version: i16, correlation_id: i32, body: &[u8]) -> Vec<u8> {
-    let header = RequestHeader {
-        request_api_key: api_key,
-        request_api_version: api_version,
-        correlation_id,
-        client_id: Some("misbehaving".into()),
-        unknown_tagged_fields: Vec::new(),
-    };
+    let mut header = RequestHeader::default();
+    header.request_api_key = api_key;
+    header.request_api_version = api_version;
+    header.correlation_id = correlation_id;
+    header.client_id = Some("misbehaving".into());
     let mut payload = BytesMut::new();
     // Metadata v9+ is flexible → header v2 for both frames.
     header.encode(&mut payload, 2).unwrap();

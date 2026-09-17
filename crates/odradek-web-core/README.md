@@ -24,6 +24,13 @@ traits: Kafka via
 production, and an in-memory log (published as
 `odradek_web_core::memory`) for deterministic downstream tests.
 
+## Features
+
+`kafka` (default) pulls in `odradek-client` for the real-cluster
+`KafkaSource`. With `--no-default-features` the engine — pump, hub,
+filters, cursors, in-memory source — builds without any Kafka client
+at all; bring your own `RecordSource`.
+
 Part of the [odradek](https://github.com/ophymx/odradek) constellation.
 
 ## License

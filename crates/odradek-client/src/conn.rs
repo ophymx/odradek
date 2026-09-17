@@ -23,7 +23,9 @@ use odradek_protocol::messages::response_header::ResponseHeader;
 use odradek_protocol::wire;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
+#[cfg(feature = "tls")]
 use tokio_rustls::TlsConnector;
+#[cfg(feature = "tls")]
 use tokio_rustls::rustls::pki_types::ServerName;
 
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
@@ -31,11 +33,13 @@ use tokio::task::JoinHandle;
 
 use crate::ClientConfig;
 use crate::error::ClientError;
+#[cfg(feature = "tls")]
 use crate::tls::Tls;
 
 /// The wire under a connection: plaintext TCP or TLS over it.
 enum Transport {
     Plain(TcpStream),
+    #[cfg(feature = "tls")]
     Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
 }
 
@@ -47,6 +51,7 @@ impl AsyncRead for Transport {
     ) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Transport::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "tls")]
             Transport::Tls(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
@@ -60,6 +65,7 @@ impl AsyncWrite for Transport {
     ) -> Poll<std::io::Result<usize>> {
         match self.get_mut() {
             Transport::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "tls")]
             Transport::Tls(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
@@ -67,6 +73,7 @@ impl AsyncWrite for Transport {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Transport::Plain(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "tls")]
             Transport::Tls(s) => Pin::new(s).poll_flush(cx),
         }
     }
@@ -74,6 +81,7 @@ impl AsyncWrite for Transport {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
             Transport::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "tls")]
             Transport::Tls(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
@@ -140,6 +148,7 @@ impl Connection {
     pub async fn connect(addr: &str, config: &ClientConfig) -> Result<Connection, ClientError> {
         let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
+        #[cfg(feature = "tls")]
         let transport = match &config.tls {
             Tls::None => Transport::Plain(stream),
             Tls::Rustls(tls_config) => {
@@ -154,6 +163,8 @@ impl Connection {
                 Transport::Tls(Box::new(tls))
             }
         };
+        #[cfg(not(feature = "tls"))]
+        let transport = Transport::Plain(stream);
         let (read_half, write_half) = tokio::io::split(transport);
 
         let shared = Arc::new(Shared {
@@ -192,13 +203,11 @@ impl Connection {
             .ok_or(ClientError::UnsupportedApi(api_key))?;
 
         let correlation_id = inner.next_correlation.fetch_add(1, Ordering::Relaxed);
-        let header = RequestHeader {
-            request_api_key: api_key,
-            request_api_version: api_version,
-            correlation_id,
-            client_id: Some(inner.client_id.clone()),
-            unknown_tagged_fields: Vec::new(),
-        };
+        let mut header = RequestHeader::default();
+        header.request_api_key = api_key;
+        header.request_api_version = api_version;
+        header.correlation_id = correlation_id;
+        header.client_id = Some(inner.client_id.clone());
         let mut frame = BytesMut::new();
         frame.put_i32(0); // frame length, patched below
         header.encode(&mut frame, header_version)?;
