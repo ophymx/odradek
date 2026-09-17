@@ -1,98 +1,16 @@
 //! Engine tests over an in-memory log: fan-out, replay, filtering, and
 //! the no-loss guarantee under backpressure.
 
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use odradek_web_core::{
-    Event, Filter, Hub, Position, PumpConfig, PumpHandle, RecordSource, SourceBatch, SourceError,
-    SourceFactory, Subscription,
-};
+use odradek_web_core::memory::{MemoryFactory, MemoryLog};
+use odradek_web_core::{Filter, Hub, Position, PumpConfig, PumpHandle, Subscription};
 
 const TOPIC: &str = "bridge";
 
-/// An in-memory partition log; offsets are indexes.
-#[derive(Clone, Default)]
-struct MemoryLog {
-    events: Arc<Mutex<Vec<Event>>>,
-}
-
-impl MemoryLog {
-    fn append(&self, key: Option<&str>, value: &str) {
-        let mut events = self.events.lock().unwrap();
-        let offset = i64::try_from(events.len()).unwrap();
-        events.push(Event {
-            topic: TOPIC.into(),
-            partition: 0,
-            offset,
-            timestamp: 1_000 + offset,
-            key: key.map(|k| Bytes::copy_from_slice(k.as_bytes())),
-            value: Some(Bytes::copy_from_slice(value.as_bytes())),
-            headers: Vec::new(),
-        });
-    }
-}
-
-#[derive(Clone)]
-struct MemorySource {
-    log: MemoryLog,
-}
-
-impl RecordSource for MemorySource {
-    async fn fetch(
-        &mut self,
-        _topic: &str,
-        partition: i32,
-        offset: i64,
-    ) -> Result<SourceBatch, SourceError> {
-        let events = self.log.events.lock().unwrap();
-        let len = i64::try_from(events.len()).unwrap();
-        let start = usize::try_from(offset.clamp(0, len)).unwrap();
-        // Cap batches so catch-up takes several rounds, like real fetches.
-        let batch: Vec<Event> = events
-            .iter()
-            .skip(start)
-            .take(3)
-            .map(|e| Event {
-                partition,
-                ..e.clone()
-            })
-            .collect();
-        let next_offset = offset.max(0) + i64::try_from(batch.len()).unwrap();
-        Ok(SourceBatch {
-            events: batch,
-            next_offset,
-            high_watermark: len,
-        })
-    }
-
-    async fn earliest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
-        Ok(0)
-    }
-
-    async fn latest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
-        Ok(i64::try_from(self.log.events.lock().unwrap().len()).unwrap())
-    }
-}
-
-#[derive(Clone)]
-struct MemoryFactory {
-    log: MemoryLog,
-}
-
-impl SourceFactory for MemoryFactory {
-    type Source = MemorySource;
-
-    async fn create(&self, _topic: &str, _partition: i32) -> Result<MemorySource, SourceError> {
-        Ok(MemorySource {
-            log: self.log.clone(),
-        })
-    }
-}
-
 fn pump_for(log: &MemoryLog, config: PumpConfig) -> PumpHandle {
-    PumpHandle::spawn(MemorySource { log: log.clone() }, TOPIC, 0, config)
+    PumpHandle::spawn(log.source(), TOPIC, 0, config)
 }
 
 async fn collect(sub: &mut Subscription, n: usize) -> Vec<(i64, String)> {
@@ -110,7 +28,7 @@ async fn collect(sub: &mut Subscription, n: usize) -> Vec<(i64, String)> {
 
 #[tokio::test]
 async fn live_fanout_reaches_every_subscriber() {
-    let log = MemoryLog::default();
+    let log = MemoryLog::new();
     let pump = pump_for(&log, PumpConfig::default());
 
     let mut a = pump
@@ -122,8 +40,8 @@ async fn live_fanout_reaches_every_subscriber() {
         .await
         .unwrap();
 
-    log.append(None, "one");
-    log.append(None, "two");
+    log.append(TOPIC, None, b"one", Vec::new());
+    log.append(TOPIC, None, b"two", Vec::new());
 
     assert_eq!(
         collect(&mut a, 2).await,
@@ -137,9 +55,9 @@ async fn live_fanout_reaches_every_subscriber() {
 
 #[tokio::test]
 async fn replay_from_offset_then_live_without_gaps_or_dups() {
-    let log = MemoryLog::default();
+    let log = MemoryLog::new();
     for i in 0..7 {
-        log.append(None, &format!("old-{i}"));
+        log.append(TOPIC, None, format!("old-{i}").as_bytes(), Vec::new());
     }
     let pump = pump_for(&log, PumpConfig::default());
 
@@ -155,15 +73,15 @@ async fn replay_from_offset_then_live_without_gaps_or_dups() {
         vec![2, 3, 4, 5, 6]
     );
 
-    log.append(None, "fresh");
+    log.append(TOPIC, None, b"fresh", Vec::new());
     assert_eq!(collect(&mut sub, 1).await, vec![(7, "fresh".into())]);
 }
 
 #[tokio::test]
 async fn earliest_replays_everything() {
-    let log = MemoryLog::default();
-    log.append(None, "zero");
-    log.append(None, "one");
+    let log = MemoryLog::new();
+    log.append(TOPIC, None, b"zero", Vec::new());
+    log.append(TOPIC, None, b"one", Vec::new());
     let pump = pump_for(&log, PumpConfig::default());
 
     let mut sub = pump
@@ -178,9 +96,9 @@ async fn earliest_replays_everything() {
 
 #[tokio::test]
 async fn filters_apply_to_replay_and_live() {
-    let log = MemoryLog::default();
-    log.append(Some("user:1"), "keep-a");
-    log.append(Some("order:9"), "drop");
+    let log = MemoryLog::new();
+    log.append(TOPIC, Some(b"user:1"), b"keep-a", Vec::new());
+    log.append(TOPIC, Some(b"order:9"), b"drop", Vec::new());
     let pump = pump_for(&log, PumpConfig::default());
 
     let filter = Filter {
@@ -189,8 +107,8 @@ async fn filters_apply_to_replay_and_live() {
     };
     let mut sub = pump.subscribe(Position::Earliest, filter).await.unwrap();
 
-    log.append(Some("user:2"), "keep-b");
-    log.append(Some("cart:3"), "drop");
+    log.append(TOPIC, Some(b"user:2"), b"keep-b", Vec::new());
+    log.append(TOPIC, Some(b"cart:3"), b"drop", Vec::new());
 
     assert_eq!(
         collect(&mut sub, 2).await,
@@ -203,7 +121,7 @@ async fn filters_apply_to_replay_and_live() {
 /// catch-up instead of dropping.
 #[tokio::test]
 async fn slow_subscriber_loses_nothing() {
-    let log = MemoryLog::default();
+    let log = MemoryLog::new();
     let pump = pump_for(
         &log,
         PumpConfig {
@@ -218,7 +136,7 @@ async fn slow_subscriber_loses_nothing() {
         .unwrap();
 
     for i in 0..50 {
-        log.append(None, &format!("v{i}"));
+        log.append(TOPIC, None, format!("v{i}").as_bytes(), Vec::new());
     }
     // Drain slowly: the tiny queue overflows many times over.
     let mut seen = Vec::new();
@@ -235,7 +153,7 @@ async fn slow_subscriber_loses_nothing() {
 
 #[tokio::test]
 async fn hub_runs_one_pump_per_partition() {
-    let log = MemoryLog::default();
+    let log = MemoryLog::new();
     let mut hub = Hub::new(MemoryFactory { log: log.clone() }, PumpConfig::default());
 
     let mut a = hub
@@ -252,6 +170,6 @@ async fn hub_runs_one_pump_per_partition() {
         .unwrap();
     assert_eq!(hub.active_partitions().count(), 2);
 
-    log.append(None, "hello");
+    log.append(TOPIC, None, b"hello", Vec::new());
     assert_eq!(collect(&mut a, 1).await, vec![(0, "hello".into())]);
 }

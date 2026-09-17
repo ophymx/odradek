@@ -14,9 +14,10 @@ the protocol as the first-class artifact and builds outward from it.
 | [`odradek-client`](crates/odradek-client) | Async, Rust-native Kafka client built on tokio: connections, metadata routing, producer, consumer. |
 | [`odradek-acceptance`](crates/odradek-acceptance) | Acceptance suite that validates *either side* of the protocol: run it against a server (suite acts as client) or against a client (suite acts as server harness). |
 | [`odradek-web-core`](crates/odradek-web-core) | Transport-agnostic bridge from Kafka partitions to web-shaped subscribers: fan-out, replay from offsets, filtering, self-healing backpressure. |
+| [`odradek-web-sse`](crates/odradek-web-sse) | Server-Sent Events transport over the bridge: an embeddable axum router with `Last-Event-ID` resume — a reconnecting `EventSource` never misses or repeats a record. |
 
-Next in the constellation: transport crates over `odradek-web-core`
-serving the bridge to actual web clients via SSE and WebSocket.
+Next in the constellation: a WebSocket transport, topic-level
+subscriptions (across partitions), and TLS/SASL in the client.
 
 ## Design principles
 
@@ -110,11 +111,19 @@ Early but functional end to end:
   slow subscriber falls out of the live path into catch-up (from the
   in-memory ring, or from Kafka past it) and rejoins as it drains —
   offset order, no gaps, no duplicates, at any speed. Engine-tested
-  over an in-memory source; the `tail` example replays and live-tails
-  a real broker.
+  over an in-memory source (published as `odradek_web_core::memory` for
+  downstream tests); the `tail` example replays and live-tails a real
+  broker.
+- `odradek-web-sse`: the first transport — an embeddable axum `Router`
+  (mount it in your own service, layer your own auth) streaming
+  `GET /topics/{topic}/partitions/{p}/events` as SSE with offsets as
+  event ids, `Last-Event-ID` reconnect resume, `from=` positions, and
+  key/header filters; UTF-8 payloads as strings, binary as base64.
+  Tested over a real listener with a raw HTTP client; the `serve`
+  example bridges a real broker to `curl -N`.
 
-Next: SSE/WebSocket transport crates over `odradek-web-core`,
-snappy/zstd codecs, and the KIP-848 consumer protocol.
+Next: a WebSocket transport, topic-level subscriptions, TLS/SASL in
+the client, snappy/zstd codecs, and the KIP-848 consumer protocol.
 
 ```sh
 cargo test --workspace       # everything

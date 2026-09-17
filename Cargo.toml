@@ -13,11 +13,15 @@ authors = ["Jeffrey T. Peckham <abic@ophymx.com>"]
 # internal crates
 odradek-protocol = { path = "crates/odradek-protocol", version = "0.1.0" }
 odradek-client = { path = "crates/odradek-client", version = "0.1.0" }
+odradek-web-core = { path = "crates/odradek-web-core", version = "0.1.0" }
 
 # external
+axum = "0.8"
+base64 = "0.22"
 bytes = "1"
 flate2 = "1"
 lz4_flex = "0.11"
+tokio-stream = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
