@@ -39,9 +39,10 @@ impl Tls {
     /// TLS trusting exactly the CA (or self-signed) certificates in
     /// `pem`.
     pub fn with_ca_pem(pem: &[u8]) -> Result<Tls, ClientError> {
+        use tokio_rustls::rustls::pki_types::CertificateDer;
+        use tokio_rustls::rustls::pki_types::pem::PemObject;
         let mut roots = rustls::RootCertStore::empty();
-        let mut cursor = std::io::Cursor::new(pem);
-        for cert in rustls_pemfile::certs(&mut cursor) {
+        for cert in CertificateDer::pem_slice_iter(pem) {
             let cert = cert.map_err(|e| ClientError::Tls(format!("bad ca pem: {e}")))?;
             roots
                 .add(cert)
@@ -60,5 +61,23 @@ impl Tls {
     /// TLS with a caller-built configuration (client certs, pinning...).
     pub fn custom(config: Arc<rustls::ClientConfig>) -> Tls {
         Tls::Rustls(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A throwaway self-signed EC certificate, only for parser coverage.
+    const TEST_CA: &str = "-----BEGIN CERTIFICATE-----\nMIIBiTCCAS+gAwIBAgIUXuO2qZzBvtnctV6f9BAsqWijXxwwCgYIKoZIzj0EAwIw\nGjEYMBYGA1UEAwwPb2RyYWRlay10ZXN0LWNhMB4XDTI2MDkxNzE5MzcwMloXDTI2\nMDkxODE5MzcwMlowGjEYMBYGA1UEAwwPb2RyYWRlay10ZXN0LWNhMFkwEwYHKoZI\nzj0CAQYIKoZIzj0DAQcDQgAEynJre9YxIxrdyndtNLz0QcJwLN0pcjem1+ijTcCr\nRsj/dV+iptafTN9tfdBkBHkUN1IvOOuvQ3GO1VSWVYbIzaNTMFEwHQYDVR0OBBYE\nFPerwBSQqwRtSiZFhbXv1UP+PUG3MB8GA1UdIwQYMBaAFPerwBSQqwRtSiZFhbXv\n1UP+PUG3MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIgT1sAzaf8\nKnUUbMT6bXmTIcE46ihE3LI3BlljV65VrGwCIQCJrumNats94UcKpcJP/m4Sooxf\nCvzLx7rQzHhfm/d3rg==\n-----END CERTIFICATE-----\n";
+
+    #[test]
+    fn ca_pem_parses_and_empty_or_garbage_is_an_error() {
+        assert!(matches!(
+            Tls::with_ca_pem(TEST_CA.as_bytes()),
+            Ok(Tls::Rustls(_))
+        ));
+        assert!(Tls::with_ca_pem(b"").is_err());
+        assert!(Tls::with_ca_pem(b"not pem at all").is_err());
     }
 }

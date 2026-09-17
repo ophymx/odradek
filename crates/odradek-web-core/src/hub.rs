@@ -99,9 +99,9 @@ impl<F: SourceFactory> Hub<F> {
         if self.shut_down {
             return Err(HubError::ShutDown);
         }
-        if let Some(gate) = &self.gate
-            && !gate(topic)
-        {
+        // No let-chain: the crate's MSRV (1.85) predates their
+        // stabilization in 1.88.
+        if self.gate.as_ref().is_some_and(|gate| !gate(topic)) {
             return Err(HubError::Denied(topic.to_owned()));
         }
         Ok(())
