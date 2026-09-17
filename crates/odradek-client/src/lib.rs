@@ -24,6 +24,7 @@ mod compression;
 pub mod conn;
 pub mod consumer;
 pub mod error;
+pub mod group;
 pub mod negotiate;
 pub mod producer;
 
@@ -31,6 +32,7 @@ pub use cluster::Cluster;
 pub use conn::Connection;
 pub use consumer::{ConsumedRecord, Consumer, ConsumerConfig, FetchResult};
 pub use error::ClientError;
+pub use group::{GroupConfig, GroupMember, HeartbeatStatus};
 pub use negotiate::ApiVersionRanges;
 pub use odradek_protocol as protocol;
 pub use producer::{Delivery, Producer, ProducerConfig};

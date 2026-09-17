@@ -62,8 +62,11 @@ Early but functional end to end:
   skipping control batches and pre-offset records, with earliest/latest
   lookup via ListOffsets and durable positions as a simple (non-member)
   consumer — coordinator discovery plus offset commit/fetch under a
-  group id — tested against in-process fake single- and multi-broker
-  clusters.
+  group id; and classic consumer-group membership (join/sync/heartbeat/
+  leave, caller-driven, with leader-side range assignment matching
+  Kafka's RangeAssignor) — tested against in-process fake single- and
+  multi-broker clusters, with real-broker smoke examples
+  (`produce_consume`, `group_join`).
 - `odradek-acceptance`: conformance checks for **both roles** over raw
   connections independent of the client crate — `api-versions/*`,
   `metadata/*`, `produce/*`, and `fetch/*` server checks (including a
@@ -100,8 +103,9 @@ Early but functional end to end:
   enforced by test: a check no fault can trip, or a fault no check
   detects, fails calibration.
 
-Next: full consumer-group membership (join/sync/heartbeat) on top of
-the coordinator layer, and snappy/zstd codecs.
+Next: snappy/zstd codecs, the KIP-848 consumer protocol, and the
+`odradek-web-*` proxy crates the constellation has been building
+toward.
 
 ```sh
 cargo test --workspace       # everything

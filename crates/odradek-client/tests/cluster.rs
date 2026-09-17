@@ -32,12 +32,26 @@ const COORDINATOR: i32 = 1;
 /// Stored record sets per (topic, partition), verbatim as produced.
 type Logs = Arc<Mutex<std::collections::HashMap<(String, i32), BytesMut>>>;
 
+/// One consumer group's coordinator state (a single group suffices).
+#[derive(Default)]
+struct GroupState {
+    next_member: u32,
+    generation: i32,
+    rebalancing: bool,
+    /// member id -> subscription metadata, current generation.
+    members: Vec<(String, Bytes)>,
+    /// member id -> assignment bytes, from the leader's SyncGroup.
+    assignments: std::collections::HashMap<String, Bytes>,
+}
+type Group = Arc<Mutex<GroupState>>;
+
 struct FakeCluster {
     /// node_id -> host:port
     endpoints: Vec<(i32, String)>,
     arrivals: Arrivals,
     offsets: Offsets,
     logs: Logs,
+    group: Group,
 }
 
 /// Spawn `n` fake brokers. Every broker answers ApiVersions and full
@@ -55,12 +69,14 @@ async fn spawn_fake_cluster(n: i32, no_leader: &'static [i32]) -> FakeCluster {
     let arrivals: Arrivals = Arc::new(Mutex::new(Vec::new()));
     let offsets: Offsets = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let logs: Logs = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let group: Group = Arc::new(Mutex::new(GroupState::default()));
 
     for (node_id, listener) in listeners {
         let endpoints = endpoints.clone();
         let arrivals = Arc::clone(&arrivals);
         let offsets = Arc::clone(&offsets);
         let logs = Arc::clone(&logs);
+        let group = Arc::clone(&group);
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -73,6 +89,7 @@ async fn spawn_fake_cluster(n: i32, no_leader: &'static [i32]) -> FakeCluster {
                     Arc::clone(&arrivals),
                     Arc::clone(&offsets),
                     Arc::clone(&logs),
+                    Arc::clone(&group),
                     no_leader,
                 ));
             }
@@ -83,9 +100,13 @@ async fn spawn_fake_cluster(n: i32, no_leader: &'static [i32]) -> FakeCluster {
         arrivals,
         offsets,
         logs,
+        group,
     }
 }
 
+// One parameter per piece of shared broker state; a config struct would
+// just rename the problem in a test fake.
+#[allow(clippy::too_many_arguments)]
 async fn serve_conn(
     mut stream: TcpStream,
     node_id: i32,
@@ -93,6 +114,7 @@ async fn serve_conn(
     arrivals: Arrivals,
     offsets: Offsets,
     logs: Logs,
+    group: Group,
     no_leader: &'static [i32],
 ) {
     loop {
@@ -123,6 +145,10 @@ async fn serve_conn(
                         (10, 0, 6),
                         (8, 2, 10),
                         (9, 1, 10),
+                        (11, 4, 9),
+                        (14, 3, 5),
+                        (12, 0, 4),
+                        (13, 0, 5),
                     ]
                     .into_iter()
                     .map(|(api_key, min_version, max_version)| ApiVersion {
@@ -283,10 +309,15 @@ async fn serve_conn(
                 use odradek_protocol::messages::find_coordinator_response::FindCoordinatorResponse;
                 let req = FindCoordinatorRequest::decode(&mut frame, api_version).unwrap();
                 assert!(!req.key.is_empty());
-                let (host, port) = endpoints[COORDINATOR as usize].1.rsplit_once(':').unwrap();
+                // Broker COORDINATOR when the cluster has one, else the
+                // last broker there is.
+                let coord = endpoints
+                    .get(COORDINATOR as usize)
+                    .unwrap_or_else(|| endpoints.last().unwrap());
+                let (host, port) = coord.1.rsplit_once(':').unwrap();
                 let resp = FindCoordinatorResponse {
                     error_code: 0,
-                    node_id: COORDINATOR,
+                    node_id: coord.0,
                     host: host.into(),
                     port: port.parse().unwrap(),
                     ..Default::default()
@@ -355,6 +386,104 @@ async fn serve_conn(
                 };
                 let mut buf = BytesMut::new();
                 resp.encode(&mut buf, api_version).unwrap();
+                buf.freeze()
+            }
+            11 => {
+                use odradek_protocol::messages::join_group_request::JoinGroupRequest;
+                use odradek_protocol::messages::join_group_response::{
+                    JoinGroupResponse, JoinGroupResponseMember,
+                };
+                let req = JoinGroupRequest::decode(&mut frame, api_version).unwrap();
+                assert_eq!(req.protocol_type, "consumer");
+                assert_eq!(req.protocols[0].name, "range");
+                let mut state = group.lock().unwrap();
+                let resp = if req.member_id.is_empty() {
+                    state.next_member += 1;
+                    JoinGroupResponse {
+                        error_code: 79, // MEMBER_ID_REQUIRED
+                        member_id: format!("member-{}", state.next_member),
+                        ..Default::default()
+                    }
+                } else {
+                    state.rebalancing = false;
+                    state.generation += 1;
+                    state.members =
+                        vec![(req.member_id.clone(), req.protocols[0].metadata.clone())];
+                    JoinGroupResponse {
+                        error_code: 0,
+                        generation_id: state.generation,
+                        protocol_name: Some("range".into()),
+                        leader: req.member_id.clone(),
+                        member_id: req.member_id.clone(),
+                        members: state
+                            .members
+                            .iter()
+                            .map(|(id, meta)| JoinGroupResponseMember {
+                                member_id: id.clone(),
+                                metadata: meta.clone(),
+                                ..Default::default()
+                            })
+                            .collect(),
+                        ..Default::default()
+                    }
+                };
+                let mut buf = BytesMut::new();
+                resp.encode(&mut buf, api_version).unwrap();
+                buf.freeze()
+            }
+            14 => {
+                use odradek_protocol::messages::sync_group_request::SyncGroupRequest;
+                use odradek_protocol::messages::sync_group_response::SyncGroupResponse;
+                let req = SyncGroupRequest::decode(&mut frame, api_version).unwrap();
+                let mut state = group.lock().unwrap();
+                assert_eq!(req.generation_id, state.generation);
+                for a in &req.assignments {
+                    state
+                        .assignments
+                        .insert(a.member_id.clone(), a.assignment.clone());
+                }
+                let resp = SyncGroupResponse {
+                    error_code: 0,
+                    assignment: state
+                        .assignments
+                        .get(&req.member_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                    ..Default::default()
+                };
+                let mut buf = BytesMut::new();
+                resp.encode(&mut buf, api_version).unwrap();
+                buf.freeze()
+            }
+            12 => {
+                use odradek_protocol::messages::heartbeat_request::HeartbeatRequest;
+                use odradek_protocol::messages::heartbeat_response::HeartbeatResponse;
+                let req = HeartbeatRequest::decode(&mut frame, api_version).unwrap();
+                let state = group.lock().unwrap();
+                let known = state.members.iter().any(|(id, _)| *id == req.member_id);
+                let resp = HeartbeatResponse {
+                    error_code: if !known {
+                        25 // UNKNOWN_MEMBER_ID
+                    } else if state.rebalancing {
+                        27 // REBALANCE_IN_PROGRESS
+                    } else {
+                        0
+                    },
+                    ..Default::default()
+                };
+                let mut buf = BytesMut::new();
+                resp.encode(&mut buf, api_version).unwrap();
+                buf.freeze()
+            }
+            13 => {
+                use odradek_protocol::messages::leave_group_request::LeaveGroupRequest;
+                use odradek_protocol::messages::leave_group_response::LeaveGroupResponse;
+                let _ = LeaveGroupRequest::decode(&mut frame, api_version).unwrap();
+                group.lock().unwrap().members.clear();
+                let mut buf = BytesMut::new();
+                LeaveGroupResponse::default()
+                    .encode(&mut buf, api_version)
+                    .unwrap();
                 buf.freeze()
             }
             other => panic!("fake broker got api key {other}"),
@@ -688,6 +817,65 @@ async fn offsets_commit_through_the_coordinator_and_read_back() {
     let (offset, committed_at) = fake.offsets.lock().unwrap()[&("g1".into(), TOPIC.into(), 2)];
     assert_eq!(offset, 41);
     assert_eq!(committed_at, COORDINATOR);
+}
+
+#[tokio::test]
+async fn group_membership_join_heartbeat_rebalance_leave() {
+    use odradek_client::{GroupConfig, GroupMember, HeartbeatStatus};
+
+    let fake = spawn_fake_cluster(3, &[]).await;
+    let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+
+    // Join runs the MEMBER_ID_REQUIRED dance, elects us leader (sole
+    // member), and the leader's range assignment covers every partition.
+    let mut member = GroupMember::join(cluster, "g1", &[TOPIC], GroupConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(member.member_id(), "member-1");
+    assert!(member.is_leader());
+    assert_eq!(member.generation_id(), 1);
+    assert_eq!(
+        member.assignment(),
+        &[(TOPIC.to_owned(), vec![0, 1, 2])],
+        "sole member owns all partitions"
+    );
+
+    assert_eq!(member.heartbeat().await.unwrap(), HeartbeatStatus::Stable);
+
+    // The coordinator starts a rebalance; the heartbeat reports it and a
+    // rejoin lands in the next generation with a fresh assignment.
+    fake.group.lock().unwrap().rebalancing = true;
+    assert_eq!(
+        member.heartbeat().await.unwrap(),
+        HeartbeatStatus::RebalanceInProgress
+    );
+    member.rejoin().await.unwrap();
+    assert_eq!(member.generation_id(), 2);
+    assert_eq!(member.assignment(), &[(TOPIC.to_owned(), vec![0, 1, 2])]);
+    assert_eq!(member.heartbeat().await.unwrap(), HeartbeatStatus::Stable);
+
+    // Leaving hands the cluster back and the coordinator forgets us.
+    let _cluster = member.leave().await.unwrap();
+    assert!(fake.group.lock().unwrap().members.is_empty());
+}
+
+#[tokio::test]
+async fn evicted_member_is_told_so() {
+    use odradek_client::{GroupConfig, GroupMember, HeartbeatStatus};
+
+    let fake = spawn_fake_cluster(1, &[]).await;
+    let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+    let mut member = GroupMember::join(cluster, "g1", &[TOPIC], GroupConfig::default())
+        .await
+        .unwrap();
+
+    // The coordinator forgets the member (session timeout, say).
+    fake.group.lock().unwrap().members.clear();
+    assert_eq!(member.heartbeat().await.unwrap(), HeartbeatStatus::Evicted);
+    // Rejoining starts over: new member id, next generation.
+    member.rejoin().await.unwrap();
+    assert_eq!(member.member_id(), "member-2");
+    assert_eq!(member.heartbeat().await.unwrap(), HeartbeatStatus::Stable);
 }
 
 #[tokio::test]

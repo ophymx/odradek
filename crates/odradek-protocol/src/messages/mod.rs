@@ -5,12 +5,20 @@
 
 pub mod api_versions_request;
 pub mod api_versions_response;
+pub mod consumer_protocol_assignment;
+pub mod consumer_protocol_subscription;
 pub mod create_topics_request;
 pub mod create_topics_response;
 pub mod fetch_request;
 pub mod fetch_response;
 pub mod find_coordinator_request;
 pub mod find_coordinator_response;
+pub mod heartbeat_request;
+pub mod heartbeat_response;
+pub mod join_group_request;
+pub mod join_group_response;
+pub mod leave_group_request;
+pub mod leave_group_response;
 pub mod list_offsets_request;
 pub mod list_offsets_response;
 pub mod metadata_request;
@@ -23,15 +31,25 @@ pub mod produce_request;
 pub mod produce_response;
 pub mod request_header;
 pub mod response_header;
+pub mod sync_group_request;
+pub mod sync_group_response;
 
 pub use api_versions_request::ApiVersionsRequest;
 pub use api_versions_response::ApiVersionsResponse;
+pub use consumer_protocol_assignment::ConsumerProtocolAssignment;
+pub use consumer_protocol_subscription::ConsumerProtocolSubscription;
 pub use create_topics_request::CreateTopicsRequest;
 pub use create_topics_response::CreateTopicsResponse;
 pub use fetch_request::FetchRequest;
 pub use fetch_response::FetchResponse;
 pub use find_coordinator_request::FindCoordinatorRequest;
 pub use find_coordinator_response::FindCoordinatorResponse;
+pub use heartbeat_request::HeartbeatRequest;
+pub use heartbeat_response::HeartbeatResponse;
+pub use join_group_request::JoinGroupRequest;
+pub use join_group_response::JoinGroupResponse;
+pub use leave_group_request::LeaveGroupRequest;
+pub use leave_group_response::LeaveGroupResponse;
 pub use list_offsets_request::ListOffsetsRequest;
 pub use list_offsets_response::ListOffsetsResponse;
 pub use metadata_request::MetadataRequest;
@@ -44,6 +62,8 @@ pub use produce_request::ProduceRequest;
 pub use produce_response::ProduceResponse;
 pub use request_header::RequestHeader;
 pub use response_header::ResponseHeader;
+pub use sync_group_request::SyncGroupRequest;
+pub use sync_group_response::SyncGroupResponse;
 
 /// Whether `api_version` of the request identified by `api_key` uses the
 /// flexible (compact) encoding. `None` when the api key has no generated
@@ -54,11 +74,15 @@ pub fn request_is_flexible(api_key: i16, api_version: i16) -> Option<bool> {
         19 => Some(create_topics_request::is_flexible(api_version)),
         1 => Some(fetch_request::is_flexible(api_version)),
         10 => Some(find_coordinator_request::is_flexible(api_version)),
+        12 => Some(heartbeat_request::is_flexible(api_version)),
+        11 => Some(join_group_request::is_flexible(api_version)),
+        13 => Some(leave_group_request::is_flexible(api_version)),
         2 => Some(list_offsets_request::is_flexible(api_version)),
         3 => Some(metadata_request::is_flexible(api_version)),
         8 => Some(offset_commit_request::is_flexible(api_version)),
         9 => Some(offset_fetch_request::is_flexible(api_version)),
         0 => Some(produce_request::is_flexible(api_version)),
+        14 => Some(sync_group_request::is_flexible(api_version)),
         _ => None,
     }
 }
