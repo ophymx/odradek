@@ -5,7 +5,7 @@
 //! catalog [`SERVER_CHECKS`] is the single source of truth: [`run`]
 //! executes exactly the Server-role checks it lists, in order.
 //!
-//! All traffic goes through one exchange path ([`checked_call`]) that
+//! All traffic goes through one exchange path (`checked_call`) that
 //! always validates the correlation echo, decodes the response header and
 //! body, and rejects trailing bytes — no response gets a lighter
 //! inspection than any other.

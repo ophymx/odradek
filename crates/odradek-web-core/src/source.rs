@@ -126,6 +126,7 @@ impl From<odradek_client::ClientError> for SourceError {
             ClientError::Sasl(_) => SourceErrorKind::Auth,
             ClientError::ConnectionClosed
             | ClientError::Io(_)
+            | ClientError::Timeout(_)
             | ClientError::Bootstrap(_)
             | ClientError::Tls(_)
             | ClientError::UnknownLeader { .. } => SourceErrorKind::Unavailable,

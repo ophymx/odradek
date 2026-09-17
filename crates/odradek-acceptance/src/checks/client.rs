@@ -7,7 +7,7 @@
 //! answers just enough of the protocol to keep a real client talking
 //! (ApiVersions, Metadata, and empty Produce/Fetch successes) and records
 //! every frame; the catalogued checks ([`CLIENT_CHECKS`]) are evaluated
-//! over the recorded [`Session`]. When the harness itself cannot run —
+//! over the recorded `Session`. When the harness itself cannot run —
 //! a listener fails to bind, or no client ever connects before the
 //! [`ObserveConfig::accept_timeout`] deadline — [`run`] returns an
 //! infrastructure error instead of fabricating check outcomes.
