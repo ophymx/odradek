@@ -119,6 +119,7 @@ struct Inner {
     writer: AsyncMutex<WriteHalf>,
     next_correlation: AtomicI32,
     client_id: String,
+    request_timeout: std::time::Duration,
     reader: JoinHandle<()>,
 }
 
@@ -179,6 +180,7 @@ impl Connection {
                 writer: AsyncMutex::new(write_half),
                 next_correlation: AtomicI32::new(1),
                 client_id: config.client_id.clone(),
+                request_timeout: config.request_timeout,
                 reader,
             }),
         })
@@ -187,7 +189,34 @@ impl Connection {
     /// Send a request body (already encoded at `api_version`) and await the
     /// matching response body. The request/response headers and framing are
     /// handled here.
+    ///
+    /// The wait is bounded by [`crate::ClientConfig::request_timeout`]. A
+    /// request that blows it fails with [`ClientError::Timeout`] and closes
+    /// the connection: the broker answers a connection's requests strictly
+    /// in order, so everything pipelined behind a hung request is hung too.
     pub async fn request(
+        &self,
+        api_key: i16,
+        api_version: i16,
+        body: &[u8],
+    ) -> Result<Bytes, ClientError> {
+        match tokio::time::timeout(
+            self.inner.request_timeout,
+            self.request_unbounded(api_key, api_version, body),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                // The pipeline behind the hung request is dead with it;
+                // fail everything so callers redial rather than queue.
+                self.inner.shared.fail_all();
+                Err(ClientError::Timeout("response"))
+            }
+        }
+    }
+
+    async fn request_unbounded(
         &self,
         api_key: i16,
         api_version: i16,

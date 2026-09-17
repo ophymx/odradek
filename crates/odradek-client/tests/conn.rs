@@ -2,7 +2,7 @@
 //! broker speaking real wire bytes through the same protocol crate.
 
 use bytes::{BufMut, Bytes, BytesMut};
-use odradek_client::{ClientConfig, Connection};
+use odradek_client::{ClientConfig, ClientError, Connection};
 use odradek_protocol::header::{request_header_version, response_header_version};
 use odradek_protocol::messages::api_versions_request::ApiVersionsRequest;
 use odradek_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
@@ -190,4 +190,39 @@ async fn responses_match_by_correlation_id_out_of_order() {
     broker.await.unwrap();
     assert_eq!(one.as_deref(), Some("one"));
     assert_eq!(two.as_deref(), Some("two"));
+}
+
+#[tokio::test]
+async fn hung_broker_times_out_and_poisons_the_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+
+    // A broker that swallows the request and never answers.
+    let broker = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut stream).await;
+        std::future::pending::<()>().await;
+    });
+
+    let mut config = ClientConfig::default();
+    config.request_timeout = std::time::Duration::from_millis(200);
+    let conn = Connection::connect(&addr, &config).await.unwrap();
+    let mut topic = odradek_protocol::messages::metadata_request::MetadataRequestTopic::default();
+    topic.name = Some("t".into());
+    let mut req = MetadataRequest::default();
+    req.topics = Some(vec![topic]);
+    let mut body = BytesMut::new();
+    req.encode(&mut body, 12).unwrap();
+
+    match conn.request(3, 12, &body).await {
+        Err(ClientError::Timeout(what)) => assert_eq!(what, "response"),
+        other => panic!("expected Timeout, got {other:?}"),
+    }
+    // The hung request took its connection with it: the broker answers a
+    // connection's requests in order, so the pipeline behind it was dead.
+    match conn.request(3, 12, &body).await {
+        Err(ClientError::ConnectionClosed) => {}
+        other => panic!("expected ConnectionClosed, got {other:?}"),
+    }
+    broker.abort();
 }

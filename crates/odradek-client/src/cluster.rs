@@ -39,6 +39,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use bytes::BytesMut;
 use odradek_protocol::ErrorCode;
+use odradek_protocol::messages::create_topics_request::{CreatableTopic, CreateTopicsRequest};
+use odradek_protocol::messages::create_topics_response::CreateTopicsResponse;
 use odradek_protocol::messages::find_coordinator_request::FindCoordinatorRequest;
 use odradek_protocol::messages::find_coordinator_response::FindCoordinatorResponse;
 use odradek_protocol::messages::metadata_request::{MetadataRequest, MetadataRequestTopic};
@@ -87,6 +89,10 @@ pub struct Broker {
 /// The mutable half of a cluster: caches every handle shares.
 #[derive(Debug, Default)]
 struct State {
+    /// The control-plane connection (metadata refresh, FindCoordinator,
+    /// admin). `None` after a failure; the next use redials, failing over
+    /// from the configured bootstrap servers to any known broker.
+    control: Option<Broker>,
     brokers: HashMap<i32, BrokerInfo>,
     topics: HashMap<String, Vec<PartitionInfo>>,
     conns: HashMap<i32, Broker>,
@@ -97,7 +103,10 @@ struct State {
 #[derive(Debug)]
 struct Inner {
     config: ClientConfig,
-    bootstrap: Broker,
+    /// The connection the cluster bootstrapped through, frozen for
+    /// [`Cluster::bootstrap_broker`]. Control-plane traffic uses the
+    /// replaceable [`State::control`] slot instead.
+    initial: Broker,
     state: Mutex<State>,
 }
 
@@ -116,11 +125,15 @@ impl Cluster {
         for addr in &config.bootstrap_servers {
             match dial(addr, &config).await {
                 Ok(bootstrap) => {
+                    let state = State {
+                        control: Some(bootstrap.clone()),
+                        ..State::default()
+                    };
                     return Ok(Cluster {
                         inner: Arc::new(Inner {
                             config,
-                            bootstrap,
-                            state: Mutex::new(State::default()),
+                            initial: bootstrap,
+                            state: Mutex::new(state),
                         }),
                     });
                 }
@@ -138,12 +151,28 @@ impl Cluster {
             .expect("cluster state lock poisoned")
     }
 
-    /// Fetch metadata for `topics` through the bootstrap connection and
-    /// update the broker and leadership caches.
+    /// Fetch metadata for `topics` through the control-plane connection
+    /// and update the broker and leadership caches. A dead control
+    /// connection fails over: the redial tries the configured bootstrap
+    /// servers and every currently-known broker.
     pub async fn refresh_metadata(&self, topics: &[&str]) -> Result<(), ClientError> {
-        let version = self
-            .inner
-            .bootstrap
+        let broker = self.control_broker().await?;
+        match self.refresh_metadata_via(&broker, topics).await {
+            Err(e) if is_control_failure(&e) => {
+                self.forget_control();
+                let broker = self.control_broker().await?;
+                self.refresh_metadata_via(&broker, topics).await
+            }
+            other => other,
+        }
+    }
+
+    async fn refresh_metadata_via(
+        &self,
+        broker: &Broker,
+        topics: &[&str],
+    ) -> Result<(), ClientError> {
+        let version = broker
             .ranges
             .pick(MetadataRequest::API_KEY, METADATA_SUPPORTED)?;
         let mut request = MetadataRequest::default();
@@ -160,9 +189,7 @@ impl Cluster {
         request.allow_auto_topic_creation = false;
         let mut body = BytesMut::new();
         request.encode(&mut body, version)?;
-        let mut resp = self
-            .inner
-            .bootstrap
+        let mut resp = broker
             .conn
             .request(MetadataRequest::API_KEY, version, &body)
             .await?;
@@ -211,10 +238,47 @@ impl Cluster {
         Ok(())
     }
 
-    /// The negotiated bootstrap connection, for requests that need no
-    /// routing (admin calls, probes).
+    /// The connection this cluster originally bootstrapped through.
+    ///
+    /// Frozen at connect time: if that broker dies this handle stays
+    /// dead. Prefer [`Cluster::control_broker`], which redials and fails
+    /// over, for admin calls and probes.
     pub fn bootstrap_broker(&self) -> &Broker {
-        &self.inner.bootstrap
+        &self.inner.initial
+    }
+
+    /// A live control-plane connection, for requests that need no
+    /// routing (admin calls, probes). Redials on first use after a
+    /// failure, trying the configured bootstrap servers and every
+    /// currently-known broker until one answers.
+    pub async fn control_broker(&self) -> Result<Broker, ClientError> {
+        if let Some(broker) = self.state().control.clone() {
+            return Ok(broker);
+        }
+        // Candidates: the configured bootstrap list, then everything
+        // metadata has taught us since — dedup'd, lock dropped before
+        // any dialing.
+        let mut candidates = self.inner.config.bootstrap_servers.clone();
+        candidates.extend(self.state().brokers.values().map(BrokerInfo::addr));
+        let mut seen = std::collections::HashSet::new();
+        candidates.retain(|addr| seen.insert(addr.clone()));
+        let mut last = String::from("no control-plane candidates");
+        for addr in &candidates {
+            match dial(addr, &self.inner.config).await {
+                Ok(broker) => {
+                    // A concurrent redial may have won; keep the winner.
+                    let mut state = self.state();
+                    return Ok(state.control.get_or_insert(broker).clone());
+                }
+                Err(e) => last = format!("{addr}: {e}"),
+            }
+        }
+        Err(ClientError::Bootstrap(last))
+    }
+
+    /// Drop the control-plane connection; the next use redials.
+    fn forget_control(&self) {
+        self.state().control = None;
     }
 
     /// Known brokers, as of the last metadata refresh.
@@ -303,43 +367,52 @@ impl Cluster {
         let node_id = match cached {
             Some(node_id) => node_id,
             None => {
-                let version = self
-                    .inner
-                    .bootstrap
-                    .ranges
-                    .pick(FindCoordinatorRequest::API_KEY, FIND_COORDINATOR_SUPPORTED)?;
-                let mut request = FindCoordinatorRequest::default();
-                request.key = group.to_owned();
-                request.key_type = 0; // group coordinator
-                let mut body = BytesMut::new();
-                request.encode(&mut body, version)?;
-                let mut resp = self
-                    .inner
-                    .bootstrap
-                    .conn
-                    .request(FindCoordinatorRequest::API_KEY, version, &body)
-                    .await?;
-                let resp = FindCoordinatorResponse::decode(&mut resp, version)?;
-                let code = ErrorCode(resp.error_code);
-                if !code.is_ok() {
-                    return Err(ClientError::Broker(code));
+                // A dead control connection fails over like metadata does.
+                let broker = self.control_broker().await?;
+                match self.find_coordinator(&broker, group).await {
+                    Err(e) if is_control_failure(&e) => {
+                        self.forget_control();
+                        let broker = self.control_broker().await?;
+                        self.find_coordinator(&broker, group).await?
+                    }
+                    other => other?,
                 }
-                let mut state = self.state();
-                // The response names the coordinator's endpoint directly;
-                // make it dialable even before any metadata refresh.
-                state.brokers.insert(
-                    resp.node_id,
-                    BrokerInfo {
-                        node_id: resp.node_id,
-                        host: resp.host.clone(),
-                        port: resp.port,
-                    },
-                );
-                state.coordinators.insert(group.to_owned(), resp.node_id);
-                resp.node_id
             }
         };
         self.broker(node_id).await
+    }
+
+    async fn find_coordinator(&self, broker: &Broker, group: &str) -> Result<i32, ClientError> {
+        let version = broker
+            .ranges
+            .pick(FindCoordinatorRequest::API_KEY, FIND_COORDINATOR_SUPPORTED)?;
+        let mut request = FindCoordinatorRequest::default();
+        request.key = group.to_owned();
+        request.key_type = 0; // group coordinator
+        let mut body = BytesMut::new();
+        request.encode(&mut body, version)?;
+        let mut resp = broker
+            .conn
+            .request(FindCoordinatorRequest::API_KEY, version, &body)
+            .await?;
+        let resp = FindCoordinatorResponse::decode(&mut resp, version)?;
+        let code = ErrorCode(resp.error_code);
+        if !code.is_ok() {
+            return Err(ClientError::Broker(code));
+        }
+        let mut state = self.state();
+        // The response names the coordinator's endpoint directly;
+        // make it dialable even before any metadata refresh.
+        state.brokers.insert(
+            resp.node_id,
+            BrokerInfo {
+                node_id: resp.node_id,
+                host: resp.host.clone(),
+                port: resp.port,
+            },
+        );
+        state.coordinators.insert(group.to_owned(), resp.node_id);
+        Ok(resp.node_id)
     }
 
     /// Forget `group`'s discovered coordinator — e.g. after
@@ -352,12 +425,100 @@ impl Cluster {
     }
 }
 
-async fn dial(addr: &str, config: &ClientConfig) -> Result<Broker, ClientError> {
-    let conn = Connection::connect(addr, config).await?;
-    let ranges = conn.negotiate().await?;
-    #[cfg(feature = "sasl")]
-    if let Some(sasl) = &config.sasl {
-        crate::sasl::authenticate(&conn, &ranges, sasl).await?;
+/// CreateTopics versions this client speaks: v2+ for the per-topic error
+/// message, v7 the last before topic-id responses.
+const CREATE_TOPICS_SUPPORTED: (i16, i16) = (2, 7);
+
+/// Broker-side deadline for a CreateTopics request.
+const CREATE_TOPICS_TIMEOUT_MS: i32 = 30_000;
+
+impl Cluster {
+    /// Create `name` with `partitions` partitions at `replication_factor`,
+    /// through the control-plane connection.
+    ///
+    /// Any per-topic error — including `TOPIC_ALREADY_EXISTS` — surfaces
+    /// as [`ClientError::Broker`]; callers that tolerate an existing
+    /// topic can match on the code.
+    pub async fn create_topic(
+        &self,
+        name: &str,
+        partitions: i32,
+        replication_factor: i16,
+    ) -> Result<(), ClientError> {
+        let broker = self.control_broker().await?;
+        match self
+            .create_topic_via(&broker, name, partitions, replication_factor)
+            .await
+        {
+            Err(e) if is_control_failure(&e) => {
+                self.forget_control();
+                let broker = self.control_broker().await?;
+                self.create_topic_via(&broker, name, partitions, replication_factor)
+                    .await
+            }
+            other => other,
+        }
     }
-    Ok(Broker { conn, ranges })
+
+    async fn create_topic_via(
+        &self,
+        broker: &Broker,
+        name: &str,
+        partitions: i32,
+        replication_factor: i16,
+    ) -> Result<(), ClientError> {
+        let version = broker
+            .ranges
+            .pick(CreateTopicsRequest::API_KEY, CREATE_TOPICS_SUPPORTED)?;
+        let mut creatable = CreatableTopic::default();
+        creatable.name = name.to_owned();
+        creatable.num_partitions = partitions;
+        creatable.replication_factor = replication_factor;
+        let mut request = CreateTopicsRequest::default();
+        request.topics = vec![creatable];
+        request.timeout_ms = CREATE_TOPICS_TIMEOUT_MS;
+        let mut body = BytesMut::new();
+        request.encode(&mut body, version)?;
+        let mut resp = broker
+            .conn
+            .request(CreateTopicsRequest::API_KEY, version, &body)
+            .await?;
+        let resp = CreateTopicsResponse::decode(&mut resp, version)?;
+        let entry = resp.topics.iter().find(|t| t.name == name).ok_or_else(|| {
+            ClientError::ProtocolViolation(format!("create topics response omits {name}"))
+        })?;
+        let code = ErrorCode(entry.error_code);
+        if code.is_ok() {
+            Ok(())
+        } else {
+            Err(ClientError::Broker(code))
+        }
+    }
+}
+
+/// True when the control-plane connection itself failed — closed under
+/// us, an I/O error, or a client-side timeout — as opposed to the
+/// broker answering with an error. The remedy is dropping the
+/// connection and failing over, not resending.
+fn is_control_failure(e: &ClientError) -> bool {
+    matches!(
+        e,
+        ClientError::ConnectionClosed | ClientError::Io(_) | ClientError::Timeout(_)
+    )
+}
+
+/// One full connection establishment — TCP, TLS, ApiVersions, SASL —
+/// bounded by [`ClientConfig::connect_timeout`].
+async fn dial(addr: &str, config: &ClientConfig) -> Result<Broker, ClientError> {
+    tokio::time::timeout(config.connect_timeout, async {
+        let conn = Connection::connect(addr, config).await?;
+        let ranges = conn.negotiate().await?;
+        #[cfg(feature = "sasl")]
+        if let Some(sasl) = &config.sasl {
+            crate::sasl::authenticate(&conn, &ranges, sasl).await?;
+        }
+        Ok(Broker { conn, ranges })
+    })
+    .await
+    .unwrap_or(Err(ClientError::Timeout("connect")))
 }

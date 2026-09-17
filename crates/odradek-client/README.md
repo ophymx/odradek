@@ -10,16 +10,22 @@ one exception).
   negotiation with the `UNSUPPORTED_VERSION` downgrade path; plaintext
   or TLS (Mozilla roots, custom CA, or caller-built config); optional
   SASL — PLAIN and SCRAM-SHA-256/512 with server-signature
-  verification — authenticated on every connection.
+  verification — authenticated on every connection; client-side
+  connect and per-request timeouts, so a hung broker cannot hang the
+  caller.
 - **Cluster layer**: metadata discovery, per-broker connection pool and
-  version ranges, partition-leader routing, coordinator discovery.
+  version ranges, partition-leader routing, coordinator discovery, a
+  control-plane connection that fails over across bootstrap servers
+  and known brokers, and topic creation (`Cluster::create_topic`).
 - **Producer**: per-partition batching (size-triggered or explicit
-  flush), gzip / lz4 / snappy / zstd compression, retries through
-  leadership changes.
+  flush), keyed produce with Kafka's default partitioner (murmur2,
+  Java-compatible) and round-robin for keyless records, gzip / lz4 /
+  snappy / zstd compression, retries through leadership changes.
 - **Consumer**: fetch with decompression and absolute offsets,
   earliest/latest lookup, committed offsets under a group id, and
   classic consumer-group membership (join/sync/heartbeat/leave with
-  Kafka-compatible range assignment).
+  Kafka-compatible range assignment); group members commit offsets
+  under their live generation, so the coordinator fences zombies.
 
 `Cluster` is a cheap clonable handle: clone it per component and they
 share one authenticated connection pool and metadata cache.

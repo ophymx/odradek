@@ -6,11 +6,7 @@
 //!     [--ca cert.pem] [--mechanism plain|scram256|scram512 --user u --pass p]
 //! ```
 
-use bytes::{Bytes, BytesMut};
-use odradek_client::protocol::messages::create_topics_request::{
-    CreatableTopic, CreateTopicsRequest,
-};
-use odradek_client::protocol::messages::create_topics_response::CreateTopicsResponse;
+use bytes::Bytes;
 use odradek_client::protocol::records::Record;
 use odradek_client::{ClientConfig, Cluster, Consumer, Mechanism, Producer, SaslConfig, Tls};
 
@@ -57,7 +53,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_millis()
     );
     let cluster = Cluster::connect(config).await?;
-    create_topic(&cluster, &topic).await?;
+    cluster.create_topic(&topic, 1, 1).await?;
+    // Give leadership a moment to settle before the first produce.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let mut producer = Producer::new(cluster.clone());
     producer
@@ -79,30 +77,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(b"secured".as_slice())
     );
     println!("ok: produced and fetched over the secured connection");
-    Ok(())
-}
-
-async fn create_topic(cluster: &Cluster, topic: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let broker = cluster.bootstrap_broker();
-    let version = broker.ranges.pick(CreateTopicsRequest::API_KEY, (2, 7))?;
-    let mut creatable = CreatableTopic::default();
-    creatable.name = topic.to_owned();
-    creatable.num_partitions = 1;
-    creatable.replication_factor = 1;
-    let mut request = CreateTopicsRequest::default();
-    request.topics = vec![creatable];
-    request.timeout_ms = 30_000;
-    let mut body = BytesMut::new();
-    request.encode(&mut body, version)?;
-    let mut resp = broker
-        .conn
-        .request(CreateTopicsRequest::API_KEY, version, &body)
-        .await?;
-    let resp = CreateTopicsResponse::decode(&mut resp, version)?;
-    let code = resp.topics.first().map_or(-1, |t| t.error_code);
-    if code != 0 {
-        return Err(format!("CreateTopics failed with error code {code}").into());
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     Ok(())
 }

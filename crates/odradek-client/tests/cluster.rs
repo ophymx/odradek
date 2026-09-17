@@ -32,6 +32,9 @@ const COORDINATOR: i32 = 1;
 /// Stored record sets per (topic, partition), verbatim as produced.
 type Logs = Arc<Mutex<std::collections::HashMap<(String, i32), BytesMut>>>;
 
+/// Topic names accepted by the fake's CreateTopics handler.
+type Created = Arc<Mutex<std::collections::HashSet<String>>>;
+
 /// One consumer group's coordinator state (a single group suffices).
 #[derive(Default)]
 struct GroupState {
@@ -48,8 +51,12 @@ type Group = Arc<Mutex<GroupState>>;
 struct FakeCluster {
     /// node_id -> host:port
     endpoints: Vec<(i32, String)>,
+    /// node_id -> the broker's accept-loop task; aborting it drops the
+    /// listener and every accepted connection (see `kill_broker`).
+    brokers: Vec<(i32, tokio::task::JoinHandle<()>)>,
     arrivals: Arrivals,
     offsets: Offsets,
+    created: Created,
     // Read back only by the codec roundtrip test, which needs every codec.
     #[cfg_attr(
         not(all(
@@ -80,37 +87,63 @@ async fn spawn_fake_cluster(n: i32, no_leader: &'static [i32]) -> FakeCluster {
     let offsets: Offsets = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let logs: Logs = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let group: Group = Arc::new(Mutex::new(GroupState::default()));
+    let created: Created = Arc::new(Mutex::new(std::collections::HashSet::new()));
 
+    let mut brokers = Vec::new();
     for (node_id, listener) in listeners {
         let endpoints = endpoints.clone();
         let arrivals = Arc::clone(&arrivals);
         let offsets = Arc::clone(&offsets);
         let logs = Arc::clone(&logs);
         let group = Arc::clone(&group);
-        tokio::spawn(async move {
+        let created = Arc::clone(&created);
+        let handle = tokio::spawn(async move {
+            // The accept loop owns its connections' tasks: aborting the
+            // loop drops the JoinSet, which aborts them all — the whole
+            // broker dies at once, listener and live sockets together.
+            let mut conns = tokio::task::JoinSet::new();
             loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    return;
-                };
-                tokio::spawn(serve_conn(
-                    stream,
-                    node_id,
-                    endpoints.clone(),
-                    Arc::clone(&arrivals),
-                    Arc::clone(&offsets),
-                    Arc::clone(&logs),
-                    Arc::clone(&group),
-                    no_leader,
-                ));
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else { return };
+                        conns.spawn(serve_conn(
+                            stream,
+                            node_id,
+                            endpoints.clone(),
+                            Arc::clone(&arrivals),
+                            Arc::clone(&offsets),
+                            Arc::clone(&logs),
+                            Arc::clone(&group),
+                            Arc::clone(&created),
+                            no_leader,
+                        ));
+                    }
+                    Some(_) = conns.join_next() => {}
+                }
             }
         });
+        brokers.push((node_id, handle));
     }
     FakeCluster {
         endpoints,
+        brokers,
         arrivals,
         offsets,
+        created,
         logs,
         group,
+    }
+}
+
+impl FakeCluster {
+    /// Kill one broker: its listener closes and every established
+    /// connection to it drops, as if the process died.
+    fn kill_broker(&self, node_id: i32) {
+        for (id, handle) in &self.brokers {
+            if *id == node_id {
+                handle.abort();
+            }
+        }
     }
 }
 
@@ -125,6 +158,7 @@ async fn serve_conn(
     offsets: Offsets,
     logs: Logs,
     group: Group,
+    created: Created,
     no_leader: &'static [i32],
 ) {
     loop {
@@ -159,6 +193,7 @@ async fn serve_conn(
                     (14, 3, 5),
                     (12, 0, 4),
                     (13, 0, 5),
+                    (19, 2, 7),
                 ]
                 .into_iter()
                 .map(|(api_key, min_version, max_version)| {
@@ -323,17 +358,33 @@ async fn serve_conn(
                     OffsetCommitResponse, OffsetCommitResponsePartition, OffsetCommitResponseTopic,
                 };
                 let req = OffsetCommitRequest::decode(&mut frame, api_version).unwrap();
-                assert_eq!(req.generation_id_or_member_epoch, -1);
-                assert!(req.member_id.is_empty());
                 let topic = &req.topics[0];
                 let p = &topic.partitions[0];
-                offsets.lock().unwrap().insert(
-                    (req.group_id.clone(), topic.name.clone(), p.partition_index),
-                    (p.committed_offset, node_id),
-                );
+                // The simple-consumer path (generation -1, no member id)
+                // is unfenced; a member's commit must carry its current
+                // identity or be refused, like a real coordinator.
+                let error_code =
+                    if req.generation_id_or_member_epoch == -1 && req.member_id.is_empty() {
+                        0
+                    } else {
+                        let state = group.lock().unwrap();
+                        if !state.members.iter().any(|(id, _)| *id == req.member_id) {
+                            25 // UNKNOWN_MEMBER_ID
+                        } else if req.generation_id_or_member_epoch != state.generation {
+                            22 // ILLEGAL_GENERATION
+                        } else {
+                            0
+                        }
+                    };
+                if error_code == 0 {
+                    offsets.lock().unwrap().insert(
+                        (req.group_id.clone(), topic.name.clone(), p.partition_index),
+                        (p.committed_offset, node_id),
+                    );
+                }
                 let mut presp = OffsetCommitResponsePartition::default();
                 presp.partition_index = p.partition_index;
-                presp.error_code = 0;
+                presp.error_code = error_code;
                 let mut tresp = OffsetCommitResponseTopic::default();
                 tresp.name = topic.name.clone();
                 tresp.partitions = vec![presp];
@@ -462,6 +513,24 @@ async fn serve_conn(
                 LeaveGroupResponse::default()
                     .encode(&mut buf, api_version)
                     .unwrap();
+                buf.freeze()
+            }
+            19 => {
+                use odradek_protocol::messages::create_topics_request::CreateTopicsRequest;
+                use odradek_protocol::messages::create_topics_response::{
+                    CreatableTopicResult, CreateTopicsResponse,
+                };
+                let req = CreateTopicsRequest::decode(&mut frame, api_version).unwrap();
+                let mut resp = CreateTopicsResponse::default();
+                for t in &req.topics {
+                    let fresh = created.lock().unwrap().insert(t.name.clone());
+                    let mut tresp = CreatableTopicResult::default();
+                    tresp.name = t.name.clone();
+                    tresp.error_code = if fresh { 0 } else { 36 }; // TOPIC_ALREADY_EXISTS
+                    resp.topics.push(tresp);
+                }
+                let mut buf = BytesMut::new();
+                resp.encode(&mut buf, api_version).unwrap();
                 buf.freeze()
             }
             other => panic!("fake broker got api key {other}"),
@@ -913,4 +982,132 @@ async fn one_cluster_handle_is_shared_across_concurrent_tasks() {
     // A consumer over the same handle reuses what the producers learned.
     let consumer = Consumer::new(cluster);
     assert_eq!(consumer.latest_offset(TOPIC, 1).await.unwrap(), 9);
+}
+
+#[tokio::test]
+async fn enqueue_keyed_routes_by_key_and_round_robins_keyless() {
+    use odradek_client::Producer;
+    use odradek_protocol::records::Record;
+
+    let fake = spawn_fake_cluster(3, &[]).await;
+    let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+    let mut producer = Producer::new(cluster);
+
+    // Equal keys land in one partition: one delivery of both records.
+    // The first call refreshes metadata itself (nothing cached yet).
+    for value in ["one", "two"] {
+        producer
+            .enqueue_keyed(
+                TOPIC,
+                Record {
+                    key: Some(Bytes::from_static(b"stable-key")),
+                    value: Some(Bytes::from_static(value.as_bytes())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let deliveries = producer.flush().await.unwrap();
+    assert_eq!(deliveries.len(), 1, "equal keys share a partition");
+    assert_eq!(deliveries[0].records, 2);
+
+    // Keyless records round-robin across the topic's three partitions.
+    for _ in 0..3 {
+        producer
+            .enqueue_keyed(
+                TOPIC,
+                Record {
+                    value: Some(Bytes::from_static(b"keyless")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let mut partitions: Vec<i32> = producer
+        .flush()
+        .await
+        .unwrap()
+        .iter()
+        .map(|d| d.partition)
+        .collect();
+    partitions.sort_unstable();
+    assert_eq!(partitions, vec![0, 1, 2]);
+}
+
+#[tokio::test]
+async fn control_plane_fails_over_when_the_bootstrap_broker_dies() {
+    let fake = spawn_fake_cluster(3, &[]).await;
+    // Bootstrap through broker 0 only.
+    let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+    cluster.refresh_metadata(&[TOPIC]).await.unwrap();
+    assert_eq!(cluster.brokers().len(), 3);
+
+    // Broker 0 — the only configured bootstrap server — dies: listener
+    // and established connections included.
+    fake.kill_broker(0);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // The next refresh rides the failover: the dead control connection
+    // is dropped and the redial falls through the dead bootstrap address
+    // to a known broker.
+    cluster.refresh_metadata(&[TOPIC]).await.unwrap();
+    assert_eq!(cluster.brokers().len(), 3);
+
+    // Coordinator discovery uses the same control plane.
+    use odradek_client::Consumer;
+    let consumer = Consumer::new(cluster);
+    consumer.commit_offset("g1", TOPIC, 1, 17).await.unwrap();
+    assert_eq!(
+        consumer.committed_offset("g1", TOPIC, 1).await.unwrap(),
+        Some(17)
+    );
+}
+
+#[tokio::test]
+async fn create_topic_speaks_create_topics_and_surfaces_duplicates() {
+    use odradek_protocol::ErrorCode;
+
+    let fake = spawn_fake_cluster(1, &[]).await;
+    let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+
+    cluster.create_topic("fresh-topic", 3, 1).await.unwrap();
+    assert!(fake.created.lock().unwrap().contains("fresh-topic"));
+
+    // Creating it again is an error the caller can match on.
+    match cluster.create_topic("fresh-topic", 3, 1).await {
+        Err(ClientError::Broker(code)) => assert_eq!(code, ErrorCode::TOPIC_ALREADY_EXISTS),
+        other => panic!("expected TOPIC_ALREADY_EXISTS, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn stale_generation_commit_is_fenced() {
+    use odradek_client::{GroupConfig, GroupMember};
+    use odradek_protocol::ErrorCode;
+
+    let fake = spawn_fake_cluster(3, &[]).await;
+    let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+    let member = GroupMember::join(cluster, "g1", &[TOPIC], GroupConfig::default())
+        .await
+        .unwrap();
+
+    // A commit carrying the member's live generation lands.
+    member.commit_offset(TOPIC, 0, 11).await.unwrap();
+    assert_eq!(member.committed_offset(TOPIC, 0).await.unwrap(), Some(11));
+    let (offset, committed_at) = fake.offsets.lock().unwrap()[&("g1".into(), TOPIC.into(), 0)];
+    assert_eq!(offset, 11);
+    assert_eq!(committed_at, COORDINATOR);
+
+    // The group rebalances away from under us; the stale generation's
+    // commit is fenced, not silently applied.
+    fake.group.lock().unwrap().generation += 1;
+    match member.commit_offset(TOPIC, 0, 12).await {
+        Err(ClientError::Broker(code)) => assert_eq!(code, ErrorCode::ILLEGAL_GENERATION),
+        other => panic!("expected ILLEGAL_GENERATION, got {other:?}"),
+    }
+    // The fenced commit changed nothing.
+    let (offset, _) = fake.offsets.lock().unwrap()[&("g1".into(), TOPIC.into(), 0)];
+    assert_eq!(offset, 11);
 }

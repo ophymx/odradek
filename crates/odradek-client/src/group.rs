@@ -33,6 +33,7 @@ use odradek_protocol::messages::sync_group_response::SyncGroupResponse;
 
 use crate::cluster::Cluster;
 use crate::error::ClientError;
+use crate::offsets::{self, CommitIdentity};
 
 /// JoinGroup versions this member speaks: v4+ for the MEMBER_ID_REQUIRED
 /// handshake.
@@ -275,6 +276,77 @@ impl GroupMember {
             .request(JoinGroupRequest::API_KEY, version, &body)
             .await?;
         Ok(JoinGroupResponse::decode(&mut resp, version)?)
+    }
+
+    /// Durably commit `offset` for `topic[partition]` under this
+    /// member's group, carrying the member's real generation and member
+    /// id: a commit from a stale generation (the group rebalanced away
+    /// from under us) or a forgotten member is refused by the
+    /// coordinator — [`ClientError::Broker`] with `ILLEGAL_GENERATION`
+    /// or `UNKNOWN_MEMBER_ID` — instead of silently clobbering the new
+    /// owner's progress. Contrast [`crate::Consumer::commit_offset`],
+    /// the unfenced simple-consumer path.
+    pub async fn commit_offset(
+        &self,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+    ) -> Result<(), ClientError> {
+        // Retriable errors (the coordinator moved, the connection died)
+        // invalidate the discovered coordinator and retry; fencing
+        // errors are not retriable and surface immediately.
+        let mut last = None;
+        for round in 0..self.config.max_attempts {
+            if round > 0 {
+                tokio::time::sleep(self.config.retry_backoff).await;
+            }
+            let identity = CommitIdentity {
+                generation_id: self.generation_id,
+                member_id: &self.member_id,
+            };
+            match offsets::commit_once(
+                &self.cluster,
+                &self.group_id,
+                identity,
+                topic,
+                partition,
+                offset,
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) if e.is_retriable() => {
+                    self.cluster.forget_coordinator(&self.group_id);
+                    last = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last.unwrap_or(ClientError::ConnectionClosed))
+    }
+
+    /// The offset last committed for `topic[partition]` under this
+    /// member's group, or `None` when nothing was ever committed.
+    pub async fn committed_offset(
+        &self,
+        topic: &str,
+        partition: i32,
+    ) -> Result<Option<i64>, ClientError> {
+        let mut last = None;
+        for round in 0..self.config.max_attempts {
+            if round > 0 {
+                tokio::time::sleep(self.config.retry_backoff).await;
+            }
+            match offsets::committed_once(&self.cluster, &self.group_id, topic, partition).await {
+                Ok(v) => return Ok(v),
+                Err(e) if e.is_retriable() => {
+                    self.cluster.forget_coordinator(&self.group_id);
+                    last = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last.unwrap_or(ClientError::ConnectionClosed))
     }
 
     /// Tell the coordinator this member is alive; the caller should do

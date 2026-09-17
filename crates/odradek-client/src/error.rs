@@ -21,6 +21,11 @@ pub enum ClientError {
     /// The connection is closed; in-flight and future requests fail with this.
     #[error("connection closed")]
     ConnectionClosed,
+    /// A client-side deadline elapsed: [`crate::ClientConfig::connect_timeout`]
+    /// over a whole dial, or [`crate::ClientConfig::request_timeout`] over one
+    /// request's response wait. The payload names which.
+    #[error("timed out waiting for {0}")]
+    Timeout(&'static str),
     /// The peer broke the protocol (bad correlation id, oversized frame, ...).
     #[error("protocol violation: {0}")]
     ProtocolViolation(String),
@@ -52,7 +57,7 @@ impl ClientError {
     /// connection died under us.
     pub fn is_retriable(&self) -> bool {
         match self {
-            ClientError::ConnectionClosed | ClientError::Io(_) => true,
+            ClientError::ConnectionClosed | ClientError::Io(_) | ClientError::Timeout(_) => true,
             ClientError::Broker(code) => {
                 *code == ErrorCode::NOT_LEADER_OR_FOLLOWER
                     || *code == ErrorCode::LEADER_NOT_AVAILABLE
@@ -61,6 +66,8 @@ impl ClientError {
                     || *code == ErrorCode::COORDINATOR_LOAD_IN_PROGRESS
                     || *code == ErrorCode::COORDINATOR_NOT_AVAILABLE
                     || *code == ErrorCode::NOT_COORDINATOR
+                    || *code == ErrorCode::REQUEST_TIMED_OUT
+                    || *code == ErrorCode::KAFKA_STORAGE_ERROR
             }
             _ => false,
         }

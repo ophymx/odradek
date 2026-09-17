@@ -36,6 +36,7 @@ pub mod consumer;
 pub mod error;
 pub mod group;
 pub mod negotiate;
+mod offsets;
 pub mod producer;
 #[cfg(feature = "sasl")]
 pub mod sasl;
@@ -66,6 +67,17 @@ pub struct ClientConfig {
     pub bootstrap_servers: Vec<String>,
     /// Client id reported to the broker in every request header.
     pub client_id: String,
+    /// Ceiling on establishing one broker connection end to end: TCP
+    /// connect, TLS handshake, ApiVersions negotiation, and SASL
+    /// authentication together (default: 10s).
+    pub connect_timeout: std::time::Duration,
+    /// Ceiling on each request's wait for its response (default: 30s).
+    /// A request that blows it poisons its connection — the broker
+    /// processes a connection's requests in order, so everything queued
+    /// behind a hung request is hung too — and the next use redials.
+    /// Long-polling requests must fit under it; see
+    /// [`ConsumerConfig::max_wait_ms`].
+    pub request_timeout: std::time::Duration,
     /// TLS for every broker connection (default: plaintext).
     #[cfg(feature = "tls")]
     pub tls: Tls,
@@ -80,6 +92,8 @@ impl Default for ClientConfig {
         Self {
             bootstrap_servers: vec!["localhost:9092".to_owned()],
             client_id: "odradek".to_owned(),
+            connect_timeout: std::time::Duration::from_secs(10),
+            request_timeout: std::time::Duration::from_secs(30),
             #[cfg(feature = "tls")]
             tls: Tls::None,
             #[cfg(feature = "sasl")]

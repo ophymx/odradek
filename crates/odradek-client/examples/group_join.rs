@@ -8,10 +8,7 @@
 
 use std::time::Duration;
 
-use bytes::BytesMut;
 use odradek_client::{ClientConfig, Cluster, GroupConfig, GroupMember, HeartbeatStatus};
-use odradek_protocol::messages::create_topics_request::{CreatableTopic, CreateTopicsRequest};
-use odradek_protocol::messages::create_topics_response::CreateTopicsResponse;
 
 const PARTITIONS: i32 = 3;
 
@@ -34,7 +31,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let group = format!("{topic}-group");
 
     let cluster = Cluster::connect(config).await?;
-    create_topic(&cluster, &topic).await?;
+    cluster.create_topic(&topic, PARTITIONS, 1).await?;
+    // Give leadership a moment to settle before joining.
+    tokio::time::sleep(Duration::from_millis(500)).await;
     println!("created {topic} with {PARTITIONS} partitions");
 
     // Member A joins alone and owns everything.
@@ -124,29 +123,4 @@ fn group_config() -> GroupConfig {
 
 fn partition_count(m: &GroupMember) -> usize {
     m.assignment().iter().map(|(_, p)| p.len()).sum()
-}
-
-async fn create_topic(cluster: &Cluster, topic: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let broker = cluster.bootstrap_broker();
-    let version = broker.ranges.pick(CreateTopicsRequest::API_KEY, (2, 7))?;
-    let mut creatable = CreatableTopic::default();
-    creatable.name = topic.to_owned();
-    creatable.num_partitions = PARTITIONS;
-    creatable.replication_factor = 1;
-    let mut request = CreateTopicsRequest::default();
-    request.topics = vec![creatable];
-    request.timeout_ms = 30_000;
-    let mut body = BytesMut::new();
-    request.encode(&mut body, version)?;
-    let mut resp = broker
-        .conn
-        .request(CreateTopicsRequest::API_KEY, version, &body)
-        .await?;
-    let resp = CreateTopicsResponse::decode(&mut resp, version)?;
-    let code = resp.topics.first().map_or(-1, |t| t.error_code);
-    if code != 0 {
-        return Err(format!("CreateTopics failed with error code {code}").into());
-    }
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    Ok(())
 }

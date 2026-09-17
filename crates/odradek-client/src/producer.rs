@@ -82,6 +82,8 @@ pub struct Producer {
     cluster: Cluster,
     config: ProducerConfig,
     pending: HashMap<(String, i32), PendingBatch>,
+    /// Round-robin cursor for keyless [`Producer::enqueue_keyed`] records.
+    next_round_robin: u64,
 }
 
 impl Producer {
@@ -94,6 +96,7 @@ impl Producer {
             cluster,
             config,
             pending: HashMap::new(),
+            next_round_robin: 0,
         }
     }
 
@@ -122,6 +125,44 @@ impl Producer {
             return Ok(Some(self.flush_partition(topic, partition).await?));
         }
         Ok(None)
+    }
+
+    /// Buffer one record for `topic`, picking the partition from the
+    /// record's key with Kafka's default partitioner — murmur2 over the
+    /// key bytes, then `(hash & 0x7fffffff) % partition_count` — so
+    /// records with equal keys land on the same partition as they would
+    /// from the Java client. Keyless records round-robin across the
+    /// topic's partitions. Refreshes metadata once when the topic's
+    /// partition count is unknown; otherwise delivery follows the
+    /// [`Producer::enqueue`] rules.
+    pub async fn enqueue_keyed(
+        &mut self,
+        topic: &str,
+        record: Record,
+    ) -> Result<Option<Delivery>, ClientError> {
+        if self.cluster.partitions(topic).is_none() {
+            self.cluster.refresh_metadata(&[topic]).await?;
+        }
+        let count = self
+            .cluster
+            .partitions(topic)
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| ClientError::UnknownLeader {
+                topic: topic.to_owned(),
+                partition: -1,
+            })?
+            .len();
+        let count = i32::try_from(count).unwrap_or(i32::MAX);
+        let partition = match &record.key {
+            Some(key) => partition_for_key(key, count),
+            None => {
+                let cursor = self.next_round_robin;
+                self.next_round_robin = self.next_round_robin.wrapping_add(1);
+                let index = cursor % u64::try_from(count).expect("partition count is positive");
+                i32::try_from(index).expect("index below partition count fits i32")
+            }
+        };
+        self.enqueue(topic, partition, record).await
     }
 
     /// Records currently buffered across all partitions.
@@ -239,7 +280,10 @@ impl Producer {
             Ok(resp) => resp,
             Err(e) => {
                 // A dead pooled connection must not poison later retries.
-                if matches!(e, ClientError::ConnectionClosed | ClientError::Io(_)) {
+                if matches!(
+                    e,
+                    ClientError::ConnectionClosed | ClientError::Io(_) | ClientError::Timeout(_)
+                ) {
                     if let Some(id) = leader {
                         self.cluster.forget_broker(id);
                     }
@@ -265,6 +309,51 @@ impl Producer {
             Err(ClientError::Broker(code))
         }
     }
+}
+
+/// The partition Kafka's default partitioner picks for `key` among
+/// `count` partitions: `(murmur2(key) & 0x7fffffff) % count`.
+fn partition_for_key(key: &[u8], count: i32) -> i32 {
+    (murmur2(key) & 0x7fff_ffff) % count
+}
+
+/// Kafka's murmur2 (`org.apache.kafka.common.utils.Utils.murmur2`):
+/// 32-bit MurmurHash2 with seed `0x9747b28c`, bit-identical to the Java
+/// client so keyed records land on the same partitions.
+fn murmur2(data: &[u8]) -> i32 {
+    const SEED: u32 = 0x9747_b28c;
+    const M: u32 = 0x5bd1_e995;
+    const R: u32 = 24;
+
+    let len = u32::try_from(data.len()).expect("key length fits u32");
+    let mut h: u32 = SEED ^ len;
+
+    let mut chunks = data.chunks_exact(4);
+    for chunk in &mut chunks {
+        let mut k = u32::from_le_bytes(chunk.try_into().expect("chunk of 4"));
+        k = k.wrapping_mul(M);
+        k ^= k >> R;
+        k = k.wrapping_mul(M);
+        h = h.wrapping_mul(M);
+        h ^= k;
+    }
+
+    let tail = chunks.remainder();
+    if tail.len() >= 3 {
+        h ^= u32::from(tail[2]) << 16;
+    }
+    if tail.len() >= 2 {
+        h ^= u32::from(tail[1]) << 8;
+    }
+    if !tail.is_empty() {
+        h ^= u32::from(tail[0]);
+        h = h.wrapping_mul(M);
+    }
+
+    h ^= h >> 13;
+    h = h.wrapping_mul(M);
+    h ^= h >> 15;
+    i32::from_le_bytes(h.to_le_bytes())
 }
 
 /// Rough wire footprint of one record, for the batch-size trigger.
@@ -328,4 +417,57 @@ fn encode_batch(mut records: Vec<Record>, codec: Compression) -> Result<Vec<u8>,
     let mut out = BytesMut::new();
     batch.encode(&mut out)?;
     Ok(out.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reference vectors from Apache Kafka's own murmur2 test data
+    /// (org.apache.kafka.common.utils.UtilsTest).
+    const JAVA_VECTORS: &[(&[u8], i32)] = &[
+        (b"21", -973932308),
+        (b"foobar", -790332482),
+        (b"a-little-bit-long-string", -985981536),
+        (b"a-little-bit-longer-string", -1486304829),
+        (
+            b"lkjh234lh9fiuh90y23oiuhsafujhadof229phr9h19h89h8",
+            -58897971,
+        ),
+        (b"", 275646681),
+    ];
+
+    #[test]
+    fn murmur2_matches_the_java_client() {
+        for (input, expected) in JAVA_VECTORS {
+            assert_eq!(
+                murmur2(input),
+                *expected,
+                "murmur2({:?})",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    #[test]
+    fn keyed_partition_selection_matches_the_java_client() {
+        // (hash & 0x7fffffff) % n, checked against the vectors above.
+        assert_eq!(
+            partition_for_key(b"21", 12),
+            (-973932308i32 & 0x7fffffff) % 12
+        );
+        assert_eq!(
+            partition_for_key(b"foobar", 7),
+            (-790332482i32 & 0x7fffffff) % 7
+        );
+        // Concrete values, so a broken mask or modulus cannot cancel out.
+        assert_eq!(partition_for_key(b"21", 12), 0);
+        assert_eq!(partition_for_key(b"foobar", 7), 0);
+        assert_eq!(partition_for_key(b"a-little-bit-long-string", 5), 2);
+        assert_eq!(partition_for_key(b"a-little-bit-longer-string", 3), {
+            (-1486304829i32 & 0x7fffffff) % 3
+        });
+        // Same key, same partition, always.
+        assert_eq!(partition_for_key(b"21", 12), partition_for_key(b"21", 12));
+    }
 }

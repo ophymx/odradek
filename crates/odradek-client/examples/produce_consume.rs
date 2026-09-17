@@ -5,10 +5,8 @@
 //! cargo run -p odradek-client --example produce_consume -- localhost:9092 [gzip|lz4|snappy|zstd|none]
 //! ```
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use odradek_client::{ClientConfig, Cluster, Consumer, Producer, ProducerConfig};
-use odradek_protocol::messages::create_topics_request::{CreatableTopic, CreateTopicsRequest};
-use odradek_protocol::messages::create_topics_response::CreateTopicsResponse;
 use odradek_protocol::records::{Compression, Record};
 
 #[tokio::main(flavor = "current_thread")]
@@ -36,7 +34,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_millis()
     );
     let cluster = Cluster::connect(config).await?;
-    create_topic(&cluster, &topic).await?;
+    cluster.create_topic(&topic, 1, 1).await?;
+    // Give leadership a moment to settle before the first produce.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     println!("created topic {topic}");
 
     // Produce one compressed batch of three records.
@@ -85,33 +85,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("committed offset {committed:?} under group {group}");
     assert_eq!(committed, Some(result.next_offset));
     println!("ok");
-    Ok(())
-}
-
-async fn create_topic(cluster: &Cluster, topic: &str) -> Result<(), Box<dyn std::error::Error>> {
-    // CreateTopics has no client-layer wrapper yet; speak it raw through
-    // the bootstrap connection.
-    let broker = cluster.bootstrap_broker();
-    let version = broker.ranges.pick(CreateTopicsRequest::API_KEY, (2, 7))?;
-    let mut creatable = CreatableTopic::default();
-    creatable.name = topic.to_owned();
-    creatable.num_partitions = 1;
-    creatable.replication_factor = 1;
-    let mut request = CreateTopicsRequest::default();
-    request.topics = vec![creatable];
-    request.timeout_ms = 30_000;
-    let mut body = BytesMut::new();
-    request.encode(&mut body, version)?;
-    let mut resp = broker
-        .conn
-        .request(CreateTopicsRequest::API_KEY, version, &body)
-        .await?;
-    let resp = CreateTopicsResponse::decode(&mut resp, version)?;
-    let code = resp.topics.first().map_or(-1, |t| t.error_code);
-    if code != 0 {
-        return Err(format!("CreateTopics failed with error code {code}").into());
-    }
-    // Give leadership a moment to settle before the first produce.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     Ok(())
 }
