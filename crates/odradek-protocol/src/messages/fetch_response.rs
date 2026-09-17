@@ -695,9 +695,6 @@ impl NodeEndpoint {
             buf.put_i32(self.port);
         }
         if version >= 16 {
-            if self.rack.is_none() && !(version >= 16) {
-                return Err(EncodeError::NullField("Rack"));
-            }
             if is_flexible(version) {
                 wire::put_compact_nullable_string(buf, self.rack.as_deref());
             } else {
@@ -726,16 +723,10 @@ impl NodeEndpoint {
             this.port = wire::get_i32(buf)?;
         }
         if version >= 16 {
-            this.rack = {
-                let raw = if is_flexible(version) {
-                    wire::get_compact_nullable_string(buf)?
-                } else {
-                    wire::get_nullable_string(buf)?
-                };
-                if raw.is_none() && !(version >= 16) {
-                    return Err(DecodeError::InvalidLength(-1));
-                }
-                raw
+            this.rack = if is_flexible(version) {
+                wire::get_compact_nullable_string(buf)?
+            } else {
+                wire::get_nullable_string(buf)?
             };
         }
         if is_flexible(version) {

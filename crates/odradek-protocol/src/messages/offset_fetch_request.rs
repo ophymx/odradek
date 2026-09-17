@@ -77,7 +77,7 @@ impl OffsetFetchRequest {
                     }
                 }
                 None => {
-                    if !((2..=7).contains(&version)) {
+                    if !(version >= 2) {
                         return Err(EncodeError::NullField("Topics"));
                     }
                     if is_flexible(version) {
@@ -125,7 +125,7 @@ impl OffsetFetchRequest {
                 };
                 match len {
                     None => {
-                        if !((2..=7).contains(&version)) {
+                        if !(version >= 2) {
                             return Err(DecodeError::InvalidLength(-1));
                         }
                         None
@@ -289,9 +289,6 @@ impl OffsetFetchRequestGroup {
             }
         }
         if version >= 9 {
-            if self.member_id.is_none() && !(version >= 9) {
-                return Err(EncodeError::NullField("MemberId"));
-            }
             if is_flexible(version) {
                 wire::put_compact_nullable_string(buf, self.member_id.as_deref());
             } else {
@@ -314,9 +311,6 @@ impl OffsetFetchRequestGroup {
                     }
                 }
                 None => {
-                    if !(version >= 8) {
-                        return Err(EncodeError::NullField("Topics"));
-                    }
                     if is_flexible(version) {
                         wire::put_compact_array_len(buf, None);
                     } else {
@@ -341,16 +335,10 @@ impl OffsetFetchRequestGroup {
             };
         }
         if version >= 9 {
-            this.member_id = {
-                let raw = if is_flexible(version) {
-                    wire::get_compact_nullable_string(buf)?
-                } else {
-                    wire::get_nullable_string(buf)?
-                };
-                if raw.is_none() && !(version >= 9) {
-                    return Err(DecodeError::InvalidLength(-1));
-                }
-                raw
+            this.member_id = if is_flexible(version) {
+                wire::get_compact_nullable_string(buf)?
+            } else {
+                wire::get_nullable_string(buf)?
             };
         }
         if version >= 9 {
@@ -364,12 +352,7 @@ impl OffsetFetchRequestGroup {
                     wire::get_array_len(buf)?
                 };
                 match len {
-                    None => {
-                        if !(version >= 8) {
-                            return Err(DecodeError::InvalidLength(-1));
-                        }
-                        None
-                    }
+                    None => None,
                     Some(n) => {
                         let mut items = Vec::new();
                         for _ in 0..n {

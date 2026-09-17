@@ -342,3 +342,50 @@ fn truncated_input_errors_cleanly() {
         );
     }
 }
+
+/// The schemas carry fields whose nullableVersions is a strict subset of
+/// their versions (e.g. MetadataRequest.Topics: on the wire from v0,
+/// nullable only from v1; JoinGroupResponse.ProtocolName: v0+, nullable
+/// from v7). The generated guards at those boundaries are load-bearing:
+/// null must be an error below the nullable floor and legal at it.
+#[test]
+fn nullable_version_boundaries_are_enforced() {
+    use odradek_protocol::DecodeError;
+    use odradek_protocol::messages::join_group_response::JoinGroupResponse;
+
+    // Encode: null Topics is an error at v0, the "all topics" wire form
+    // at v1.
+    let mut request = MetadataRequest::default();
+    request.topics = None;
+    let mut buf = BytesMut::new();
+    assert!(matches!(
+        request.encode(&mut buf, 0),
+        Err(EncodeError::NullField("Topics"))
+    ));
+    buf.clear();
+    request.encode(&mut buf, 1).unwrap();
+    let mut bytes = buf.freeze();
+    let decoded = MetadataRequest::decode(&mut bytes, 1).unwrap();
+    assert!(decoded.topics.is_none());
+
+    // Decode: a null Topics array in a v0 body is a wire violation.
+    let mut null_topics_v0 = Bytes::copy_from_slice(&(-1i32).to_be_bytes());
+    assert!(matches!(
+        MetadataRequest::decode(&mut null_topics_v0, 0),
+        Err(DecodeError::InvalidLength(-1))
+    ));
+
+    // JoinGroupResponse.ProtocolName: null is an error at v6, fine at v7.
+    let mut response = JoinGroupResponse::default();
+    response.protocol_name = None;
+    let mut buf = BytesMut::new();
+    assert!(matches!(
+        response.encode(&mut buf, 6),
+        Err(EncodeError::NullField("ProtocolName"))
+    ));
+    buf.clear();
+    response.encode(&mut buf, 7).unwrap();
+    let mut bytes = buf.freeze();
+    let decoded = JoinGroupResponse::decode(&mut bytes, 7).unwrap();
+    assert!(decoded.protocol_name.is_none());
+}

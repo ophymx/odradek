@@ -90,9 +90,6 @@ impl ConsumerProtocolSubscription {
             buf.put_i32(self.generation_id);
         }
         if version >= 3 {
-            if self.rack_id.is_none() && !(version >= 3) {
-                return Err(EncodeError::NullField("RackId"));
-            }
             if is_flexible(version) {
                 wire::put_compact_nullable_string(buf, self.rack_id.as_deref());
             } else {
@@ -156,16 +153,10 @@ impl ConsumerProtocolSubscription {
             this.generation_id = wire::get_i32(buf)?;
         }
         if version >= 3 {
-            this.rack_id = {
-                let raw = if is_flexible(version) {
-                    wire::get_compact_nullable_string(buf)?
-                } else {
-                    wire::get_nullable_string(buf)?
-                };
-                if raw.is_none() && !(version >= 3) {
-                    return Err(DecodeError::InvalidLength(-1));
-                }
-                raw
+            this.rack_id = if is_flexible(version) {
+                wire::get_compact_nullable_string(buf)?
+            } else {
+                wire::get_nullable_string(buf)?
             };
         }
         if is_flexible(version) {

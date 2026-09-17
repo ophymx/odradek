@@ -65,9 +65,6 @@ impl SyncGroupResponse {
         }
         buf.put_i16(self.error_code);
         if version >= 5 {
-            if self.protocol_type.is_none() && !(version >= 5) {
-                return Err(EncodeError::NullField("ProtocolType"));
-            }
             if is_flexible(version) {
                 wire::put_compact_nullable_string(buf, self.protocol_type.as_deref());
             } else {
@@ -75,9 +72,6 @@ impl SyncGroupResponse {
             }
         }
         if version >= 5 {
-            if self.protocol_name.is_none() && !(version >= 5) {
-                return Err(EncodeError::NullField("ProtocolName"));
-            }
             if is_flexible(version) {
                 wire::put_compact_nullable_string(buf, self.protocol_name.as_deref());
             } else {
@@ -102,29 +96,17 @@ impl SyncGroupResponse {
         }
         this.error_code = wire::get_i16(buf)?;
         if version >= 5 {
-            this.protocol_type = {
-                let raw = if is_flexible(version) {
-                    wire::get_compact_nullable_string(buf)?
-                } else {
-                    wire::get_nullable_string(buf)?
-                };
-                if raw.is_none() && !(version >= 5) {
-                    return Err(DecodeError::InvalidLength(-1));
-                }
-                raw
+            this.protocol_type = if is_flexible(version) {
+                wire::get_compact_nullable_string(buf)?
+            } else {
+                wire::get_nullable_string(buf)?
             };
         }
         if version >= 5 {
-            this.protocol_name = {
-                let raw = if is_flexible(version) {
-                    wire::get_compact_nullable_string(buf)?
-                } else {
-                    wire::get_nullable_string(buf)?
-                };
-                if raw.is_none() && !(version >= 5) {
-                    return Err(DecodeError::InvalidLength(-1));
-                }
-                raw
+            this.protocol_name = if is_flexible(version) {
+                wire::get_compact_nullable_string(buf)?
+            } else {
+                wire::get_nullable_string(buf)?
             };
         }
         this.assignment = {

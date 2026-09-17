@@ -69,9 +69,6 @@ impl HeartbeatRequest {
             wire::put_string(buf, &self.member_id)?;
         }
         if version >= 3 {
-            if self.group_instance_id.is_none() && !(version >= 3) {
-                return Err(EncodeError::NullField("GroupInstanceId"));
-            }
             if is_flexible(version) {
                 wire::put_compact_nullable_string(buf, self.group_instance_id.as_deref());
             } else {
@@ -98,16 +95,10 @@ impl HeartbeatRequest {
             wire::get_string(buf)?
         };
         if version >= 3 {
-            this.group_instance_id = {
-                let raw = if is_flexible(version) {
-                    wire::get_compact_nullable_string(buf)?
-                } else {
-                    wire::get_nullable_string(buf)?
-                };
-                if raw.is_none() && !(version >= 3) {
-                    return Err(DecodeError::InvalidLength(-1));
-                }
-                raw
+            this.group_instance_id = if is_flexible(version) {
+                wire::get_compact_nullable_string(buf)?
+            } else {
+                wire::get_nullable_string(buf)?
             };
         }
         if is_flexible(version) {

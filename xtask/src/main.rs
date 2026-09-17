@@ -147,6 +147,14 @@ impl VersionRange {
         self.min > self.max
     }
 
+    /// The versions in both ranges.
+    fn intersect(self, other: VersionRange) -> VersionRange {
+        VersionRange {
+            min: self.min.max(other.min),
+            max: self.max.min(other.max),
+        }
+    }
+
     /// Rust boolean expression testing membership of `version`, folding to
     /// `true`/`false` where the outcome is constant over `valid`.
     fn expr(self, valid: VersionRange) -> String {
@@ -829,7 +837,9 @@ fn encode_field(msg: &Message, f: &Field) -> Result<String> {
 /// write target, letting tagged fields shadow it with a side buffer).
 fn encode_field_value(msg: &Message, f: &Field, path: &str) -> Result<String> {
     let flex = field_flex_expr(msg, f);
-    let nullable_expr = f.nullable.map(|r| r.expr(msg.valid));
+    // Folded over the versions the field is actually on the wire, so
+    // a guard that can never fire is not emitted at all.
+    let nullable_expr = f.nullable.map(|r| r.expr(msg.valid.intersect(f.versions)));
 
     let code = match (&f.ftype, &nullable_expr) {
         // Scalars, non-nullable
@@ -960,7 +970,9 @@ fn decode_field(msg: &Message, f: &Field) -> Result<String> {
 /// The expression decoding `f`'s value from the free variable `buf`.
 fn decode_value(msg: &Message, f: &Field) -> Result<String> {
     let flex = field_flex_expr(msg, f);
-    let nullable_expr = f.nullable.map(|r| r.expr(msg.valid));
+    // Folded over the versions the field is actually on the wire, so
+    // a guard that can never fire is not emitted at all.
+    let nullable_expr = f.nullable.map(|r| r.expr(msg.valid.intersect(f.versions)));
 
     let value = match (&f.ftype, &nullable_expr) {
         (FieldType::Bool, None) => "wire::get_bool(buf)?".to_string(),

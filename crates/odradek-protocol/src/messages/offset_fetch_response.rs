@@ -267,9 +267,6 @@ impl OffsetFetchResponsePartition {
             buf.put_i32(self.committed_leader_epoch);
         }
         if version <= 7 {
-            if self.metadata.is_none() && !(version <= 7) {
-                return Err(EncodeError::NullField("Metadata"));
-            }
             if is_flexible(version) {
                 wire::put_compact_nullable_string(buf, self.metadata.as_deref());
             } else {
@@ -297,16 +294,10 @@ impl OffsetFetchResponsePartition {
             this.committed_leader_epoch = wire::get_i32(buf)?;
         }
         if version <= 7 {
-            this.metadata = {
-                let raw = if is_flexible(version) {
-                    wire::get_compact_nullable_string(buf)?
-                } else {
-                    wire::get_nullable_string(buf)?
-                };
-                if raw.is_none() && !(version <= 7) {
-                    return Err(DecodeError::InvalidLength(-1));
-                }
-                raw
+            this.metadata = if is_flexible(version) {
+                wire::get_compact_nullable_string(buf)?
+            } else {
+                wire::get_nullable_string(buf)?
             };
         }
         if version <= 7 {
@@ -544,9 +535,6 @@ impl OffsetFetchResponsePartitions {
             buf.put_i32(self.committed_leader_epoch);
         }
         if version >= 8 {
-            if self.metadata.is_none() && !(version >= 8) {
-                return Err(EncodeError::NullField("Metadata"));
-            }
             if is_flexible(version) {
                 wire::put_compact_nullable_string(buf, self.metadata.as_deref());
             } else {
@@ -574,16 +562,10 @@ impl OffsetFetchResponsePartitions {
             this.committed_leader_epoch = wire::get_i32(buf)?;
         }
         if version >= 8 {
-            this.metadata = {
-                let raw = if is_flexible(version) {
-                    wire::get_compact_nullable_string(buf)?
-                } else {
-                    wire::get_nullable_string(buf)?
-                };
-                if raw.is_none() && !(version >= 8) {
-                    return Err(DecodeError::InvalidLength(-1));
-                }
-                raw
+            this.metadata = if is_flexible(version) {
+                wire::get_compact_nullable_string(buf)?
+            } else {
+                wire::get_nullable_string(buf)?
             };
         }
         if version >= 8 {

@@ -73,9 +73,6 @@ impl FindCoordinatorResponse {
             buf.put_i16(self.error_code);
         }
         if (1..=3).contains(&version) {
-            if self.error_message.is_none() && !((1..=3).contains(&version)) {
-                return Err(EncodeError::NullField("ErrorMessage"));
-            }
             if is_flexible(version) {
                 wire::put_compact_nullable_string(buf, self.error_message.as_deref());
             } else {
@@ -120,16 +117,10 @@ impl FindCoordinatorResponse {
             this.error_code = wire::get_i16(buf)?;
         }
         if (1..=3).contains(&version) {
-            this.error_message = {
-                let raw = if is_flexible(version) {
-                    wire::get_compact_nullable_string(buf)?
-                } else {
-                    wire::get_nullable_string(buf)?
-                };
-                if raw.is_none() && !((1..=3).contains(&version)) {
-                    return Err(DecodeError::InvalidLength(-1));
-                }
-                raw
+            this.error_message = if is_flexible(version) {
+                wire::get_compact_nullable_string(buf)?
+            } else {
+                wire::get_nullable_string(buf)?
             };
         }
         if version <= 3 {
@@ -231,9 +222,6 @@ impl Coordinator {
             buf.put_i16(self.error_code);
         }
         if version >= 4 {
-            if self.error_message.is_none() && !(version >= 4) {
-                return Err(EncodeError::NullField("ErrorMessage"));
-            }
             if is_flexible(version) {
                 wire::put_compact_nullable_string(buf, self.error_message.as_deref());
             } else {
@@ -272,16 +260,10 @@ impl Coordinator {
             this.error_code = wire::get_i16(buf)?;
         }
         if version >= 4 {
-            this.error_message = {
-                let raw = if is_flexible(version) {
-                    wire::get_compact_nullable_string(buf)?
-                } else {
-                    wire::get_nullable_string(buf)?
-                };
-                if raw.is_none() && !(version >= 4) {
-                    return Err(DecodeError::InvalidLength(-1));
-                }
-                raw
+            this.error_message = if is_flexible(version) {
+                wire::get_compact_nullable_string(buf)?
+            } else {
+                wire::get_nullable_string(buf)?
             };
         }
         if is_flexible(version) {

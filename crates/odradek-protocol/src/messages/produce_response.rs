@@ -299,9 +299,6 @@ impl PartitionProduceResponse {
             }
         }
         if version >= 8 {
-            if self.error_message.is_none() && !(version >= 8) {
-                return Err(EncodeError::NullField("ErrorMessage"));
-            }
             if is_flexible(version) {
                 wire::put_compact_nullable_string(buf, self.error_message.as_deref());
             } else {
@@ -358,16 +355,10 @@ impl PartitionProduceResponse {
             };
         }
         if version >= 8 {
-            this.error_message = {
-                let raw = if is_flexible(version) {
-                    wire::get_compact_nullable_string(buf)?
-                } else {
-                    wire::get_nullable_string(buf)?
-                };
-                if raw.is_none() && !(version >= 8) {
-                    return Err(DecodeError::InvalidLength(-1));
-                }
-                raw
+            this.error_message = if is_flexible(version) {
+                wire::get_compact_nullable_string(buf)?
+            } else {
+                wire::get_nullable_string(buf)?
             };
         }
         if is_flexible(version) {
@@ -418,9 +409,6 @@ impl BatchIndexAndErrorMessage {
             buf.put_i32(self.batch_index);
         }
         if version >= 8 {
-            if self.batch_index_error_message.is_none() && !(version >= 8) {
-                return Err(EncodeError::NullField("BatchIndexErrorMessage"));
-            }
             if is_flexible(version) {
                 wire::put_compact_nullable_string(buf, self.batch_index_error_message.as_deref());
             } else {
@@ -439,16 +427,10 @@ impl BatchIndexAndErrorMessage {
             this.batch_index = wire::get_i32(buf)?;
         }
         if version >= 8 {
-            this.batch_index_error_message = {
-                let raw = if is_flexible(version) {
-                    wire::get_compact_nullable_string(buf)?
-                } else {
-                    wire::get_nullable_string(buf)?
-                };
-                if raw.is_none() && !(version >= 8) {
-                    return Err(DecodeError::InvalidLength(-1));
-                }
-                raw
+            this.batch_index_error_message = if is_flexible(version) {
+                wire::get_compact_nullable_string(buf)?
+            } else {
+                wire::get_nullable_string(buf)?
             };
         }
         if is_flexible(version) {
@@ -553,9 +535,6 @@ impl NodeEndpoint {
             buf.put_i32(self.port);
         }
         if version >= 10 {
-            if self.rack.is_none() && !(version >= 10) {
-                return Err(EncodeError::NullField("Rack"));
-            }
             if is_flexible(version) {
                 wire::put_compact_nullable_string(buf, self.rack.as_deref());
             } else {
@@ -584,16 +563,10 @@ impl NodeEndpoint {
             this.port = wire::get_i32(buf)?;
         }
         if version >= 10 {
-            this.rack = {
-                let raw = if is_flexible(version) {
-                    wire::get_compact_nullable_string(buf)?
-                } else {
-                    wire::get_nullable_string(buf)?
-                };
-                if raw.is_none() && !(version >= 10) {
-                    return Err(DecodeError::InvalidLength(-1));
-                }
-                raw
+            this.rack = if is_flexible(version) {
+                wire::get_compact_nullable_string(buf)?
+            } else {
+                wire::get_nullable_string(buf)?
             };
         }
         if is_flexible(version) {

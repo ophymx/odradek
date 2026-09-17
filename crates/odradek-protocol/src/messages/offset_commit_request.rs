@@ -75,9 +75,6 @@ impl OffsetCommitRequest {
             wire::put_string(buf, &self.member_id)?;
         }
         if version >= 7 {
-            if self.group_instance_id.is_none() && !(version >= 7) {
-                return Err(EncodeError::NullField("GroupInstanceId"));
-            }
             if is_flexible(version) {
                 wire::put_compact_nullable_string(buf, self.group_instance_id.as_deref());
             } else {
@@ -115,16 +112,10 @@ impl OffsetCommitRequest {
             wire::get_string(buf)?
         };
         if version >= 7 {
-            this.group_instance_id = {
-                let raw = if is_flexible(version) {
-                    wire::get_compact_nullable_string(buf)?
-                } else {
-                    wire::get_nullable_string(buf)?
-                };
-                if raw.is_none() && !(version >= 7) {
-                    return Err(DecodeError::InvalidLength(-1));
-                }
-                raw
+            this.group_instance_id = if is_flexible(version) {
+                wire::get_compact_nullable_string(buf)?
+            } else {
+                wire::get_nullable_string(buf)?
             };
         }
         if version <= 4 {

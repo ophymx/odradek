@@ -78,9 +78,6 @@ impl JoinGroupResponse {
         buf.put_i16(self.error_code);
         buf.put_i32(self.generation_id);
         if version >= 7 {
-            if self.protocol_type.is_none() && !(version >= 7) {
-                return Err(EncodeError::NullField("ProtocolType"));
-            }
             if is_flexible(version) {
                 wire::put_compact_nullable_string(buf, self.protocol_type.as_deref());
             } else {
@@ -130,16 +127,10 @@ impl JoinGroupResponse {
         this.error_code = wire::get_i16(buf)?;
         this.generation_id = wire::get_i32(buf)?;
         if version >= 7 {
-            this.protocol_type = {
-                let raw = if is_flexible(version) {
-                    wire::get_compact_nullable_string(buf)?
-                } else {
-                    wire::get_nullable_string(buf)?
-                };
-                if raw.is_none() && !(version >= 7) {
-                    return Err(DecodeError::InvalidLength(-1));
-                }
-                raw
+            this.protocol_type = if is_flexible(version) {
+                wire::get_compact_nullable_string(buf)?
+            } else {
+                wire::get_nullable_string(buf)?
             };
         }
         this.protocol_name = {
@@ -223,9 +214,6 @@ impl JoinGroupResponseMember {
             wire::put_string(buf, &self.member_id)?;
         }
         if version >= 5 {
-            if self.group_instance_id.is_none() && !(version >= 5) {
-                return Err(EncodeError::NullField("GroupInstanceId"));
-            }
             if is_flexible(version) {
                 wire::put_compact_nullable_string(buf, self.group_instance_id.as_deref());
             } else {
@@ -251,16 +239,10 @@ impl JoinGroupResponseMember {
             wire::get_string(buf)?
         };
         if version >= 5 {
-            this.group_instance_id = {
-                let raw = if is_flexible(version) {
-                    wire::get_compact_nullable_string(buf)?
-                } else {
-                    wire::get_nullable_string(buf)?
-                };
-                if raw.is_none() && !(version >= 5) {
-                    return Err(DecodeError::InvalidLength(-1));
-                }
-                raw
+            this.group_instance_id = if is_flexible(version) {
+                wire::get_compact_nullable_string(buf)?
+            } else {
+                wire::get_nullable_string(buf)?
             };
         }
         this.metadata = {

@@ -172,9 +172,6 @@ impl CreatableTopicResult {
                     }
                 }
                 None => {
-                    if !(version >= 5) {
-                        return Err(EncodeError::NullField("Configs"));
-                    }
                     if is_flexible(version) {
                         wire::put_compact_array_len(buf, None);
                     } else {
@@ -234,12 +231,7 @@ impl CreatableTopicResult {
                     wire::get_array_len(buf)?
                 };
                 match len {
-                    None => {
-                        if !(version >= 5) {
-                            return Err(DecodeError::InvalidLength(-1));
-                        }
-                        None
-                    }
+                    None => None,
                     Some(n) => {
                         let mut items = Vec::new();
                         for _ in 0..n {
@@ -311,9 +303,6 @@ impl CreatableTopicConfigs {
             }
         }
         if version >= 5 {
-            if self.value.is_none() && !(version >= 5) {
-                return Err(EncodeError::NullField("Value"));
-            }
             if is_flexible(version) {
                 wire::put_compact_nullable_string(buf, self.value.as_deref());
             } else {
@@ -345,16 +334,10 @@ impl CreatableTopicConfigs {
             };
         }
         if version >= 5 {
-            this.value = {
-                let raw = if is_flexible(version) {
-                    wire::get_compact_nullable_string(buf)?
-                } else {
-                    wire::get_nullable_string(buf)?
-                };
-                if raw.is_none() && !(version >= 5) {
-                    return Err(DecodeError::InvalidLength(-1));
-                }
-                raw
+            this.value = if is_flexible(version) {
+                wire::get_compact_nullable_string(buf)?
+            } else {
+                wire::get_nullable_string(buf)?
             };
         }
         if version >= 5 {

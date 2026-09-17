@@ -131,9 +131,6 @@ impl FetchRequest {
                     let mut tag_data = bytes::BytesMut::new();
                     {
                         let buf = &mut tag_data;
-                        if (*v).is_none() && !(version >= 12) {
-                            return Err(EncodeError::NullField("ClusterId"));
-                        }
                         if is_flexible(version) {
                             wire::put_compact_nullable_string(buf, (*v).as_deref());
                         } else {
@@ -228,16 +225,10 @@ impl FetchRequest {
                 if raw.tag == 0 && (version >= 12) {
                     let mut tag_data = raw.data;
                     let buf = &mut tag_data;
-                    this.cluster_id = Some({
-                        let raw = if is_flexible(version) {
-                            wire::get_compact_nullable_string(buf)?
-                        } else {
-                            wire::get_nullable_string(buf)?
-                        };
-                        if raw.is_none() && !(version >= 12) {
-                            return Err(DecodeError::InvalidLength(-1));
-                        }
-                        raw
+                    this.cluster_id = Some(if is_flexible(version) {
+                        wire::get_compact_nullable_string(buf)?
+                    } else {
+                        wire::get_nullable_string(buf)?
                     });
                     if buf.has_remaining() {
                         return Err(DecodeError::InvalidLength(
