@@ -78,3 +78,16 @@ impl SaslAuthenticateRequest {
         Ok(this)
     }
 }
+
+impl crate::Message for SaslAuthenticateRequest {
+    const API_KEY: i16 = 36;
+    const MIN_VERSION: i16 = 0;
+    const MAX_VERSION: i16 = 2;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        SaslAuthenticateRequest::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        SaslAuthenticateRequest::decode(buf, version)
+    }
+}

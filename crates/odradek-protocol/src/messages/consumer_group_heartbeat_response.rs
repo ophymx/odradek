@@ -123,6 +123,19 @@ impl ConsumerGroupHeartbeatResponse {
     }
 }
 
+impl crate::Message for ConsumerGroupHeartbeatResponse {
+    const API_KEY: i16 = 68;
+    const MIN_VERSION: i16 = 0;
+    const MAX_VERSION: i16 = 1;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        ConsumerGroupHeartbeatResponse::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        ConsumerGroupHeartbeatResponse::decode(buf, version)
+    }
+}
+
 /// `Assignment` (nested in [`ConsumerGroupHeartbeatResponse`]).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]

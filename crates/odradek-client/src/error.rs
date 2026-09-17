@@ -51,7 +51,54 @@ pub enum ClientError {
     Sasl(String),
 }
 
+/// The session-level classification of a [`ClientError`]: what kind of
+/// problem this is, independent of whether one more retry might clear
+/// it. Consumers deciding "give up vs. keep trying vs. tell the user
+/// their credentials are wrong" should match on this instead of
+/// re-deriving the taxonomy from error codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ErrorCategory {
+    /// The named topic/partition/group does not exist. Note the
+    /// interplay with [`ClientError::is_retriable`]: unknown-topic is
+    /// *briefly* retriable (topics materialize asynchronously), but if
+    /// it persists, this is what it is.
+    NotFound,
+    /// Authentication or authorization failed; retrying with the same
+    /// credentials cannot succeed.
+    Auth,
+    /// The broker/connection is unreachable or unresponsive right now;
+    /// the operation may succeed later.
+    Unavailable,
+    /// Everything else.
+    Other,
+}
+
 impl ClientError {
+    /// This error's session-level [`ErrorCategory`].
+    pub fn category(&self) -> ErrorCategory {
+        match self {
+            ClientError::Broker(code) => match *code {
+                ErrorCode::UNKNOWN_TOPIC_OR_PARTITION | ErrorCode::UNKNOWN_TOPIC_ID => {
+                    ErrorCategory::NotFound
+                }
+                ErrorCode::TOPIC_AUTHORIZATION_FAILED
+                | ErrorCode::GROUP_AUTHORIZATION_FAILED
+                | ErrorCode::SASL_AUTHENTICATION_FAILED
+                | ErrorCode::UNSUPPORTED_SASL_MECHANISM => ErrorCategory::Auth,
+                _ => ErrorCategory::Other,
+            },
+            ClientError::Sasl(_) => ErrorCategory::Auth,
+            ClientError::ConnectionClosed
+            | ClientError::Io(_)
+            | ClientError::Timeout(_)
+            | ClientError::Bootstrap(_)
+            | ClientError::Tls(_)
+            | ClientError::UnknownLeader { .. } => ErrorCategory::Unavailable,
+            _ => ErrorCategory::Other,
+        }
+    }
+
     /// True when retrying after refreshed metadata could plausibly
     /// succeed: leadership moved, a topic is still materializing, or the
     /// connection died under us.

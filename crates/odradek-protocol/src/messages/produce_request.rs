@@ -111,6 +111,19 @@ impl ProduceRequest {
     }
 }
 
+impl crate::Message for ProduceRequest {
+    const API_KEY: i16 = 0;
+    const MIN_VERSION: i16 = 3;
+    const MAX_VERSION: i16 = 13;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        ProduceRequest::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        ProduceRequest::decode(buf, version)
+    }
+}
+
 /// `TopicProduceData` (nested in [`ProduceRequest`]).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]

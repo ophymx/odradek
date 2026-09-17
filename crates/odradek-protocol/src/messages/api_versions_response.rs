@@ -261,6 +261,19 @@ impl ApiVersionsResponse {
     }
 }
 
+impl crate::Message for ApiVersionsResponse {
+    const API_KEY: i16 = 18;
+    const MIN_VERSION: i16 = 0;
+    const MAX_VERSION: i16 = 4;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        ApiVersionsResponse::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        ApiVersionsResponse::decode(buf, version)
+    }
+}
+
 /// `ApiVersion` (nested in [`ApiVersionsResponse`]).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]

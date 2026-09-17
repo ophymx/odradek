@@ -169,6 +169,19 @@ impl FetchResponse {
     }
 }
 
+impl crate::Message for FetchResponse {
+    const API_KEY: i16 = 1;
+    const MIN_VERSION: i16 = 4;
+    const MAX_VERSION: i16 = 18;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        FetchResponse::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        FetchResponse::decode(buf, version)
+    }
+}
+
 /// `FetchableTopicResponse` (nested in [`FetchResponse`]).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]

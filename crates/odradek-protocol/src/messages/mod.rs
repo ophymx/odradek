@@ -101,3 +101,27 @@ pub fn request_is_flexible(api_key: i16, api_version: i16) -> Option<bool> {
         _ => None,
     }
 }
+
+/// The version range this schema snapshot speaks for `api_key`'s
+/// request type, or `None` for keys with no generated support.
+pub fn supported_versions(api_key: i16) -> Option<(i16, i16)> {
+    match api_key {
+        18 => Some((0, 4)),
+        68 => Some((0, 1)),
+        19 => Some((2, 7)),
+        1 => Some((4, 18)),
+        10 => Some((0, 6)),
+        12 => Some((0, 4)),
+        11 => Some((0, 9)),
+        13 => Some((0, 5)),
+        2 => Some((1, 10)),
+        3 => Some((0, 13)),
+        8 => Some((2, 10)),
+        9 => Some((1, 10)),
+        0 => Some((3, 13)),
+        36 => Some((0, 2)),
+        17 => Some((0, 1)),
+        14 => Some((0, 5)),
+        _ => None,
+    }
+}

@@ -169,6 +169,19 @@ impl MetadataResponse {
     }
 }
 
+impl crate::Message for MetadataResponse {
+    const API_KEY: i16 = 3;
+    const MIN_VERSION: i16 = 0;
+    const MAX_VERSION: i16 = 13;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        MetadataResponse::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        MetadataResponse::decode(buf, version)
+    }
+}
+
 /// `MetadataResponseBroker` (nested in [`MetadataResponse`]).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]

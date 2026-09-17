@@ -162,6 +162,19 @@ impl FindCoordinatorResponse {
     }
 }
 
+impl crate::Message for FindCoordinatorResponse {
+    const API_KEY: i16 = 10;
+    const MIN_VERSION: i16 = 0;
+    const MAX_VERSION: i16 = 6;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        FindCoordinatorResponse::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        FindCoordinatorResponse::decode(buf, version)
+    }
+}
+
 /// `Coordinator` (nested in [`FindCoordinatorResponse`]).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]

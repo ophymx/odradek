@@ -51,7 +51,7 @@ pub use cluster::Cluster;
 pub use conn::Connection;
 pub use consumer::{ConsumedRecord, Consumer, ConsumerConfig, FetchResult};
 pub use consumer_group::{ConsumerGroupConfig, ConsumerGroupMember, GroupEvent};
-pub use error::ClientError;
+pub use error::{ClientError, ErrorCategory};
 pub use group::{GroupConfig, GroupMember, HeartbeatStatus};
 pub use negotiate::ApiVersionRanges;
 pub use odradek_protocol as protocol;

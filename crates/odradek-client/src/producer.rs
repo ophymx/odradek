@@ -21,7 +21,7 @@ use odradek_protocol::messages::produce_response::ProduceResponse;
 use odradek_protocol::records::{Compression, Record, RecordBatch, Records};
 
 use crate::cluster::Cluster;
-use crate::compression::{attribute_bits, compress};
+use crate::compression::compress;
 use crate::error::ClientError;
 use crate::retry::{or_mark_stale, retry_loop};
 
@@ -402,7 +402,7 @@ fn encode_batch(mut records: Vec<Record>, codec: Compression) -> Result<Vec<u8>,
     };
     let batch = RecordBatch {
         base_offset: 0,
-        attributes: attribute_bits(codec),
+        attributes: codec.attribute_bits(),
         last_offset_delta: i32::try_from(last).unwrap_or(i32::MAX),
         base_timestamp: now_ms,
         max_timestamp: now_ms + max_delta,

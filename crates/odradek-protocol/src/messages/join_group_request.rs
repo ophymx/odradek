@@ -175,6 +175,19 @@ impl JoinGroupRequest {
     }
 }
 
+impl crate::Message for JoinGroupRequest {
+    const API_KEY: i16 = 11;
+    const MIN_VERSION: i16 = 0;
+    const MAX_VERSION: i16 = 9;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        JoinGroupRequest::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        JoinGroupRequest::decode(buf, version)
+    }
+}
+
 /// `JoinGroupRequestProtocol` (nested in [`JoinGroupRequest`]).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]

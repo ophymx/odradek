@@ -49,6 +49,20 @@ impl Compression {
             other => Compression::Unknown(other),
         }
     }
+
+    /// The attribute bits that select this codec — the inverse of
+    /// [`Compression::from_attributes`], kept beside it so a new codec
+    /// number cannot land in one direction only.
+    pub fn attribute_bits(self) -> i16 {
+        match self {
+            Compression::None => 0,
+            Compression::Gzip => 1,
+            Compression::Snappy => 2,
+            Compression::Lz4 => 3,
+            Compression::Zstd => 4,
+            Compression::Unknown(bits) => i16::from(bits),
+        }
+    }
 }
 
 /// One record batch (magic 2).

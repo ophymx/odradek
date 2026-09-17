@@ -1,0 +1,6 @@
+Vendored from https://github.com/apache/kafka at tag 4.1.0
+(clients/src/main/resources/common/message/).
+
+Every schema in this directory was taken from that single tag. When
+re-vendoring, update this file and diff against the recorded tag so
+behavioral changes arrive deliberately, then run `cargo xtask codegen`.

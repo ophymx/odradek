@@ -187,18 +187,6 @@ fn snappy_decompress(payload: &[u8]) -> Result<Vec<u8>, ClientError> {
     Ok(out)
 }
 
-/// The attribute bits selecting `codec` in a record batch.
-pub(crate) fn attribute_bits(codec: Compression) -> i16 {
-    match codec {
-        Compression::None => 0,
-        Compression::Gzip => 1,
-        Compression::Snappy => 2,
-        Compression::Lz4 => 3,
-        Compression::Zstd => 4,
-        Compression::Unknown(bits) => i16::from(bits),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

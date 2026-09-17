@@ -126,3 +126,16 @@ impl SyncGroupResponse {
         Ok(this)
     }
 }
+
+impl crate::Message for SyncGroupResponse {
+    const API_KEY: i16 = 14;
+    const MIN_VERSION: i16 = 0;
+    const MAX_VERSION: i16 = 5;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        SyncGroupResponse::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        SyncGroupResponse::decode(buf, version)
+    }
+}

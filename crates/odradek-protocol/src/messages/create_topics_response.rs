@@ -96,6 +96,19 @@ impl CreateTopicsResponse {
     }
 }
 
+impl crate::Message for CreateTopicsResponse {
+    const API_KEY: i16 = 19;
+    const MIN_VERSION: i16 = 2;
+    const MAX_VERSION: i16 = 7;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        CreateTopicsResponse::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        CreateTopicsResponse::decode(buf, version)
+    }
+}
+
 /// `CreatableTopicResult` (nested in [`CreateTopicsResponse`]).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]

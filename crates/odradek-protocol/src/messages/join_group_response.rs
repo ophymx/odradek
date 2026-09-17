@@ -181,6 +181,19 @@ impl JoinGroupResponse {
     }
 }
 
+impl crate::Message for JoinGroupResponse {
+    const API_KEY: i16 = 11;
+    const MIN_VERSION: i16 = 0;
+    const MAX_VERSION: i16 = 9;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        JoinGroupResponse::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        JoinGroupResponse::decode(buf, version)
+    }
+}
+
 /// `JoinGroupResponseMember` (nested in [`JoinGroupResponse`]).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]

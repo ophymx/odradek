@@ -111,6 +111,19 @@ impl ListOffsetsRequest {
     }
 }
 
+impl crate::Message for ListOffsetsRequest {
+    const API_KEY: i16 = 2;
+    const MIN_VERSION: i16 = 1;
+    const MAX_VERSION: i16 = 10;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        ListOffsetsRequest::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        ListOffsetsRequest::decode(buf, version)
+    }
+}
+
 /// `ListOffsetsTopic` (nested in [`ListOffsetsRequest`]).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]

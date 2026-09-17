@@ -134,6 +134,19 @@ impl MetadataRequest {
     }
 }
 
+impl crate::Message for MetadataRequest {
+    const API_KEY: i16 = 3;
+    const MIN_VERSION: i16 = 0;
+    const MAX_VERSION: i16 = 13;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        MetadataRequest::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        MetadataRequest::decode(buf, version)
+    }
+}
+
 /// `MetadataRequestTopic` (nested in [`MetadataRequest`]).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]

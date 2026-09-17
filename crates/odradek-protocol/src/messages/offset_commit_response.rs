@@ -97,6 +97,19 @@ impl OffsetCommitResponse {
     }
 }
 
+impl crate::Message for OffsetCommitResponse {
+    const API_KEY: i16 = 8;
+    const MIN_VERSION: i16 = 2;
+    const MAX_VERSION: i16 = 10;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        OffsetCommitResponse::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        OffsetCommitResponse::decode(buf, version)
+    }
+}
+
 /// `OffsetCommitResponseTopic` (nested in [`OffsetCommitResponse`]).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]

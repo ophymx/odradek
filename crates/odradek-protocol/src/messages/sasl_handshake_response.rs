@@ -100,3 +100,16 @@ impl SaslHandshakeResponse {
         Ok(this)
     }
 }
+
+impl crate::Message for SaslHandshakeResponse {
+    const API_KEY: i16 = 17;
+    const MIN_VERSION: i16 = 0;
+    const MAX_VERSION: i16 = 1;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        SaslHandshakeResponse::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        SaslHandshakeResponse::decode(buf, version)
+    }
+}

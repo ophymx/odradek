@@ -334,6 +334,17 @@ impl Cluster {
         self.state().topics.get(topic).cloned()
     }
 
+    /// A topic's partitions, refreshing metadata if the topic is not
+    /// yet cached. The one call for "what partitions does this topic
+    /// have" — producers, group leaders, and bridges all need it.
+    pub async fn topic_partitions(&self, topic: &str) -> Result<Vec<PartitionInfo>, ClientError> {
+        if self.partitions(topic).is_none() {
+            self.refresh_metadata(&[topic]).await?;
+        }
+        self.partitions(topic)
+            .ok_or(ClientError::Broker(ErrorCode::UNKNOWN_TOPIC_OR_PARTITION))
+    }
+
     /// The topic name behind a metadata-reported topic id, if the last
     /// refresh saw it.
     pub fn topic_name_by_id(&self, topic_id: [u8; 16]) -> Option<String> {

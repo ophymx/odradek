@@ -93,3 +93,16 @@ impl ApiVersionsRequest {
         Ok(this)
     }
 }
+
+impl crate::Message for ApiVersionsRequest {
+    const API_KEY: i16 = 18;
+    const MIN_VERSION: i16 = 0;
+    const MAX_VERSION: i16 = 4;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        ApiVersionsRequest::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        ApiVersionsRequest::decode(buf, version)
+    }
+}

@@ -99,6 +99,24 @@ fn codegen() -> Result<()> {
     }
     let _ = writeln!(mod_rs, "        _ => None,\n    }}\n}}");
 
+    let _ = writeln!(
+        mod_rs,
+        "\n/// The version range this schema snapshot speaks for `api_key`'s\n\
+         /// request type, or `None` for keys with no generated support.\n\
+         pub fn supported_versions(api_key: i16) -> Option<(i16, i16)> {{\n    match api_key {{"
+    );
+    for (_module, msg) in &module_names {
+        if msg.typ == "request" {
+            let key = msg.api_key.expect("request without apiKey");
+            let _ = writeln!(
+                mod_rs,
+                "        {key} => Some(({}, {})),",
+                msg.valid.min, msg.valid.max
+            );
+        }
+    }
+    let _ = writeln!(mod_rs, "        _ => None,\n    }}\n}}");
+
     fs::write(out_dir.join("mod.rs"), mod_rs)?;
     println!(
         "generated {} message modules in {}",
@@ -647,6 +665,32 @@ fn generate_struct(w: &mut String, msg: &Message, def: &StructDef, is_top: bool)
     let _ = writeln!(w, "        Ok(this)");
     let _ = writeln!(w, "    }}");
     let _ = writeln!(w, "}}");
+
+    // The generic spine: every top-level keyed message implements
+    // crate::Message by delegating to the inherent methods above.
+    if is_top {
+        if let Some(key) = msg.api_key {
+            let _ = writeln!(w);
+            let _ = writeln!(w, "impl crate::Message for {} {{", def.name);
+            let _ = writeln!(w, "    const API_KEY: i16 = {key};");
+            let _ = writeln!(w, "    const MIN_VERSION: i16 = {};", msg.valid.min);
+            let _ = writeln!(w, "    const MAX_VERSION: i16 = {};", msg.valid.max);
+            let _ = writeln!(w);
+            let _ = writeln!(
+                w,
+                "    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {{"
+            );
+            let _ = writeln!(w, "        {}::encode(self, buf, version)", def.name);
+            let _ = writeln!(w, "    }}");
+            let _ = writeln!(
+                w,
+                "    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {{"
+            );
+            let _ = writeln!(w, "        {}::decode(buf, version)", def.name);
+            let _ = writeln!(w, "    }}");
+            let _ = writeln!(w, "}}");
+        }
+    }
     Ok(())
 }
 

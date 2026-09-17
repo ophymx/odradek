@@ -107,3 +107,16 @@ impl HeartbeatRequest {
         Ok(this)
     }
 }
+
+impl crate::Message for HeartbeatRequest {
+    const API_KEY: i16 = 12;
+    const MIN_VERSION: i16 = 0;
+    const MAX_VERSION: i16 = 4;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        HeartbeatRequest::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        HeartbeatRequest::decode(buf, version)
+    }
+}

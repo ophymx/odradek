@@ -169,6 +169,19 @@ impl OffsetFetchRequest {
     }
 }
 
+impl crate::Message for OffsetFetchRequest {
+    const API_KEY: i16 = 9;
+    const MIN_VERSION: i16 = 1;
+    const MAX_VERSION: i16 = 10;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        OffsetFetchRequest::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        OffsetFetchRequest::decode(buf, version)
+    }
+}
+
 /// `OffsetFetchRequestTopic` (nested in [`OffsetFetchRequest`]).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]

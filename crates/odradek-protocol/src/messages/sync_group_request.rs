@@ -170,6 +170,19 @@ impl SyncGroupRequest {
     }
 }
 
+impl crate::Message for SyncGroupRequest {
+    const API_KEY: i16 = 14;
+    const MIN_VERSION: i16 = 0;
+    const MAX_VERSION: i16 = 5;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        SyncGroupRequest::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        SyncGroupRequest::decode(buf, version)
+    }
+}
+
 /// `SyncGroupRequestAssignment` (nested in [`SyncGroupRequest`]).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]

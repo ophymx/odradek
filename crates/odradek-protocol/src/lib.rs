@@ -11,7 +11,12 @@
 //! - [`wire`]: primitive codecs — fixed-width big-endian integers, varints,
 //!   zigzag varints, (compact/nullable) strings and bytes, array length
 //!   prefixes, and tagged fields (flexible versions / KIP-482).
-//! - [`api_key`]: the API key registry identifying each request type.
+//! - [`frame`]: the i32 length-prefixed frame envelope around every
+//!   request and response.
+//! - [`api_key`]: the API key registry identifying each request type;
+//!   [`message::Message`] is the generic spine over every generated
+//!   message, and `messages::supported_versions` maps keys to the
+//!   schema snapshot's version ranges.
 //! - [`messages`]: versioned request/response structs generated from the
 //!   vendored upstream schemas (`cargo xtask codegen`); unknown tagged
 //!   fields round-trip raw.
@@ -24,9 +29,12 @@
 //! - [`error`]: encode/decode error types.
 
 pub mod api_key;
+pub mod consumer_protocol;
 pub mod error;
 pub mod error_code;
+pub mod frame;
 pub mod header;
+pub mod message;
 pub mod messages;
 pub mod records;
 pub mod wire;
@@ -34,3 +42,4 @@ pub mod wire;
 pub use api_key::ApiKey;
 pub use error::{DecodeError, EncodeError};
 pub use error_code::ErrorCode;
+pub use message::Message;

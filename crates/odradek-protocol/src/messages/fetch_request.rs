@@ -253,6 +253,19 @@ impl FetchRequest {
     }
 }
 
+impl crate::Message for FetchRequest {
+    const API_KEY: i16 = 1;
+    const MIN_VERSION: i16 = 4;
+    const MAX_VERSION: i16 = 18;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        FetchRequest::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        FetchRequest::decode(buf, version)
+    }
+}
+
 /// `ReplicaState` (nested in [`FetchRequest`]).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]

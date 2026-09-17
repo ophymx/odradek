@@ -122,6 +122,19 @@ impl LeaveGroupRequest {
     }
 }
 
+impl crate::Message for LeaveGroupRequest {
+    const API_KEY: i16 = 13;
+    const MIN_VERSION: i16 = 0;
+    const MAX_VERSION: i16 = 5;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        LeaveGroupRequest::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        LeaveGroupRequest::decode(buf, version)
+    }
+}
+
 /// `MemberIdentity` (nested in [`LeaveGroupRequest`]).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]

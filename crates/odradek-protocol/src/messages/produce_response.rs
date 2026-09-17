@@ -151,6 +151,19 @@ impl ProduceResponse {
     }
 }
 
+impl crate::Message for ProduceResponse {
+    const API_KEY: i16 = 0;
+    const MIN_VERSION: i16 = 3;
+    const MAX_VERSION: i16 = 13;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        ProduceResponse::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        ProduceResponse::decode(buf, version)
+    }
+}
+
 /// `TopicProduceResponse` (nested in [`ProduceResponse`]).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]

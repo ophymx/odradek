@@ -14,12 +14,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::BytesMut;
 use odradek_protocol::ErrorCode;
-use odradek_protocol::messages::consumer_protocol_assignment::{
-    ConsumerProtocolAssignment, TopicPartition,
+use odradek_protocol::consumer_protocol::{
+    decode_assignment, decode_subscription, encode_assignment, encode_subscription,
 };
-use odradek_protocol::messages::consumer_protocol_subscription::ConsumerProtocolSubscription;
 use odradek_protocol::messages::heartbeat_request::HeartbeatRequest;
 use odradek_protocol::messages::heartbeat_response::HeartbeatResponse;
 use odradek_protocol::messages::join_group_request::{JoinGroupRequest, JoinGroupRequestProtocol};
@@ -433,67 +432,6 @@ impl GroupMember {
     }
 }
 
-// --- consumer protocol payloads (version-prefixed, non-flexible) ------------
-
-fn encode_subscription(topics: &[String]) -> Bytes {
-    let mut body = ConsumerProtocolSubscription::default();
-    body.topics = topics.to_vec();
-    let mut out = BytesMut::new();
-    out.put_i16(0);
-    body.encode(&mut out, 0).expect("v0 subscription encodes");
-    out.freeze()
-}
-
-fn decode_subscription(data: &[u8]) -> Result<Vec<String>, ClientError> {
-    let mut buf = Bytes::copy_from_slice(data);
-    if buf.len() < 2 {
-        return Err(ClientError::ProtocolViolation(
-            "subscription metadata shorter than its version prefix".into(),
-        ));
-    }
-    let version = buf.get_i16().min(ConsumerProtocolSubscription::MAX_VERSION);
-    // Newer members may append fields; the prefix decodes, the rest is
-    // deliberately ignored.
-    let sub = ConsumerProtocolSubscription::decode(&mut buf, version.max(0))?;
-    Ok(sub.topics)
-}
-
-fn encode_assignment(partitions: &[(String, Vec<i32>)]) -> Bytes {
-    let mut body = ConsumerProtocolAssignment::default();
-    body.assigned_partitions = partitions
-        .iter()
-        .map(|(topic, parts)| {
-            let mut tp = TopicPartition::default();
-            tp.topic = topic.clone();
-            tp.partitions = parts.clone();
-            tp
-        })
-        .collect();
-    let mut out = BytesMut::new();
-    out.put_i16(0);
-    body.encode(&mut out, 0).expect("v0 assignment encodes");
-    out.freeze()
-}
-
-fn decode_assignment(data: &[u8]) -> Result<Vec<(String, Vec<i32>)>, ClientError> {
-    if data.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut buf = Bytes::copy_from_slice(data);
-    if buf.len() < 2 {
-        return Err(ClientError::ProtocolViolation(
-            "assignment shorter than its version prefix".into(),
-        ));
-    }
-    let version = buf.get_i16().min(ConsumerProtocolAssignment::MAX_VERSION);
-    let assignment = ConsumerProtocolAssignment::decode(&mut buf, version.max(0))?;
-    Ok(assignment
-        .assigned_partitions
-        .into_iter()
-        .map(|tp| (tp.topic, tp.partitions))
-        .collect())
-}
-
 /// The `range` assignor: per topic, its subscribers (sorted by member
 /// id) split the partitions into contiguous ranges, earlier members
 /// taking the remainder. Matches Kafka's RangeAssignor so mixed groups
@@ -576,21 +514,5 @@ mod tests {
             vec![("x".into(), vec![1]), ("y".into(), vec![0])]
         );
         assert!(assignment["m3"].is_empty());
-    }
-
-    #[test]
-    fn subscription_and_assignment_payloads_roundtrip() {
-        let topics = vec!["alpha".to_owned(), "beta".to_owned()];
-        assert_eq!(
-            decode_subscription(&encode_subscription(&topics)).unwrap(),
-            topics
-        );
-
-        let parts = vec![("alpha".to_owned(), vec![0, 2])];
-        assert_eq!(
-            decode_assignment(&encode_assignment(&parts)).unwrap(),
-            parts
-        );
-        assert!(decode_assignment(b"").unwrap().is_empty());
     }
 }

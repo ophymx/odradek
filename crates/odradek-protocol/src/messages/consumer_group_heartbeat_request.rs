@@ -238,6 +238,19 @@ impl ConsumerGroupHeartbeatRequest {
     }
 }
 
+impl crate::Message for ConsumerGroupHeartbeatRequest {
+    const API_KEY: i16 = 68;
+    const MIN_VERSION: i16 = 0;
+    const MAX_VERSION: i16 = 1;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        ConsumerGroupHeartbeatRequest::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        ConsumerGroupHeartbeatRequest::decode(buf, version)
+    }
+}
+
 /// `TopicPartitions` (nested in [`ConsumerGroupHeartbeatRequest`]).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]

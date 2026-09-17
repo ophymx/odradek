@@ -106,6 +106,19 @@ impl LeaveGroupResponse {
     }
 }
 
+impl crate::Message for LeaveGroupResponse {
+    const API_KEY: i16 = 13;
+    const MIN_VERSION: i16 = 0;
+    const MAX_VERSION: i16 = 5;
+
+    fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
+        LeaveGroupResponse::encode(self, buf, version)
+    }
+    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        LeaveGroupResponse::decode(buf, version)
+    }
+}
+
 /// `MemberResponse` (nested in [`LeaveGroupResponse`]).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
