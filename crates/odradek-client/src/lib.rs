@@ -14,9 +14,11 @@
 //! 2. [`cluster`]: a [`Cluster`] handle over a connection pool keyed by
 //!    broker id, a metadata cache, partition-leader routing, and
 //!    coordinator discovery.
-//! 3. [`producer`], [`consumer`], [`group`]: batching and compression on
-//!    the produce side; fetch, offset lookup, and durable offsets on the
-//!    consume side; classic join/sync/heartbeat/leave membership.
+//! 3. [`producer`], [`consumer`], [`group`], [`consumer_group`]:
+//!    batching and compression on the produce side; fetch, offset
+//!    lookup, and durable offsets on the consume side; classic
+//!    join/sync/heartbeat/leave membership and KIP-848 next-generation
+//!    membership.
 //!
 //! # One cluster, many components
 //!
@@ -33,6 +35,7 @@ pub mod cluster;
 mod compression;
 pub mod conn;
 pub mod consumer;
+pub mod consumer_group;
 pub mod error;
 pub mod group;
 pub mod negotiate;
@@ -47,6 +50,7 @@ pub mod tls;
 pub use cluster::Cluster;
 pub use conn::Connection;
 pub use consumer::{ConsumedRecord, Consumer, ConsumerConfig, FetchResult};
+pub use consumer_group::{ConsumerGroupConfig, ConsumerGroupMember, GroupEvent};
 pub use error::ClientError;
 pub use group::{GroupConfig, GroupMember, HeartbeatStatus};
 pub use negotiate::ApiVersionRanges;

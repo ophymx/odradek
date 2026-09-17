@@ -912,6 +912,21 @@ fn encode_field_value(msg: &Message, f: &Field, path: &str) -> Result<String> {
                 "match &{path} {{\n    Some(items) => {{\n        {put_some}\n        for item in items {{\n            {elem_code}\n        }}\n    }}\n    None => {{\n        {none_arm}\n    }}\n}}",
             )
         }
+        (FieldType::Struct(_), Some(nullable)) => {
+            // Kafka serializes a nullable struct as a signed marker
+            // byte: -1 for null, 1 followed by the struct's fields.
+            let none_arm = if nullable == "true" {
+                "buf.put_i8(-1);".to_string()
+            } else {
+                format!(
+                    "if !({nullable}) {{\n    return Err(EncodeError::NullField({:?}));\n}}\nbuf.put_i8(-1);",
+                    f.name
+                )
+            };
+            format!(
+                "match &{path} {{\n    Some(v) => {{\n        buf.put_i8(1);\n        v.encode(buf, version)?;\n    }}\n    None => {{\n        {none_arm}\n    }}\n}}"
+            )
+        }
         (other, Some(_)) => bail!("nullable {other:?} not supported (field {})", f.name),
     };
     Ok(code)
@@ -985,6 +1000,18 @@ fn decode_value(msg: &Message, f: &Field) -> Result<String> {
         (FieldType::Float64, None) => "wire::get_f64(buf)?".to_string(),
         (FieldType::Uuid, None) => "wire::get_uuid(buf)?".to_string(),
         (FieldType::Struct(n), None) => format!("{n}::decode(buf, version)?"),
+        (FieldType::Struct(n), Some(nullable)) => {
+            let none_val = if nullable == "true" {
+                "None".to_string()
+            } else {
+                format!(
+                    "{{\n    if !({nullable}) {{\n        return Err(DecodeError::InvalidLength(-1));\n    }}\n    None\n}}"
+                )
+            };
+            format!(
+                "if wire::get_i8(buf)? < 0 {{\n    {none_val}\n}} else {{\n    Some({n}::decode(buf, version)?)\n}}"
+            )
+        }
         (FieldType::String, None) => flex_switch(
             &flex,
             "wire::get_compact_string(buf)?".into(),

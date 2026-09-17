@@ -125,6 +125,9 @@ struct State {
     control: Option<Broker>,
     brokers: HashMap<i32, BrokerInfo>,
     topics: HashMap<String, Vec<PartitionInfo>>,
+    /// Topic id → name, as of the last metadata refresh (v10+ metadata
+    /// carries ids; KIP-848 assignments address topics by id).
+    topic_ids: HashMap<[u8; 16], String>,
     conns: HashMap<i32, Broker>,
     /// Idle leased connections for blocking requests, per broker.
     blocking: HashMap<i32, Vec<Broker>>,
@@ -254,6 +257,7 @@ impl Cluster {
             }
             refreshed.push((
                 name.clone(),
+                topic.topic_id,
                 topic
                     .partitions
                     .iter()
@@ -268,7 +272,10 @@ impl Cluster {
 
         let mut state = self.state();
         state.brokers = brokers;
-        for (name, partitions) in refreshed {
+        for (name, topic_id, partitions) in refreshed {
+            if topic_id != [0u8; 16] {
+                state.topic_ids.insert(topic_id, name.clone());
+            }
             state.topics.insert(name, partitions);
         }
         Ok(())
@@ -325,6 +332,12 @@ impl Cluster {
     /// A topic's partitions, as of the last metadata refresh.
     pub fn partitions(&self, topic: &str) -> Option<Vec<PartitionInfo>> {
         self.state().topics.get(topic).cloned()
+    }
+
+    /// The topic name behind a metadata-reported topic id, if the last
+    /// refresh saw it.
+    pub fn topic_name_by_id(&self, topic_id: [u8; 16]) -> Option<String> {
+        self.state().topic_ids.get(&topic_id).cloned()
     }
 
     /// The node id currently leading `topic[partition]`.

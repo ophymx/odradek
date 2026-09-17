@@ -68,11 +68,15 @@ Early but functional end to end:
   skipping control batches and pre-offset records, with earliest/latest
   lookup via ListOffsets and durable positions as a simple (non-member)
   consumer — coordinator discovery plus offset commit/fetch under a
-  group id; and classic consumer-group membership (join/sync/heartbeat/
+  group id; classic consumer-group membership (join/sync/heartbeat/
   leave, caller-driven, with leader-side range assignment matching
-  Kafka's RangeAssignor) — tested against in-process fake single- and
-  multi-broker clusters, with real-broker smoke examples
-  (`produce_consume`, `group_join`).
+  Kafka's RangeAssignor); and KIP-848 next-generation membership
+  (one ConsumerGroupHeartbeat API, broker-side assignment addressed
+  by topic id, member-epoch fencing on heartbeats and commits) —
+  tested against in-process fake single- and multi-broker clusters,
+  with real-broker smoke examples (`produce_consume`, `group_join`,
+  `group848_join` — the latter exercising live incremental
+  reconciliation on Kafka 4.1's new coordinator).
 - `odradek-acceptance`: conformance checks for **both roles** over raw
   connections independent of the client crate — `api-versions/*`,
   `metadata/*`, `produce/*`, and `fetch/*` server checks (including a
@@ -145,7 +149,7 @@ Kafka's SASL_PLAINTEXT, SSL, and SASL_SSL listeners: PLAIN and both
 SCRAM variants authenticate, wrong passwords and untrusted
 certificates fail cleanly.
 
-Next: the KIP-848 consumer protocol and crates.io publication.
+Next: crates.io publication.
 
 ```sh
 cargo test --workspace       # everything

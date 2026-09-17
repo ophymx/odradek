@@ -55,6 +55,20 @@ struct GroupState {
 }
 type Group = Arc<Mutex<GroupState>>;
 
+/// KIP-848 coordinator state: broker-side assignment over TOPIC.
+#[derive(Default)]
+struct Group848State {
+    group_epoch: i32,
+    /// Sorted member ids.
+    members: Vec<String>,
+    /// Member id -> the group epoch last handed to it.
+    told: std::collections::HashMap<String, i32>,
+}
+type Group848 = Arc<Mutex<Group848State>>;
+
+/// The topic id the fake advertises for TOPIC in metadata (v10+).
+const FAKE_TOPIC_ID: [u8; 16] = *b"fake-routing-id!";
+
 struct FakeCluster {
     /// node_id -> host:port
     endpoints: Vec<(i32, String)>,
@@ -76,6 +90,7 @@ struct FakeCluster {
     )]
     logs: Logs,
     group: Group,
+    group848: Group848,
     accepts: Accepts,
 }
 
@@ -95,6 +110,7 @@ async fn spawn_fake_cluster(n: i32, no_leader: &'static [i32]) -> FakeCluster {
     let offsets: Offsets = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let logs: Logs = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let group: Group = Arc::new(Mutex::new(GroupState::default()));
+    let group848: Group848 = Arc::new(Mutex::new(Group848State::default()));
     let created: Created = Arc::new(Mutex::new(std::collections::HashSet::new()));
     let accepts: Accepts = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
@@ -105,6 +121,7 @@ async fn spawn_fake_cluster(n: i32, no_leader: &'static [i32]) -> FakeCluster {
         let offsets = Arc::clone(&offsets);
         let logs = Arc::clone(&logs);
         let group = Arc::clone(&group);
+        let group848 = Arc::clone(&group848);
         let created = Arc::clone(&created);
         let accepts = Arc::clone(&accepts);
         let handle = tokio::spawn(async move {
@@ -125,6 +142,7 @@ async fn spawn_fake_cluster(n: i32, no_leader: &'static [i32]) -> FakeCluster {
                             Arc::clone(&offsets),
                             Arc::clone(&logs),
                             Arc::clone(&group),
+                            Arc::clone(&group848),
                             Arc::clone(&created),
                             no_leader,
                         ));
@@ -143,6 +161,7 @@ async fn spawn_fake_cluster(n: i32, no_leader: &'static [i32]) -> FakeCluster {
         created,
         logs,
         group,
+        group848,
         accepts,
     }
 }
@@ -170,6 +189,7 @@ async fn serve_conn(
     offsets: Offsets,
     logs: Logs,
     group: Group,
+    group848: Group848,
     created: Created,
     no_leader: &'static [i32],
 ) {
@@ -206,6 +226,7 @@ async fn serve_conn(
                     (12, 0, 4),
                     (13, 0, 5),
                     (19, 2, 7),
+                    (68, 0, 1),
                 ]
                 .into_iter()
                 .map(|(api_key, min_version, max_version)| {
@@ -237,6 +258,7 @@ async fn serve_conn(
                 resp.controller_id = 0;
                 let mut topic = MetadataResponseTopic::default();
                 topic.name = Some(TOPIC.into());
+                topic.topic_id = FAKE_TOPIC_ID;
                 topic.partitions = endpoints
                     .iter()
                     .map(|(id, _)| {
@@ -516,6 +538,72 @@ async fn serve_conn(
                 } else {
                     0
                 };
+                let mut buf = BytesMut::new();
+                resp.encode(&mut buf, api_version).unwrap();
+                buf.freeze()
+            }
+            68 => {
+                use odradek_protocol::messages::consumer_group_heartbeat_request::ConsumerGroupHeartbeatRequest;
+                use odradek_protocol::messages::consumer_group_heartbeat_response::{
+                    Assignment, ConsumerGroupHeartbeatResponse, TopicPartitions,
+                };
+                let req = ConsumerGroupHeartbeatRequest::decode(&mut frame, api_version).unwrap();
+                let mut resp = ConsumerGroupHeartbeatResponse::default();
+                resp.heartbeat_interval_ms = 50;
+                let mut g = group848.lock().unwrap();
+                let n_partitions = i32::try_from(endpoints.len()).unwrap();
+                if req.member_epoch == -1 {
+                    g.members.retain(|m| *m != req.member_id);
+                    g.told.remove(&req.member_id);
+                    g.group_epoch += 1;
+                    resp.member_epoch = -1;
+                } else if req.member_epoch == 0 {
+                    if !g.members.contains(&req.member_id) {
+                        g.members.push(req.member_id.clone());
+                        g.members.sort();
+                        g.group_epoch += 1;
+                    }
+                    let epoch = g.group_epoch;
+                    g.told.insert(req.member_id.clone(), epoch);
+                    resp.member_epoch = epoch;
+                    resp.assignment = Some(assignment_for(&g, &req.member_id, n_partitions));
+                } else if !g.members.contains(&req.member_id) {
+                    resp.error_code = 25; // UNKNOWN_MEMBER_ID
+                } else if req.member_epoch != g.group_epoch
+                    && g.told.get(&req.member_id) != Some(&req.member_epoch)
+                {
+                    resp.error_code = 110; // FENCED_MEMBER_EPOCH
+                } else {
+                    let epoch = g.group_epoch;
+                    let stale = g.told.get(&req.member_id) != Some(&epoch);
+                    g.told.insert(req.member_id.clone(), epoch);
+                    resp.member_epoch = epoch;
+                    if stale {
+                        resp.assignment = Some(assignment_for(&g, &req.member_id, n_partitions));
+                    }
+                }
+                drop(g);
+                fn assignment_for(
+                    g: &Group848State,
+                    member: &str,
+                    n_partitions: i32,
+                ) -> Assignment {
+                    // Contiguous split of TOPIC's partitions across the
+                    // sorted membership, like the range assignor.
+                    let n = i32::try_from(g.members.len()).unwrap().max(1);
+                    let idx =
+                        i32::try_from(g.members.iter().position(|m| m == member).unwrap()).unwrap();
+                    let per = n_partitions / n;
+                    let extra = n_partitions % n;
+                    let start = idx * per + idx.min(extra);
+                    let take = per + i32::from(idx < extra);
+                    let mut tp = TopicPartitions::default();
+                    tp.topic_id = FAKE_TOPIC_ID;
+                    tp.partitions = (start..start + take).collect();
+                    let mut a = Assignment::default();
+                    a.topic_partitions = vec![tp];
+                    a
+                }
                 let mut buf = BytesMut::new();
                 resp.encode(&mut buf, api_version).unwrap();
                 buf.freeze()
@@ -1185,4 +1273,95 @@ async fn released_fetch_leases_are_reused_not_redialed() {
         after_first, after_more,
         "sequential fetches must reuse the released lease"
     );
+}
+
+#[tokio::test]
+async fn kip848_single_member_owns_everything() {
+    use odradek_client::{ConsumerGroupConfig, ConsumerGroupMember, GroupEvent};
+
+    let fake = spawn_fake_cluster(3, &[]).await;
+    let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+    let mut member = ConsumerGroupMember::join(
+        cluster,
+        "848-group",
+        &[TOPIC],
+        ConsumerGroupConfig::default(),
+    )
+    .await
+    .unwrap();
+    assert!(member.member_epoch() > 0);
+    assert_eq!(
+        member.assignment(),
+        &[(TOPIC.to_owned(), vec![0, 1, 2])],
+        "sole member owns every partition"
+    );
+    assert_eq!(member.heartbeat().await.unwrap(), GroupEvent::Stable);
+    member.leave().await.unwrap();
+}
+
+#[tokio::test]
+async fn kip848_two_members_split_then_reclaim() {
+    use odradek_client::{ConsumerGroupConfig, ConsumerGroupMember, GroupEvent};
+
+    let fake = spawn_fake_cluster(3, &[]).await;
+    let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+    let mut a = ConsumerGroupMember::join(
+        cluster.clone(),
+        "848-group",
+        &[TOPIC],
+        ConsumerGroupConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    // B joins over the same shared cluster; A hears on its next beat.
+    let b = ConsumerGroupMember::join(
+        cluster,
+        "848-group",
+        &[TOPIC],
+        ConsumerGroupConfig::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(a.heartbeat().await.unwrap(), GroupEvent::AssignmentChanged);
+
+    let mut all: Vec<i32> = a
+        .assignment()
+        .iter()
+        .chain(b.assignment())
+        .flat_map(|(_, p)| p.clone())
+        .collect();
+    all.sort_unstable();
+    assert_eq!(all, vec![0, 1, 2], "disjoint cover of the topic");
+    assert!(!a.assignment()[0].1.is_empty() && !b.assignment()[0].1.is_empty());
+
+    // B leaves; A reclaims everything.
+    b.leave().await.unwrap();
+    assert_eq!(a.heartbeat().await.unwrap(), GroupEvent::AssignmentChanged);
+    assert_eq!(a.assignment(), &[(TOPIC.to_owned(), vec![0, 1, 2])]);
+}
+
+#[tokio::test]
+async fn kip848_fenced_member_rejoins_with_the_same_id() {
+    use odradek_client::{ConsumerGroupConfig, ConsumerGroupMember, GroupEvent};
+
+    let fake = spawn_fake_cluster(3, &[]).await;
+    let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+    let mut config = ConsumerGroupConfig::default();
+    config.retry_backoff = std::time::Duration::from_millis(20);
+    let mut member = ConsumerGroupMember::join(cluster, "848-group", &[TOPIC], config)
+        .await
+        .unwrap();
+    let id = member.member_id().to_owned();
+
+    // The coordinator forgets the member (session expiry stand-in).
+    {
+        let mut g = fake.group848.lock().unwrap();
+        g.members.clear();
+        g.told.clear();
+        g.group_epoch += 1;
+    }
+    assert_eq!(member.heartbeat().await.unwrap(), GroupEvent::Rejoined);
+    assert_eq!(member.member_id(), id, "identity survives fencing");
+    assert_eq!(member.assignment(), &[(TOPIC.to_owned(), vec![0, 1, 2])]);
 }

@@ -78,6 +78,7 @@ error_codes! {
     FENCED_MEMBER_EPOCH = 110,
     UNRELEASED_INSTANCE_ID = 111,
     UNSUPPORTED_ASSIGNOR = 112,
+    STALE_MEMBER_EPOCH = 113,
 }
 
 impl ErrorCode {

@@ -5,6 +5,8 @@
 
 pub mod api_versions_request;
 pub mod api_versions_response;
+pub mod consumer_group_heartbeat_request;
+pub mod consumer_group_heartbeat_response;
 pub mod consumer_protocol_assignment;
 pub mod consumer_protocol_subscription;
 pub mod create_topics_request;
@@ -40,6 +42,8 @@ pub mod sync_group_response;
 
 pub use api_versions_request::ApiVersionsRequest;
 pub use api_versions_response::ApiVersionsResponse;
+pub use consumer_group_heartbeat_request::ConsumerGroupHeartbeatRequest;
+pub use consumer_group_heartbeat_response::ConsumerGroupHeartbeatResponse;
 pub use consumer_protocol_assignment::ConsumerProtocolAssignment;
 pub use consumer_protocol_subscription::ConsumerProtocolSubscription;
 pub use create_topics_request::CreateTopicsRequest;
@@ -79,6 +83,7 @@ pub use sync_group_response::SyncGroupResponse;
 pub fn request_is_flexible(api_key: i16, api_version: i16) -> Option<bool> {
     match api_key {
         18 => Some(api_versions_request::is_flexible(api_version)),
+        68 => Some(consumer_group_heartbeat_request::is_flexible(api_version)),
         19 => Some(create_topics_request::is_flexible(api_version)),
         1 => Some(fetch_request::is_flexible(api_version)),
         10 => Some(find_coordinator_request::is_flexible(api_version)),

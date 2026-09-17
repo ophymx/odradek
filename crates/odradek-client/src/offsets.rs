@@ -20,7 +20,7 @@ use crate::error::ClientError;
 
 /// OffsetCommit versions this client speaks: the classic name-addressed
 /// shape (v9+ carries member epochs for KIP-848 groups, v10 topic ids).
-const OFFSET_COMMIT_SUPPORTED: (i16, i16) = (2, 8);
+const OFFSET_COMMIT_SUPPORTED: (i16, i16) = (2, 9);
 
 /// OffsetFetch versions this client speaks: the single-group shape
 /// (v8+ switches to batched groups).
