@@ -15,9 +15,10 @@ the protocol as the first-class artifact and builds outward from it.
 | [`odradek-acceptance`](crates/odradek-acceptance) | Acceptance suite that validates *either side* of the protocol: run it against a server (suite acts as client) or against a client (suite acts as server harness). |
 | [`odradek-web-core`](crates/odradek-web-core) | Transport-agnostic bridge from Kafka partitions to web-shaped subscribers: fan-out, replay from offsets, filtering, self-healing backpressure. |
 | [`odradek-web-sse`](crates/odradek-web-sse) | Server-Sent Events transport over the bridge: an embeddable axum router with `Last-Event-ID` resume — a reconnecting `EventSource` never misses or repeats a record. |
+| [`odradek-web-ws`](crates/odradek-web-ws) | WebSocket transport over the bridge: the same streams as JSON text frames, offset-resumable via `from=`. |
 
-Next in the constellation: a WebSocket transport, topic-level
-subscriptions (across partitions), and TLS/SASL in the client.
+Next in the constellation: topic-level subscriptions (across
+partitions) and TLS/SASL in the client.
 
 ## Design principles
 
@@ -121,9 +122,15 @@ Early but functional end to end:
   key/header filters; UTF-8 payloads as strings, binary as base64.
   Tested over a real listener with a raw HTTP client; the `serve`
   example bridges a real broker to `curl -N`.
+- `odradek-web-ws`: the WebSocket transport — the same subscriptions
+  as JSON text frames (shared JSON mapping in
+  `odradek_web_core::json`), parameter errors rejected before the
+  upgrade, resume via `from=<offset>`. Tested with a hand-rolled
+  WebSocket client (upgrade handshake + frame parser); its `serve`
+  example mounts both transports on one router.
 
-Next: a WebSocket transport, topic-level subscriptions, TLS/SASL in
-the client, snappy/zstd codecs, and the KIP-848 consumer protocol.
+Next: topic-level subscriptions, TLS/SASL in the client, snappy/zstd
+codecs, and the KIP-848 consumer protocol.
 
 ```sh
 cargo test --workspace       # everything

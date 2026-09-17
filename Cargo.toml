@@ -16,7 +16,7 @@ odradek-client = { path = "crates/odradek-client", version = "0.1.0" }
 odradek-web-core = { path = "crates/odradek-web-core", version = "0.1.0" }
 
 # external
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 bytes = "1"
 flate2 = "1"

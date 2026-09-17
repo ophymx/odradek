@@ -25,6 +25,7 @@
 
 pub mod event;
 pub mod hub;
+pub mod json;
 pub mod memory;
 pub mod pump;
 pub mod source;
