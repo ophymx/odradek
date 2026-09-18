@@ -677,6 +677,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "webpki-roots",
+ "zeroize",
  "zstd",
 ]
 

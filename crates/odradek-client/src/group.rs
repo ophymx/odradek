@@ -31,6 +31,7 @@ use odradek_protocol::messages::sync_group_request::{
 use odradek_protocol::messages::sync_group_response::SyncGroupResponse;
 
 use crate::cluster::Cluster;
+use crate::conn;
 use crate::error::ClientError;
 use crate::offsets::{self, CommitIdentity};
 use crate::retry::{Attempt, or_forget_coordinator, retry_loop};
@@ -257,7 +258,7 @@ impl GroupMember {
             .conn
             .request(SyncGroupRequest::API_KEY, sync_version, &body)
             .await?;
-        let resp = SyncGroupResponse::decode(&mut resp, sync_version)?;
+        let resp = conn::decode_body::<SyncGroupResponse>(&mut resp, sync_version)?;
         let code = ErrorCode(resp.error_code);
         if !code.is_ok() {
             return Err(ClientError::Broker(code));
@@ -280,7 +281,7 @@ impl GroupMember {
             .conn
             .request(JoinGroupRequest::API_KEY, version, &body)
             .await?;
-        Ok(JoinGroupResponse::decode(&mut resp, version)?)
+        conn::decode_body::<JoinGroupResponse>(&mut resp, version)
     }
 
     /// Durably commit `offset` for `topic[partition]` under this
@@ -380,7 +381,7 @@ impl GroupMember {
                 .conn
                 .request(HeartbeatRequest::API_KEY, version, &body)
                 .await?;
-            Ok(HeartbeatResponse::decode(&mut resp, version)?)
+            conn::decode_body::<HeartbeatResponse>(&mut resp, version)
         }
         .await;
         let code = match sent {
@@ -422,7 +423,7 @@ impl GroupMember {
             .conn
             .request(LeaveGroupRequest::API_KEY, version, &body)
             .await?;
-        let resp = LeaveGroupResponse::decode(&mut resp, version)?;
+        let resp = conn::decode_body::<LeaveGroupResponse>(&mut resp, version)?;
         let code = ErrorCode(resp.error_code);
         // Being already forgotten is as good as having left.
         if !code.is_ok() && code != ErrorCode::UNKNOWN_MEMBER_ID {

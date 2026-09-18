@@ -40,6 +40,7 @@ use odradek_protocol::records::{Compression, Record, RecordBatch, Records};
 
 use crate::cluster::Cluster;
 use crate::compression::compress;
+use crate::conn;
 use crate::error::ClientError;
 use crate::join::join_all;
 use crate::retry::{or_mark_stale, retry_loop};
@@ -382,7 +383,7 @@ async fn try_once(
             return Err(e);
         }
     };
-    let resp = ProduceResponse::decode(&mut resp, version)?;
+    let resp = conn::decode_body::<ProduceResponse>(&mut resp, version)?;
     let entry = resp
         .responses
         .iter()

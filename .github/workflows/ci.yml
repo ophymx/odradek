@@ -50,8 +50,15 @@ jobs:
       - name: generated code is in sync with the schemas
         # codegen output is committed formatted, so format before diffing
         run: cargo xtask codegen && cargo fmt && git diff --exit-code
-      - name: crates package cleanly
-        run: cargo package --workspace --no-verify --locked
+      - name: crates package and build from the packaged tarball
+        # Without --no-verify, cargo unpacks each tarball and compiles it
+        # against the others as registry dependencies. That is the only
+        # check that catches a crate which builds here but not from what
+        # is actually uploaded -- a file outside the crate directory, a
+        # path dependency with no version. Publishing is irreversible and
+        # ordered, so the failure this prevents is three crates live on
+        # crates.io and the fourth refusing to build. ~35s.
+        run: cargo package --workspace --locked
 
   msrv:
     name: MSRV (1.85)

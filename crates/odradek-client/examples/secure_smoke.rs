@@ -51,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.sasl = mechanism.map(|mechanism| SaslConfig {
         mechanism,
         username: user,
-        password: pass,
+        password: odradek_client::sasl::Zeroizing::new(pass),
     });
 
     let topic = format!(

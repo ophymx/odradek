@@ -33,6 +33,7 @@ use odradek_protocol::messages::consumer_group_heartbeat_request::{
 use odradek_protocol::messages::consumer_group_heartbeat_response::ConsumerGroupHeartbeatResponse;
 
 use crate::cluster::Cluster;
+use crate::conn;
 use crate::error::ClientError;
 use crate::retry::{Attempt, or_forget_coordinator, retry_loop};
 
@@ -231,7 +232,7 @@ impl ConsumerGroupMember {
             .conn
             .request(ConsumerGroupHeartbeatRequest::API_KEY, version, &body)
             .await?;
-        let resp = ConsumerGroupHeartbeatResponse::decode(&mut resp, version)?;
+        let resp = conn::decode_body::<ConsumerGroupHeartbeatResponse>(&mut resp, version)?;
         let code = ErrorCode(resp.error_code);
         // Being already forgotten is as good as having left.
         if !code.is_ok() && code != ErrorCode::UNKNOWN_MEMBER_ID {
@@ -288,7 +289,7 @@ impl ConsumerGroupMember {
                 .conn
                 .request(ConsumerGroupHeartbeatRequest::API_KEY, version, &body)
                 .await?;
-            Ok(ConsumerGroupHeartbeatResponse::decode(&mut resp, version)?)
+            conn::decode_body::<ConsumerGroupHeartbeatResponse>(&mut resp, version)
         }
         .await;
         let resp: ConsumerGroupHeartbeatResponse = match sent {

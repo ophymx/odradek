@@ -30,6 +30,7 @@ pbkdf2 = { version = "0.12", default-features = false }
 sha2 = "0.10"
 snap = "1"
 subtle = { version = "2.6", default-features = false }
+zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
 rustls-pki-types = "1"
 tokio-rustls = "0.26"
 webpki-roots = "1"

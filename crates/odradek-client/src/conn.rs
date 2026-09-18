@@ -162,7 +162,7 @@ impl Connection {
         let transport = match &config.tls {
             Tls::None => Transport::Plain(stream),
             Tls::Rustls(tls_config) => {
-                let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
+                let host = host_of(addr);
                 let server_name = ServerName::try_from(host.to_owned())
                     .map_err(|e| ClientError::Tls(format!("bad server name {host:?}: {e}")))?;
                 let connector = TlsConnector::from(Arc::clone(tls_config));
@@ -306,6 +306,92 @@ async fn reader_loop(mut read_half: ReadHalf, shared: Arc<Shared>) {
     }
 }
 
+/// Decode a response body and require that it accounted for every byte
+/// of the frame.
+///
+/// A message that decodes while leaving a remainder is not a message
+/// this client understood. The usual cause is a version disagreement —
+/// decoding a v9 response against the v8 schema stops early and hands
+/// back a struct whose fields are silently the wrong ones — and the
+/// symptom without this check is not an error but wrong data: offsets
+/// and error codes read out of fields the peer meant for something
+/// else. Kafka encodes a response at exactly the version the request
+/// named, so a remainder is always a disagreement, never slack; unknown
+/// *additions* are what the tagged-field section exists to carry, and
+/// that is consumed by the decode.
+///
+/// The check is on the client and not in
+/// [`Message::decode`](odradek_protocol::message::Message::decode),
+/// which is correct to leave the buffer alone: a decoder can legitimately
+/// be handed a buffer holding more than one thing — the response header
+/// and the body that follows it, here.
+pub(crate) fn decode_body<M: odradek_protocol::message::Message>(
+    body: &mut Bytes,
+    version: i16,
+) -> Result<M, ClientError> {
+    let message = M::decode(body, version)?;
+    if !body.is_empty() {
+        return Err(ClientError::ProtocolViolation(format!(
+            "api key {} v{version} response leaves {} undecoded byte(s)",
+            M::API_KEY,
+            body.len()
+        )));
+    }
+    Ok(message)
+}
+
+/// The host part of a `host:port` endpoint, for TLS server-name
+/// verification.
+///
+/// An IPv6 literal is bracketed and full of colons — `[::1]:9092` — so
+/// splitting on the last colon yields `[::1]`, which is not a name
+/// rustls will accept. That fails closed (a handshake error, never an
+/// unverified connection), but it fails on every IPv6 broker a cluster
+/// advertises, which is not a thing to leave to a bug report. The
+/// brackets are endpoint syntax, not part of the address, so they come
+/// off before rustls decides whether this is a DNS name or an IP.
+#[cfg(feature = "tls")]
+fn host_of(addr: &str) -> &str {
+    match addr.strip_prefix('[') {
+        Some(rest) => rest.split_once(']').map_or(addr, |(host, _)| host),
+        None => addr.rsplit_once(':').map_or(addr, |(host, _)| host),
+    }
+}
+
+/// How much of a frame body to allocate at a time.
+///
+/// The peer's declared length is a claim, not an arrival. Growing in
+/// steps means a claim only costs what the peer actually backs with
+/// bytes, and the step is large enough that an honest 1 MiB fetch
+/// response costs a handful of amortized reallocations.
+const FRAME_CHUNK: usize = 64 * 1024;
+
+/// Read exactly `len` bytes of frame body, allocating as they arrive.
+///
+/// [`frame::check_len`] returns a bound to stream against, and says in
+/// its own documentation that `vec![0u8; len]` is the thing not to do:
+/// four attacker-chosen bytes would otherwise reserve
+/// [`frame::DEFAULT_MAX_FRAME`] (64 MiB) per connection before the peer
+/// sends any payload at all. A hostile broker needs no more than that
+/// header, and a cluster's metadata response is what tells this client
+/// how many brokers to connect to — so the multiplier is also the
+/// peer's to choose.
+async fn read_frame_body<R: AsyncRead + Unpin>(
+    read_half: &mut R,
+    len: usize,
+) -> Result<Bytes, ClientError> {
+    let mut frame = BytesMut::new();
+    while frame.len() < len {
+        let start = frame.len();
+        let chunk = (len - start).min(FRAME_CHUNK);
+        frame.resize(start + chunk, 0);
+        // read_exact, not read_buf: reading past `chunk` would consume
+        // the head of the next frame.
+        read_half.read_exact(&mut frame[start..]).await?;
+    }
+    Ok(frame.freeze())
+}
+
 async fn read_response(read_half: &mut ReadHalf, shared: &Shared) -> Result<(), ClientError> {
     let mut len_bytes = [0u8; 4];
     read_half.read_exact(&mut len_bytes).await?;
@@ -313,9 +399,7 @@ async fn read_response(read_half: &mut ReadHalf, shared: &Shared) -> Result<(), 
     // protocol violation rather than attempting the allocation.
     let len = frame::check_len(len_bytes, frame::DEFAULT_MAX_FRAME)
         .map_err(|e| ClientError::ProtocolViolation(format!("response frame: {e}")))?;
-    let mut frame = vec![0u8; len];
-    read_half.read_exact(&mut frame).await?;
-    let mut frame = Bytes::from(frame);
+    let mut frame = read_frame_body(read_half, len).await?;
 
     // Correlation id leads every response header version; peek it, then
     // decode the header at the version recorded for that request.
@@ -333,4 +417,49 @@ async fn read_response(read_half: &mut ReadHalf, shared: &Shared) -> Result<(), 
         .map_err(ClientError::from);
     let _ = pending.reply.send(result);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "tls")]
+    #[test]
+    fn host_of_handles_both_address_families() {
+        use super::host_of;
+        assert_eq!(host_of("broker.example.com:9093"), "broker.example.com");
+        assert_eq!(host_of("10.0.0.7:9093"), "10.0.0.7");
+        // The brackets are endpoint syntax; rustls wants the address.
+        assert_eq!(host_of("[::1]:9093"), "::1");
+        assert_eq!(host_of("[2001:db8::a]:9093"), "2001:db8::a");
+        // No port at all: the whole string is the host.
+        assert_eq!(host_of("broker.example.com"), "broker.example.com");
+    }
+
+    #[tokio::test]
+    async fn frame_body_allocates_only_what_arrives() {
+        use super::{FRAME_CHUNK, read_frame_body};
+
+        // A peer that declares a huge frame and then stalls must not
+        // get that size allocated up front. Nothing is written to the
+        // pipe, so the read blocks; the test passes by *not* having
+        // reserved 64 MiB to reach that point.
+        let (client, _server) = tokio::io::duplex(64);
+        let (mut read_half, _write_half) = tokio::io::split(client);
+        let huge = 64 << 20;
+        let read = read_frame_body(&mut read_half, huge);
+        tokio::pin!(read);
+        let stalled = tokio::time::timeout(std::time::Duration::from_millis(50), &mut read).await;
+        assert!(stalled.is_err(), "should still be waiting for the body");
+
+        // And an honest frame still arrives whole, across chunks.
+        let (mut client, mut server) = tokio::io::duplex(1 << 20);
+        let len = FRAME_CHUNK + 1234;
+        let writer = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            server.write_all(&vec![7u8; len]).await.unwrap();
+        });
+        let body = read_frame_body(&mut client, len).await.unwrap();
+        writer.await.unwrap();
+        assert_eq!(body.len(), len);
+        assert!(body.iter().all(|b| *b == 7));
+    }
 }

@@ -43,6 +43,7 @@ use odradek_protocol::messages::list_offsets_response::ListOffsetsResponse;
 use odradek_protocol::records::{Record, RecordHeader, Records, decode_set};
 
 use crate::cluster::Cluster;
+use crate::conn;
 use crate::error::ClientError;
 use crate::offsets::{self, CommitIdentity};
 use crate::retry::{or_forget_coordinator, or_mark_stale, retry_loop};
@@ -347,7 +348,7 @@ impl Consumer {
         };
         // The exchange completed; the connection is clean for reuse.
         lease.release();
-        let resp = FetchResponse::decode(&mut resp, version)?;
+        let resp = conn::decode_body::<FetchResponse>(&mut resp, version)?;
         let code = ErrorCode(resp.error_code);
         if !code.is_ok() {
             return Err(ClientError::Broker(code));
@@ -426,7 +427,7 @@ impl Consumer {
             .conn
             .request(ListOffsetsRequest::API_KEY, version, &body)
             .await?;
-        let resp = ListOffsetsResponse::decode(&mut resp, version)?;
+        let resp = conn::decode_body::<ListOffsetsResponse>(&mut resp, version)?;
         let entry = resp
             .topics
             .iter()

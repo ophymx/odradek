@@ -56,6 +56,12 @@ use sha2::{Digest, Sha256, Sha512};
 use subtle::ConstantTimeEq;
 
 use crate::ClientConfig;
+/// Re-exported because it names the type of a public field:
+/// [`SaslConfig::password`] is a `Zeroizing<String>`, so a caller has to
+/// be able to construct one without taking a direct dependency.
+pub use zeroize::Zeroizing;
+
+use crate::conn;
 use crate::conn::Connection;
 use crate::error::ClientError;
 use crate::negotiate::ApiVersionRanges;
@@ -77,11 +83,24 @@ pub const MIN_SCRAM_ITERATIONS: u32 = 4096;
 pub const DEFAULT_MAX_SCRAM_ITERATIONS: u32 = 1_000_000;
 
 /// Credentials plus mechanism. `Debug` never prints the password.
+///
+/// The password is wrapped in [`Zeroizing`], so dropping this config —
+/// or any clone of it — overwrites the bytes instead of returning them
+/// to the allocator intact. That narrows how long a credential is
+/// readable in a core dump, a swapped page, or a later heap allocation
+/// that happens to land on the same memory.
+///
+/// Two honest limits. It cannot reach copies made before the value got
+/// here: whatever produced the `String` (an environment variable, a
+/// config parse, a `read_to_string`) may have left its own, and only
+/// the caller can clear those. And a `String` that reallocated while
+/// being built leaves the old buffer behind. Treat this as shortening
+/// the window, not closing it.
 #[derive(Clone)]
 pub struct SaslConfig {
     pub mechanism: Mechanism,
     pub username: String,
-    pub password: String,
+    pub password: Zeroizing<String>,
 }
 
 impl std::fmt::Debug for SaslConfig {
@@ -157,7 +176,7 @@ pub async fn authenticate(
     let mut resp = conn
         .request(SaslHandshakeRequest::API_KEY, version, &body)
         .await?;
-    let resp = SaslHandshakeResponse::decode(&mut resp, version)?;
+    let resp = conn::decode_body::<SaslHandshakeResponse>(&mut resp, version)?;
     let code = ErrorCode(resp.error_code);
     if !code.is_ok() {
         return Err(ClientError::Sasl(format!(
@@ -220,7 +239,7 @@ async fn sasl_round(
     let mut resp = conn
         .request(SaslAuthenticateRequest::API_KEY, version, &body)
         .await?;
-    Ok(SaslAuthenticateResponse::decode(&mut resp, version)?)
+    conn::decode_body::<SaslAuthenticateResponse>(&mut resp, version)
 }
 
 fn check_auth(resp: &SaslAuthenticateResponse) -> Result<(), ClientError> {
@@ -294,6 +313,8 @@ where
     // and no timeout can interrupt a synchronous call that already
     // holds it).
     let (client_final, server_signature) = {
+        // Clone into the blocking task as a zeroizing copy too:
+        // the derivation holds it for the whole PBKDF2 burn.
         let password = sasl.password.clone();
         let client_first_bare = client_first_bare.clone();
         let server_first = server_first.clone();
@@ -492,7 +513,7 @@ mod tests {
         let sasl = SaslConfig {
             mechanism: Mechanism::Plain,
             username: "alice".into(),
-            password: "secret".into(),
+            password: Zeroizing::new("secret".to_owned()),
         };
         assert!(format!("{sasl:?}").contains("<redacted>"));
         assert!(!format!("{sasl:?}").contains("secret"));

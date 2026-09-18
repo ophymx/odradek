@@ -16,6 +16,7 @@ use odradek_protocol::messages::offset_fetch_request::{
 use odradek_protocol::messages::offset_fetch_response::OffsetFetchResponse;
 
 use crate::cluster::Cluster;
+use crate::conn;
 use crate::error::ClientError;
 
 /// OffsetCommit versions this client speaks: the classic name-addressed
@@ -77,7 +78,7 @@ pub(crate) async fn commit_once(
         .conn
         .request(OffsetCommitRequest::API_KEY, version, &body)
         .await?;
-    let resp = OffsetCommitResponse::decode(&mut resp, version)?;
+    let resp = conn::decode_body::<OffsetCommitResponse>(&mut resp, version)?;
     let entry = resp
         .topics
         .iter()
@@ -120,7 +121,7 @@ pub(crate) async fn committed_once(
         .conn
         .request(OffsetFetchRequest::API_KEY, version, &body)
         .await?;
-    let resp = OffsetFetchResponse::decode(&mut resp, version)?;
+    let resp = conn::decode_body::<OffsetFetchResponse>(&mut resp, version)?;
     let code = ErrorCode(resp.error_code);
     if !code.is_ok() {
         return Err(ClientError::Broker(code));
