@@ -121,6 +121,16 @@ pub enum TopicPosition {
 
 /// A per-subscriber selection over the partition's records. Empty
 /// matches everything.
+///
+/// [`matches`](Filter::matches) runs on the pump loop, once per event
+/// per subscriber, before the [`SharedEvent`] clone — so the cheap case
+/// is an uninterested subscriber costing one comparison. Every variant
+/// here is therefore O(1) in record size: prefixes and header values
+/// are compared as bytes, never parsed. Anything that must *understand*
+/// a value (JSON path, schema registry) is an unbounded parse on the
+/// live path, and it would not even fail loudly — backpressure would
+/// dutifully demote every subscriber into permanent catch-up, and the
+/// bridge would look slow rather than broken.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Filter {
     /// Keep only records whose key starts with these bytes.

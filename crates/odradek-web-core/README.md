@@ -92,6 +92,55 @@ is the classification (`SourceErrorKind` / `RejectionKind`) plus a
 fixed sentence, which is what `Rejection` and `StreamError::public_message`
 produce.
 
+## Non-goals
+
+One rule decides most of what belongs here, and it is worth stating
+before the arguments rather than after:
+
+> **The engine never decodes a record, never sees a request, and never
+> keeps state a client could keep instead.**
+
+Each clause refuses a different category, and each refusal has
+somewhere better to go.
+
+**Never decodes.** A record's value is opaque `Bytes` from `fetch` to
+frame. So: no JSONPath or SQL-ish filters, no schema registry, no
+Avro/Protobuf decoding, no field projection, no format conversion.
+`Filter` compares bytes — key prefix, header value — because it runs on
+the pump loop once per event per subscriber, and anything on that loop
+must be O(1) in record size. The line is *no decoding*, not "do not
+touch the value". Decode in the subscriber, where the cost is yours.
+
+**Never sees a request.** The hub takes a topic gate, not a principal.
+So: no per-user authorization, rate limiting, quotas, sessions, or
+CORS. Those need the whole request, and they belong in middleware over
+the transport's `Router` — which is why the transports hand you a
+`Router` instead of a server. One pattern is worth knowing before you
+conclude the gap is fatal: a per-subscription `Filter` *is* row-level
+authorization when authority lines up with the key. Authenticate in
+your middleware, derive `key_prefix = "tenant-7/"` from the identity,
+and pass it to `subscribe`. That works today, and it is a reason to put
+the tenant in the key when you design the topic.
+
+**Never keeps state a client could keep.** The resume token lives in
+the client. So: no server-side durable cursors and no consumer-group
+membership in this crate (`odradek-client` has both, for programs that
+want them). What the refusal buys is worth more than the feature: a
+reader that reconnects to a *different process* resumes exactly, with
+zero coordination, because its cursor arrived in the request. Running N
+replicas behind a load balancer is correct by construction rather than
+by a clustering mode.
+
+Two more, refused deliberately:
+
+- **No total order across partitions.** A topic subscription holds
+  order *within* each partition and interleaves them. A global order
+  would mean buffering every partition to the pace of the slowest, and
+  one quiet partition would stall the stream indefinitely.
+- **No write path.** `RecordSource` has no `append`, so no adapter has
+  to implement one it cannot honour. Produce with the store's own
+  client; this side is a reader.
+
 ## Features
 
 `kafka` (default) pulls in `odradek-client` for the real-cluster

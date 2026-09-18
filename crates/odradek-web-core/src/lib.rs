@@ -40,6 +40,17 @@
 //! query grammar ([`StreamParams`]), the JSON event shape
 //! ([`event_json`]), and the resume cursors ([`cursor`]) — so the
 //! transports cannot drift apart.
+//!
+//! # Non-goals
+//!
+//! The engine never decodes a record, never sees a request, and never
+//! keeps state a client could keep instead. That one rule is why
+//! [`Filter`] compares bytes rather than parsing them, why [`Hub`]
+//! takes a topic gate rather than a principal, and why resume tokens
+//! live in the client — which in turn is what makes N replicas behind
+//! a load balancer correct without a clustering mode. The README works
+//! through what each clause refuses and where those things belong
+//! instead.
 
 pub mod cursor;
 pub mod event;
