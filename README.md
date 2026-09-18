@@ -126,8 +126,8 @@ Early but functional end to end:
 - `odradek-web-sse`: the first transport — an embeddable axum `Router`
   (mount it in your own service, layer your own auth) streaming
   `GET /topics/{topic}/partitions/{p}/events` as SSE with resume
-  tokens (next offset) as event ids, `Last-Event-ID` reconnect
-  resume, `from=` positions, and
+  tokens as event ids (opaque — echoed back, not parsed),
+  `Last-Event-ID` reconnect resume, `from=` positions, and
   key/header filters; UTF-8 payloads as strings, binary as base64.
   Tested over a real listener with a raw HTTP client; the `serve`
   example bridges a real broker to `curl -N`.

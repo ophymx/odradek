@@ -13,8 +13,9 @@
 //!   many subscribers ask for it.
 //! - **Replay**: subscribers start [`Earliest`](Position::Earliest),
 //!   [`Latest`](Position::Latest), or at an exact offset — and every
-//!   [`Event`] carries its offset, so `offset + 1` is a natural resume
-//!   token (`Last-Event-ID`, in SSE terms).
+//!   [`Event`] carries its offset, from which a transport mints the
+//!   resume token it hands the client (`Last-Event-ID`, in SSE terms).
+//!   The token is opaque to that client: echoed back, never parsed.
 //! - **Filtering**: per-subscriber [`Filter`]s (key prefix, header
 //!   match) applied before anything is queued.
 //! - **Self-healing backpressure**: a slow subscriber falls out of the

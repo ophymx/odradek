@@ -4,8 +4,15 @@
 //! contract of the constellation's HTTP-facing streams; both the SSE
 //! and WebSocket transports deserialize into [`StreamParams`] so the
 //! grammar cannot drift between them. Resume tokens mean "start here"
-//! everywhere: a partition stream takes a next offset, a topic stream a
-//! `partition:next_offset,...` cursor.
+//! everywhere, and are interchangeable across transports.
+//!
+//! A resume token is **opaque to the client**: the server mints it, the
+//! client echoes it back unchanged. Its contents are this crate's
+//! business — today an offset for a partition stream and a
+//! `partition:next_offset,...` cursor for a topic stream, both parsed
+//! here. Publishing that shape would invite clients to do arithmetic on
+//! it, and every such client would break the day a source's positions
+//! stop being integers.
 
 use bytes::Bytes;
 
@@ -27,8 +34,9 @@ pub struct StreamParams {
 
 impl StreamParams {
     /// The partition-stream start position. A `resume` token (e.g. SSE's
-    /// `Last-Event-ID`) wins over `from` and is used verbatim as the
-    /// next offset.
+    /// `Last-Event-ID`) wins over `from` and is honoured exactly as the
+    /// server minted it — see the [module docs](self) on why its shape
+    /// is not part of the client contract.
     pub fn position(&self, resume: Option<&str>) -> Result<Position, String> {
         if let Some(raw) = resume {
             let offset: i64 = raw

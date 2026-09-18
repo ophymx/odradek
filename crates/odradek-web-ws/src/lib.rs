@@ -16,11 +16,21 @@
 //! JSON is rendered once per record and shared by every socket reading
 //! the partition, so a frame costs each socket a refcount bump.
 //! WebSocket has no `Last-Event-ID`, so resume is explicit: reconnect
-//! with the resume token — `from=<next offset>` (partition streams) or
+//! with `from=<next offset>` (partition streams) or
 //! `from=<partition:next_offset,...>` (topic streams). Tokens mean
 //! "start here" and are interchangeable with the SSE transport's event
 //! ids. Parameter errors are rejected as plain HTTP responses before
 //! the upgrade.
+//!
+//! Note the asymmetry with SSE, which sends each event's resume token
+//! as its `id` and can therefore treat the token as opaque. This
+//! transport sends no token: a client derives `from` by adding one to
+//! the `offset` of the last frame it kept. That arithmetic is part of
+//! this transport's contract, and it is the one place in the
+//! constellation where a resume token's shape is not the server's alone
+//! to change. Putting a resume field in the frame would close the gap —
+//! deliberately not done yet, because it is a wire change to the
+//! envelope SSE shares.
 //!
 //! Subscribe failures are plain HTTP errors before the upgrade: `403`
 //! for a topic the hub's gate denies or an `Origin` the state's

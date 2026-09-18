@@ -14,12 +14,17 @@
 //!
 //! Each record becomes one SSE event: `event: record`, `data` = one
 //! JSON object (which carries the record's own offset), and `id` = the
-//! *resume token*: the next offset after this event. Browsers reconnect
-//! with `Last-Event-ID`, which overrides `from` and is used verbatim as
-//! the start position — so a reconnecting `EventSource` never misses or
-//! repeats a record. Every resume token in the constellation means
-//! "start here": SSE ids, WebSocket `from=`, and the topic-level
+//! *resume token* for the stream position just after it. Browsers
+//! reconnect with `Last-Event-ID`, which overrides `from` and is
+//! honoured exactly as sent — so a reconnecting `EventSource` never
+//! misses or repeats a record. Every resume token in the constellation
+//! means "start here": SSE ids, WebSocket `from=`, and the topic-level
 //! cursors are interchangeable across transports.
+//!
+//! The token is **opaque**: echo it back, do not parse or increment it.
+//! A client that derives the next id itself rather than reading the one
+//! it was sent is coupled to an internal format — and to a `data`
+//! offset that is the *record's*, not the resume position's.
 //!
 //! Keys, values, and header values arrive as UTF-8 strings when they
 //! are valid UTF-8 (`key`, `value`), else base64 (`key_base64`,

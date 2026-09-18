@@ -5,12 +5,14 @@ Server-Sent Events transport over
 embeddable axum `Router` that streams Kafka topics to browsers.
 
 - `GET /topics/{topic}/partitions/{p}/events` — one partition; each
-  event's id is its resume token (the next offset), so a reconnecting
-  `EventSource` resumes via `Last-Event-ID` without missing or
-  repeating a record.
+  event's id is its resume token, so a reconnecting `EventSource`
+  resumes via `Last-Event-ID` without missing or repeating a record.
 - `GET /topics/{topic}/events` — every partition merged into one
   stream (order holds within partitions), with a multi-partition
-  cursor (`partition:next_offset,...`) as the resume token.
+  cursor as the resume token.
+- Resume tokens are opaque: echo back the id the server sent, do not
+  parse or increment it. (The `data` object's `offset` is the
+  *record's* position, not the one to resume from.)
 - `from=` start positions and key/header filters as query parameters;
   UTF-8 payloads as strings, binary as base64.
 - Typed failures: `403` for topics the hub's gate denies, `404` for

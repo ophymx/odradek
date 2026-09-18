@@ -6,9 +6,11 @@ use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 
-/// One record, self-describing enough for a web client to resume from:
-/// the offset doubles as a resume token (subscribe again at
-/// `Position::Offset(offset + 1)` — the natural `Last-Event-ID`).
+/// One record, self-describing enough to resume from: a transport mints
+/// its resume token out of this offset (subscribe again at
+/// `Position::Offset(offset + 1)`) and hands the client something to
+/// echo back. Minting is the server's side of that contract; clients are
+/// told only "send this back", never how it is built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
     pub topic: String,
