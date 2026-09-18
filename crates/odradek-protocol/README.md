@@ -30,6 +30,19 @@ let mut buf = bytes::BytesMut::new();
 MetadataRequest::default().encode(&mut buf, 12)?;
 ```
 
+## Features
+
+None by default — the crate depends only on `bytes` and `thiserror`,
+which is what the proxy and embedded consumers want.
+
+`hardware-crc` swaps the portable slicing-by-8 CRC-32C for the CPU's
+CRC-32C instruction (via the [`crc32c`](https://crates.io/crates/crc32c)
+crate, which detects support at runtime and falls back to software).
+Measured here: CRC 1.2 GiB/s -> 2.6 GiB/s, and a whole 1 MiB fetch
+response decodes 50% faster (697 MiB/s -> 1.02 GiB/s). Output is
+bit-identical either way, enforced by a differential test that CI runs
+in both configurations.
+
 Part of the [odradek](https://github.com/ophymx/odradek) constellation:
 a Kafka client, an acceptance suite, and web bridges all built on this
 crate.

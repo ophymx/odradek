@@ -24,6 +24,8 @@ jobs:
         run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+      - name: hardware-accelerated crc is bit-identical
+        run: cargo test -p odradek-protocol --features hardware-crc
       - name: lean client builds (no tls/sasl/codecs)
         run: cargo check -p odradek-client --no-default-features
       - name: lean web transports build (no kafka)

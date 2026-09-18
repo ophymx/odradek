@@ -15,8 +15,20 @@ categories = ["network-programming", "encoding", "parser-implementations"]
 # Benches live in benches/; keep `cargo bench` off the unit-test harness.
 bench = false
 
+[features]
+default = []
+## Use the CPU's CRC-32C instruction (SSE4.2 on x86-64, CRC32CX on
+## aarch64) via the `crc32c` crate, which detects support at runtime and
+## falls back to software. Off by default: the portable implementation
+## is already ~1.2 GiB/s and keeps this crate dependency-light, which
+## matters for the proxy and embedded consumers. Turn it on for
+## throughput-sensitive pipelines — output is bit-identical either way,
+## enforced by test.
+hardware-crc = ["dep:crc32c"]
+
 [dependencies]
 bytes = { workspace = true }
+crc32c = { workspace = true, optional = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

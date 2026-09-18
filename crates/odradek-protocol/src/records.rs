@@ -474,12 +474,40 @@ fn get_varint_bytes(buf: &mut Bytes) -> Result<Option<Bytes>, DecodeError> {
 /// CRC-32C (Castagnoli), the checksum record batches use. Distinct from
 /// the CRC-32 that magic 0/1 message sets used.
 ///
+/// Two implementations, selected at compile time and bit-identical
+/// (`crc32c_implementations_agree` holds them to it):
+///
+/// - Default: a portable slicing-by-8 table implementation, safe Rust,
+///   no dependencies.
+/// - With the `hardware-crc` feature: the CPU's CRC-32C instruction via
+///   the `crc32c` crate, which picks it at runtime and falls back to
+///   software where it is absent. Worth it for throughput-sensitive
+///   pipelines; the portable path is fast enough that the default stays
+///   dependency-free.
+pub fn crc32c(data: &[u8]) -> u32 {
+    #[cfg(feature = "hardware-crc")]
+    {
+        ::crc32c::crc32c(data)
+    }
+    #[cfg(not(feature = "hardware-crc"))]
+    {
+        crc32c_portable(data)
+    }
+}
+
+/// The dependency-free CRC-32C, always compiled so the accelerated build
+/// can be differentially tested against it.
+///
 /// Slicing-by-8: each iteration folds eight input bytes at once through
 /// eight tables, breaking the serial dependency that makes the classic
-/// one-byte loop wait a table lookup per byte. Pure safe Rust, so it
-/// needs no runtime feature detection — a machine with the SSE4.2 `crc32`
-/// instruction would still be faster, but that needs `unsafe`.
-pub fn crc32c(data: &[u8]) -> u32 {
+/// one-byte loop wait a table lookup per byte.
+// Unused in an accelerated non-test build; the differential test in
+// `hardware_crc_tests` is its only caller there.
+#[cfg_attr(
+    all(feature = "hardware-crc", not(test)),
+    expect(dead_code, reason = "differential test only")
+)]
+pub(crate) fn crc32c_portable(data: &[u8]) -> u32 {
     let mut crc = !0u32;
     let mut chunks = data.chunks_exact(8);
     for chunk in &mut chunks {
@@ -536,4 +564,36 @@ const fn crc32c_tables() -> [[u32; 256]; 8] {
         slice += 1;
     }
     tables
+}
+
+#[cfg(all(test, feature = "hardware-crc"))]
+mod hardware_crc_tests {
+    use super::{crc32c, crc32c_portable};
+
+    /// The accelerated build must be indistinguishable from the portable
+    /// one. A CRC that differed by platform would corrupt every batch
+    /// this crate writes and reject every batch it reads, so the feature
+    /// is only safe while this holds — including at the lengths where
+    /// the two implementations' wide paths and remainders differ.
+    #[test]
+    fn crc32c_implementations_agree() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            u8::try_from((state >> 33) & 0xff).expect("masked to a byte")
+        };
+        for len in [
+            0, 1, 2, 3, 7, 8, 9, 15, 16, 17, 23, 24, 25, 31, 32, 33, 63, 64, 65, 127, 128, 255,
+            256, 257, 1023, 1024, 1025, 4096, 4097,
+        ] {
+            let data: Vec<u8> = (0..len).map(|_| next()).collect();
+            assert_eq!(
+                crc32c(&data),
+                crc32c_portable(&data),
+                "hardware and portable crc disagree at {len} bytes"
+            );
+        }
+    }
 }

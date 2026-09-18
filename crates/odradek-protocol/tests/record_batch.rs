@@ -58,8 +58,9 @@ fn crc32c_known_vectors() {
     assert_eq!(crc32c(b""), 0);
 }
 
-/// The textbook byte-at-a-time CRC-32C, which the shipped slicing-by-8
-/// implementation must agree with on every input.
+/// The textbook byte-at-a-time CRC-32C, which whichever implementation
+/// is compiled — portable slicing-by-8, or the CPU instruction under the
+/// `hardware-crc` feature — must agree with on every input.
 fn reference_crc32c(data: &[u8]) -> u32 {
     let mut crc = !0u32;
     for &byte in data {
