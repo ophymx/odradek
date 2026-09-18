@@ -8,8 +8,12 @@
     "api-versions/v0-basic": "pass",
     "fetch/batch-integrity": "pass",
     "fetch/topic-id": "skipped",
+    "find-coordinator/group": "pass",
+    "list-offsets/earliest-latest": "pass",
     "metadata/basic": "pass",
     "metadata/flexible-response-header": "skipped",
+    "offsets/commit-fetch-roundtrip": "pass",
+    "offsets/unset-is-sentinel": "pass",
     "produce/basic": "pass",
     "produce/topic-id": "skipped"
   }

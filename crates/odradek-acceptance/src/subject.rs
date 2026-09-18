@@ -21,9 +21,24 @@ use odradek_protocol::messages::fetch_request::FetchRequest;
 use odradek_protocol::messages::fetch_response::{
     FetchResponse, FetchableTopicResponse, PartitionData,
 };
+use odradek_protocol::messages::find_coordinator_request::FindCoordinatorRequest;
+use odradek_protocol::messages::find_coordinator_response::{Coordinator, FindCoordinatorResponse};
+use odradek_protocol::messages::list_offsets_request::ListOffsetsRequest;
+use odradek_protocol::messages::list_offsets_response::{
+    ListOffsetsPartitionResponse, ListOffsetsResponse, ListOffsetsTopicResponse,
+};
 use odradek_protocol::messages::metadata_request::{self, MetadataRequest};
 use odradek_protocol::messages::metadata_response::{
     MetadataResponse, MetadataResponseBroker, MetadataResponseTopic,
+};
+use odradek_protocol::messages::offset_commit_request::OffsetCommitRequest;
+use odradek_protocol::messages::offset_commit_response::{
+    OffsetCommitResponse, OffsetCommitResponsePartition, OffsetCommitResponseTopic,
+};
+use odradek_protocol::messages::offset_fetch_request::OffsetFetchRequest;
+use odradek_protocol::messages::offset_fetch_response::{
+    OffsetFetchResponse, OffsetFetchResponseGroup, OffsetFetchResponsePartition,
+    OffsetFetchResponsePartitions, OffsetFetchResponseTopic, OffsetFetchResponseTopics,
 };
 use odradek_protocol::messages::produce_request::ProduceRequest;
 use odradek_protocol::messages::produce_response::{
@@ -39,6 +54,18 @@ use tokio::task::JoinHandle;
 
 /// The newest ApiVersions version the subject supports.
 pub const MAX_SUPPORTED_API_VERSIONS: i16 = ApiVersionsRequest::MAX_VERSION;
+
+/// The single broker this subject presents itself as.
+const BROKER_NODE_ID: i32 = 1;
+/// ListOffsets sentinel timestamps: the log start and the log end.
+const EARLIEST_TIMESTAMP: i64 = -2;
+const LATEST_TIMESTAMP: i64 = -1;
+/// "This group has committed nothing for this partition" — not an error.
+const UNSET_OFFSET: i64 = -1;
+/// The version at which FindCoordinator began batching keys.
+const FIND_COORDINATOR_BATCHED: i16 = 4;
+/// The version at which OffsetFetch began batching groups.
+const OFFSET_FETCH_BATCHED: i16 = 8;
 
 /// A single deliberate protocol violation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +109,16 @@ pub enum Fault {
     /// Answer a topic-id-addressed produce with UNKNOWN_TOPIC_ID even
     /// though the id was minted by this subject's CreateTopics.
     ProduceTopicIdUnknown,
+    /// Report a log start that is not 0, though every log in this
+    /// subject starts at 0.
+    ListOffsetsWrongEarliest,
+    /// Echo a coordinator key the request did not ask about.
+    FindCoordinatorWrongKey,
+    /// Report a committed offset as never-committed.
+    OffsetFetchLosesCommit,
+    /// Answer a never-committed partition with 0 rather than the -1
+    /// sentinel — a plausible offset where "nothing here" was meant.
+    OffsetFetchUnsetIsZero,
     /// Echo a different topic id than the fetch requested.
     FetchWrongTopicId,
 }
@@ -106,6 +143,10 @@ impl Fault {
         Fault::FetchCorruptBatch,
         Fault::ProduceTopicIdUnknown,
         Fault::FetchWrongTopicId,
+        Fault::ListOffsetsWrongEarliest,
+        Fault::FindCoordinatorWrongKey,
+        Fault::OffsetFetchLosesCommit,
+        Fault::OffsetFetchUnsetIsZero,
     ];
 }
 
@@ -173,6 +214,26 @@ fn advertised_keys() -> Vec<ApiVersion> {
             CreateTopicsRequest::MIN_VERSION,
             CreateTopicsRequest::MAX_VERSION,
         ),
+        (
+            ListOffsetsRequest::API_KEY,
+            ListOffsetsRequest::MIN_VERSION,
+            ListOffsetsRequest::MAX_VERSION,
+        ),
+        (
+            FindCoordinatorRequest::API_KEY,
+            FindCoordinatorRequest::MIN_VERSION,
+            FindCoordinatorRequest::MAX_VERSION,
+        ),
+        (
+            OffsetCommitRequest::API_KEY,
+            OffsetCommitRequest::MIN_VERSION,
+            OffsetCommitRequest::MAX_VERSION,
+        ),
+        (
+            OffsetFetchRequest::API_KEY,
+            OffsetFetchRequest::MIN_VERSION,
+            OffsetFetchRequest::MAX_VERSION,
+        ),
     ]
     .into_iter()
     .map(|(api_key, min_version, max_version)| {
@@ -201,6 +262,8 @@ struct ConnState {
     logs: HashMap<(String, i32), PartitionLog>,
     /// Topic ids minted by CreateTopics, keyed by id.
     topic_names: HashMap<[u8; 16], String>,
+    /// Committed offsets, keyed by (group, topic, partition).
+    committed: HashMap<(String, String, i32), i64>,
 }
 
 /// A deterministic per-name topic id; never the zero uuid.
@@ -247,6 +310,16 @@ async fn handle_connection(mut stream: TcpStream, faults: Vec<Fault>) {
             CreateTopicsRequest::API_KEY => create_topics_exchange(frame, api_version, &mut state),
             ProduceRequest::API_KEY => produce_exchange(frame, api_version, &faults, &mut state),
             FetchRequest::API_KEY => fetch_exchange(frame, api_version, &faults, &state),
+            ListOffsetsRequest::API_KEY => {
+                list_offsets_exchange(frame, api_version, &faults, &state)
+            }
+            FindCoordinatorRequest::API_KEY => {
+                find_coordinator_exchange(frame, api_version, local_port, &faults)
+            }
+            OffsetCommitRequest::API_KEY => offset_commit_exchange(frame, api_version, &mut state),
+            OffsetFetchRequest::API_KEY => {
+                offset_fetch_exchange(frame, api_version, &faults, &state)
+            }
             _ => return,
         };
         let Some(out) = out else {
@@ -265,6 +338,298 @@ fn response_header_version(api_key: i16, api_version: i16) -> i16 {
 }
 
 /// Frame a response: length prefix, header at `header_version`, body bytes.
+/// ListOffsets: `-2` is the log start, `-1` the log end, and any other
+/// timestamp is a lookup this subject answers "no such message" to.
+fn list_offsets_exchange(
+    mut frame: Bytes,
+    api_version: i16,
+    faults: &[Fault],
+    state: &ConnState,
+) -> Option<BytesMut> {
+    if !(ListOffsetsRequest::MIN_VERSION..=ListOffsetsRequest::MAX_VERSION).contains(&api_version) {
+        return None;
+    }
+    let hv = header::request_header_version(ListOffsetsRequest::API_KEY, api_version)?;
+    let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
+    let request = ListOffsetsRequest::decode(&mut frame, api_version).ok()?;
+
+    let mut resp = ListOffsetsResponse::default();
+    resp.topics = request
+        .topics
+        .iter()
+        .map(|topic| {
+            let mut out = ListOffsetsTopicResponse::default();
+            out.name = topic.name.clone();
+            out.partitions = topic
+                .partitions
+                .iter()
+                .map(|p| {
+                    let end = state
+                        .logs
+                        .get(&(topic.name.clone(), p.partition_index))
+                        .map_or(0, |log| log.next_offset);
+                    let (timestamp, offset) = match p.timestamp {
+                        EARLIEST_TIMESTAMP => {
+                            let start = if faults.contains(&Fault::ListOffsetsWrongEarliest) {
+                                // The log start is always 0 here, so any
+                                // other answer is wrong by construction.
+                                end.max(1)
+                            } else {
+                                0
+                            };
+                            (-1, start)
+                        }
+                        LATEST_TIMESTAMP => (-1, end),
+                        // No message search in this subject: a timestamp
+                        // lookup finds nothing, which is `offset: -1`.
+                        _ => (-1, -1),
+                    };
+                    let mut out = ListOffsetsPartitionResponse::default();
+                    out.partition_index = p.partition_index;
+                    out.error_code = 0;
+                    out.timestamp = timestamp;
+                    out.offset = offset;
+                    out.leader_epoch = -1;
+                    out
+                })
+                .collect();
+            out
+        })
+        .collect();
+    frame_response(
+        req_header.correlation_id,
+        response_header_version(ListOffsetsRequest::API_KEY, api_version),
+        |out| resp.encode(out, api_version).unwrap(),
+        false,
+    )
+}
+
+/// FindCoordinator: this subject is its own coordinator for every group.
+///
+/// v4 replaced the single `key` with `coordinator_keys`, and the flat
+/// node/host/port with a `coordinators` array — so the two shapes are
+/// answered separately, which is the whole point of checking it.
+fn find_coordinator_exchange(
+    mut frame: Bytes,
+    api_version: i16,
+    local_port: i32,
+    faults: &[Fault],
+) -> Option<BytesMut> {
+    if !(FindCoordinatorRequest::MIN_VERSION..=FindCoordinatorRequest::MAX_VERSION)
+        .contains(&api_version)
+    {
+        return None;
+    }
+    let hv = header::request_header_version(FindCoordinatorRequest::API_KEY, api_version)?;
+    let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
+    let request = FindCoordinatorRequest::decode(&mut frame, api_version).ok()?;
+
+    let mut resp = FindCoordinatorResponse::default();
+    if api_version >= FIND_COORDINATOR_BATCHED {
+        resp.coordinators = request
+            .coordinator_keys
+            .iter()
+            .map(|key| {
+                let mut c = Coordinator::default();
+                c.key = if faults.contains(&Fault::FindCoordinatorWrongKey) {
+                    format!("{key}-not-yours")
+                } else {
+                    key.clone()
+                };
+                c.node_id = BROKER_NODE_ID;
+                c.host = "127.0.0.1".to_owned();
+                c.port = local_port;
+                c.error_code = 0;
+                c
+            })
+            .collect();
+    } else {
+        resp.error_code = 0;
+        resp.node_id = BROKER_NODE_ID;
+        resp.host = "127.0.0.1".to_owned();
+        resp.port = local_port;
+    }
+    frame_response(
+        req_header.correlation_id,
+        response_header_version(FindCoordinatorRequest::API_KEY, api_version),
+        |out| resp.encode(out, api_version).unwrap(),
+        false,
+    )
+}
+
+/// OffsetCommit: store what was committed, per (group, topic, partition).
+fn offset_commit_exchange(
+    mut frame: Bytes,
+    api_version: i16,
+    state: &mut ConnState,
+) -> Option<BytesMut> {
+    if !(OffsetCommitRequest::MIN_VERSION..=OffsetCommitRequest::MAX_VERSION).contains(&api_version)
+    {
+        return None;
+    }
+    let hv = header::request_header_version(OffsetCommitRequest::API_KEY, api_version)?;
+    let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
+    let request = OffsetCommitRequest::decode(&mut frame, api_version).ok()?;
+
+    let mut resp = OffsetCommitResponse::default();
+    resp.topics = request
+        .topics
+        .iter()
+        .map(|topic| {
+            let name = if topic.name.is_empty() {
+                state
+                    .topic_names
+                    .get(&topic.topic_id)
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                topic.name.clone()
+            };
+            let mut out = OffsetCommitResponseTopic::default();
+            out.name = name.clone();
+            out.topic_id = topic.topic_id;
+            out.partitions = topic
+                .partitions
+                .iter()
+                .map(|p| {
+                    state.committed.insert(
+                        (request.group_id.clone(), name.clone(), p.partition_index),
+                        p.committed_offset,
+                    );
+                    let mut out = OffsetCommitResponsePartition::default();
+                    out.partition_index = p.partition_index;
+                    out.error_code = 0;
+                    out
+                })
+                .collect();
+            out
+        })
+        .collect();
+    frame_response(
+        req_header.correlation_id,
+        response_header_version(OffsetCommitRequest::API_KEY, api_version),
+        |out| resp.encode(out, api_version).unwrap(),
+        false,
+    )
+}
+
+/// OffsetFetch: report what was committed, or `-1` where nothing was.
+///
+/// The sentinel is the subtle part and the reason this is checked: a
+/// group that never committed is not an error, it is offset `-1` with
+/// `error_code` 0. v8 moved the whole exchange into a `groups` array.
+fn offset_fetch_exchange(
+    mut frame: Bytes,
+    api_version: i16,
+    faults: &[Fault],
+    state: &ConnState,
+) -> Option<BytesMut> {
+    if !(OffsetFetchRequest::MIN_VERSION..=OffsetFetchRequest::MAX_VERSION).contains(&api_version) {
+        return None;
+    }
+    let hv = header::request_header_version(OffsetFetchRequest::API_KEY, api_version)?;
+    let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
+    let request = OffsetFetchRequest::decode(&mut frame, api_version).ok()?;
+
+    // From v10 the request names topics only by id, exactly as
+    // OffsetCommit does, so both sides have to resolve to the same key or
+    // a commit and its read-back silently miss each other.
+    let resolve = |name: &str, topic_id: &[u8; 16]| -> String {
+        if name.is_empty() {
+            state.topic_names.get(topic_id).cloned().unwrap_or_default()
+        } else {
+            name.to_owned()
+        }
+    };
+    let lookup = |group: &str, topic: &str, partition: i32| -> i64 {
+        let stored = state
+            .committed
+            .get(&(group.to_owned(), topic.to_owned(), partition))
+            .copied();
+        match stored {
+            Some(offset) if faults.contains(&Fault::OffsetFetchLosesCommit) => {
+                // Answer as though nothing was ever committed.
+                let _ = offset;
+                UNSET_OFFSET
+            }
+            Some(offset) => offset,
+            // The sentinel, unless told to report a plausible-looking 0.
+            None if faults.contains(&Fault::OffsetFetchUnsetIsZero) => 0,
+            None => UNSET_OFFSET,
+        }
+    };
+
+    let mut resp = OffsetFetchResponse::default();
+    if api_version >= OFFSET_FETCH_BATCHED {
+        resp.groups = request
+            .groups
+            .iter()
+            .map(|group| {
+                let mut out = OffsetFetchResponseGroup::default();
+                out.group_id = group.group_id.clone();
+                out.error_code = 0;
+                out.topics = group
+                    .topics
+                    .iter()
+                    .flatten()
+                    .map(|topic| {
+                        let mut t = OffsetFetchResponseTopics::default();
+                        t.name = topic.name.clone();
+                        t.topic_id = topic.topic_id;
+                        t.partitions = topic
+                            .partition_indexes
+                            .iter()
+                            .map(|index| {
+                                let mut p = OffsetFetchResponsePartitions::default();
+                                p.partition_index = *index;
+                                p.committed_offset = lookup(
+                                    &group.group_id,
+                                    &resolve(&topic.name, &topic.topic_id),
+                                    *index,
+                                );
+                                p.committed_leader_epoch = -1;
+                                p.error_code = 0;
+                                p
+                            })
+                            .collect();
+                        t
+                    })
+                    .collect();
+                out
+            })
+            .collect();
+    } else {
+        resp.topics = request
+            .topics
+            .iter()
+            .flatten()
+            .map(|topic| {
+                let mut t = OffsetFetchResponseTopic::default();
+                t.name = topic.name.clone();
+                t.partitions = topic
+                    .partition_indexes
+                    .iter()
+                    .map(|index| {
+                        let mut p = OffsetFetchResponsePartition::default();
+                        p.partition_index = *index;
+                        p.committed_offset = lookup(&request.group_id, &topic.name, *index);
+                        p.committed_leader_epoch = -1;
+                        p.error_code = 0;
+                        p
+                    })
+                    .collect();
+                t
+            })
+            .collect();
+    }
+    frame_response(
+        req_header.correlation_id,
+        response_header_version(OffsetFetchRequest::API_KEY, api_version),
+        |out| resp.encode(out, api_version).unwrap(),
+        false,
+    )
+}
+
 fn frame_response(
     correlation_id: i32,
     header_version: i16,
@@ -370,7 +735,7 @@ fn metadata_exchange(
         Vec::new()
     } else {
         let mut broker = MetadataResponseBroker::default();
-        broker.node_id = 1;
+        broker.node_id = BROKER_NODE_ID;
         broker.host = "127.0.0.1".into();
         broker.port = local_port;
         vec![broker]

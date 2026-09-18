@@ -19,8 +19,22 @@ use odradek_protocol::messages::create_topics_request::{CreatableTopic, CreateTo
 use odradek_protocol::messages::create_topics_response::CreateTopicsResponse;
 use odradek_protocol::messages::fetch_request::{FetchPartition, FetchRequest, FetchTopic};
 use odradek_protocol::messages::fetch_response::FetchResponse;
+use odradek_protocol::messages::find_coordinator_request::FindCoordinatorRequest;
+use odradek_protocol::messages::find_coordinator_response::FindCoordinatorResponse;
+use odradek_protocol::messages::list_offsets_request::{
+    ListOffsetsPartition, ListOffsetsRequest, ListOffsetsTopic,
+};
+use odradek_protocol::messages::list_offsets_response::ListOffsetsResponse;
 use odradek_protocol::messages::metadata_request::MetadataRequest;
 use odradek_protocol::messages::metadata_response::MetadataResponse;
+use odradek_protocol::messages::offset_commit_request::{
+    OffsetCommitRequest, OffsetCommitRequestPartition, OffsetCommitRequestTopic,
+};
+use odradek_protocol::messages::offset_commit_response::OffsetCommitResponse;
+use odradek_protocol::messages::offset_fetch_request::{
+    OffsetFetchRequest, OffsetFetchRequestGroup, OffsetFetchRequestTopic, OffsetFetchRequestTopics,
+};
+use odradek_protocol::messages::offset_fetch_response::OffsetFetchResponse;
 use odradek_protocol::messages::produce_request::{
     PartitionProduceData, ProduceRequest, TopicProduceData,
 };
@@ -106,6 +120,32 @@ pub static SERVER_CHECKS: &[Check] = &[
                       requested topic id and returning the produced batch \
                       intact",
         runner: Runner::Server(|ctx| Box::pin(fetch_topic_id(ctx))),
+    },
+    Check {
+        id: "list-offsets/earliest-latest",
+        requirement: "answers timestamp -2 with the log start and -1 with the \
+                      log end, so that the span between them is exactly the \
+                      records produced",
+        runner: Runner::Server(|ctx| Box::pin(list_offsets_earliest_latest(ctx))),
+    },
+    Check {
+        id: "find-coordinator/group",
+        requirement: "names a reachable coordinator for a group key, answering \
+                      in the shape the negotiated version defines (v4+ echoes \
+                      each requested key in `coordinators`)",
+        runner: Runner::Server(|ctx| Box::pin(find_coordinator_group(ctx))),
+    },
+    Check {
+        id: "offsets/commit-fetch-roundtrip",
+        requirement: "returns from OffsetFetch exactly the offset OffsetCommit \
+                      was given for that group, topic and partition",
+        runner: Runner::Server(|ctx| Box::pin(offsets_commit_fetch_roundtrip(ctx))),
+    },
+    Check {
+        id: "offsets/unset-is-sentinel",
+        requirement: "reports a partition a group never committed as offset -1 \
+                      with no error, rather than as 0 or as a failure",
+        runner: Runner::Server(|ctx| Box::pin(offsets_unset_is_sentinel(ctx))),
     },
 ];
 
@@ -323,6 +363,622 @@ async fn checked_call<T: Message>(
         )));
     }
     Ok(resp)
+}
+
+/// ListOffsets sentinels: `-2` is the log start, `-1` the log end.
+const EARLIEST_TIMESTAMP: i64 = -2;
+const LATEST_TIMESTAMP: i64 = -1;
+/// OffsetFetch reports a never-committed partition as this, not as an error.
+const UNSET_OFFSET: i64 = -1;
+/// FindCoordinator batched keys from v4; OffsetFetch batched groups from v8.
+const FIND_COORDINATOR_BATCHED: i16 = 4;
+const OFFSET_FETCH_BATCHED: i16 = 8;
+/// From v10 both offset APIs address topics by id instead of by name —
+/// the same migration Produce and Fetch made at v13.
+const OFFSETS_BY_TOPIC_ID: i16 = 10;
+/// The group this suite commits under. Named per run so a rerun against a
+/// live cluster never reads a previous run's commits.
+fn check_group(topic: &str) -> String {
+    format!("{topic}-odradek-acceptance")
+}
+
+/// Ask for one partition's offset at `timestamp`.
+async fn list_offsets_at(
+    conn: &mut RawConnection,
+    version: i16,
+    topic: &str,
+    timestamp: i64,
+    correlation_id: i32,
+) -> Result<i64, CheckError> {
+    let mut partition = ListOffsetsPartition::default();
+    partition.partition_index = 0;
+    partition.current_leader_epoch = -1;
+    partition.timestamp = timestamp;
+    let mut req_topic = ListOffsetsTopic::default();
+    req_topic.name = topic.to_owned();
+    req_topic.partitions = vec![partition];
+    let mut request = ListOffsetsRequest::default();
+    request.replica_id = -1;
+    request.isolation_level = 0;
+    request.topics = vec![req_topic];
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding ListOffsets: {e}")))?;
+    let resp: ListOffsetsResponse = api_call(
+        conn,
+        ListOffsetsRequest::API_KEY,
+        version,
+        correlation_id,
+        &body,
+    )
+    .await?;
+    let partition = resp
+        .topics
+        .iter()
+        .find(|t| t.name == topic)
+        .and_then(|t| t.partitions.first())
+        .ok_or_else(|| CheckError::Violation(format!("ListOffsets response omits {topic}[0]")))?;
+    let code = ErrorCode(partition.error_code);
+    if !code.is_ok() {
+        return Err(CheckError::Violation(format!(
+            "ListOffsets for {topic}[0] at timestamp {timestamp} failed: {code}"
+        )));
+    }
+    Ok(partition.offset)
+}
+
+/// The log start and log end bracket exactly what was produced.
+///
+/// Checking the two together is what makes this more than a liveness
+/// probe: either alone can be faked by a constant, but their difference
+/// has to equal the record count, and the flow knows that count.
+async fn list_offsets_earliest_latest(ctx: &ServerCtx) -> Verdict {
+    let advertised = match ctx.range(ListOffsetsRequest::API_KEY) {
+        Ok(a) => a,
+        Err(v) => return v,
+    };
+    let version = match negotiate(
+        "ListOffsets",
+        advertised,
+        ListOffsetsRequest::MIN_VERSION,
+        ListOffsetsRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let mut produced = match produce_flow(ctx, "listoffsets", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    let sent_records = match decode_set(&mut produced.sent.clone()) {
+        Ok(batches) => batches.iter().map(batch_record_count).sum::<i64>(),
+        Err(e) => {
+            return Verdict::Error {
+                details: format!("suite produced a record set it cannot decode: {e}"),
+            };
+        }
+    };
+
+    let earliest = match list_offsets_at(
+        &mut produced.conn,
+        version,
+        &produced.topic,
+        EARLIEST_TIMESTAMP,
+        41,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => return e.into_verdict(),
+    };
+    let latest = match list_offsets_at(
+        &mut produced.conn,
+        version,
+        &produced.topic,
+        LATEST_TIMESTAMP,
+        42,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => return e.into_verdict(),
+    };
+
+    if earliest != 0 {
+        return Verdict::Fail {
+            details: format!("log start of a freshly created topic is {earliest}, expected 0"),
+        };
+    }
+    if latest - earliest != sent_records {
+        return Verdict::Fail {
+            details: format!(
+                "log spans {} offset(s) ({earliest}..{latest}) after producing \
+                 {sent_records} record(s)",
+                latest - earliest
+            ),
+        };
+    }
+    Verdict::Pass
+}
+
+/// Records in a batch, from whichever representation it decoded to.
+fn batch_record_count(batch: &RecordBatch) -> i64 {
+    match &batch.records {
+        Records::Plain(records) => records.len() as i64,
+        Records::Compressed { count, .. } => i64::from(*count),
+    }
+}
+
+/// A group has a coordinator, and v4+ says which key it answered for.
+async fn find_coordinator_group(ctx: &ServerCtx) -> Verdict {
+    let advertised = match ctx.range(FindCoordinatorRequest::API_KEY) {
+        Ok(a) => a,
+        Err(v) => return v,
+    };
+    let version = match negotiate(
+        "FindCoordinator",
+        advertised,
+        FindCoordinatorRequest::MIN_VERSION,
+        FindCoordinatorRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let mut conn = match connect(&ctx.addr).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
+    let group = check_group("find-coordinator");
+
+    let mut request = FindCoordinatorRequest::default();
+    request.key_type = 0; // group
+    if version >= FIND_COORDINATOR_BATCHED {
+        request.coordinator_keys = vec![group.clone()];
+    } else {
+        request.key = group.clone();
+    }
+    let mut body = BytesMut::new();
+    if let Err(e) = request.encode(&mut body, version) {
+        return Verdict::Error {
+            details: format!("encoding FindCoordinator: {e}"),
+        };
+    }
+    // A cluster that has never hosted a group creates `__consumer_offsets`
+    // on the first ask, and says COORDINATOR_NOT_AVAILABLE until its
+    // partitions have leaders. That is a retriable error, not a wrong
+    // answer, and a client that treated it as final would be the broken
+    // one — so the suite waits it out on the same budget the produce flow
+    // uses for a freshly created topic.
+    let mut resp: FindCoordinatorResponse = FindCoordinatorResponse::default();
+    let mut last = ErrorCode(0);
+    let mut correlation = 51;
+    for attempt in 0..ctx.config.settle_attempts() {
+        if attempt > 0 {
+            tokio::time::sleep(ctx.config.settle_delay).await;
+        }
+        correlation += 1;
+        resp = match api_call(
+            &mut conn,
+            FindCoordinatorRequest::API_KEY,
+            version,
+            correlation,
+            &body,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => return e.into_verdict(),
+        };
+        last = coordinator_error(&resp, version);
+        if !is_coordinator_settling(last) {
+            break;
+        }
+    }
+    if is_coordinator_settling(last) {
+        return Verdict::Fail {
+            details: format!(
+                "coordinator for {group:?} still {last} after {:?}",
+                ctx.config.settle_budget
+            ),
+        };
+    }
+
+    // The two shapes are genuinely different messages wearing one name.
+    let (error_code, key, host, port) = if version >= FIND_COORDINATOR_BATCHED {
+        if resp.coordinators.len() != 1 {
+            return Verdict::Fail {
+                details: format!(
+                    "asked about 1 coordinator key, v{version} response carries {}",
+                    resp.coordinators.len()
+                ),
+            };
+        }
+        let c = &resp.coordinators[0];
+        (c.error_code, Some(c.key.clone()), c.host.clone(), c.port)
+    } else {
+        (resp.error_code, None, resp.host.clone(), resp.port)
+    };
+
+    let code = ErrorCode(error_code);
+    if !code.is_ok() {
+        return Verdict::Fail {
+            details: format!("no coordinator for group {group:?}: {code}"),
+        };
+    }
+    // No let-chain: this crate builds on the declared MSRV, which predates
+    // them.
+    if key.as_deref().is_some_and(|key| key != group) {
+        return Verdict::Fail {
+            details: format!(
+                "asked about group {group:?}, response answers for {:?}",
+                key.unwrap_or_default()
+            ),
+        };
+    }
+    if host.is_empty() || !(1..=65535).contains(&port) {
+        return Verdict::Fail {
+            details: format!("coordinator endpoint is implausible: {host:?}:{port}"),
+        };
+    }
+    Verdict::Pass
+}
+
+/// The error a FindCoordinator response reports, from whichever shape
+/// the negotiated version used.
+fn coordinator_error(resp: &FindCoordinatorResponse, version: i16) -> ErrorCode {
+    if version >= FIND_COORDINATOR_BATCHED {
+        ErrorCode(resp.coordinators.first().map_or(0, |c| c.error_code))
+    } else {
+        ErrorCode(resp.error_code)
+    }
+}
+
+/// Errors that mean "ask again shortly", not "no".
+fn is_coordinator_settling(code: ErrorCode) -> bool {
+    code == ErrorCode::COORDINATOR_NOT_AVAILABLE || code == ErrorCode::COORDINATOR_LOAD_IN_PROGRESS
+}
+
+/// Wait for the group coordinator to exist before asking it anything.
+///
+/// The offsets checks need this for the same reason and would otherwise
+/// pass or fail on whether they happened to run after
+/// `find-coordinator/group` warmed the cluster — an order dependency
+/// between checks is a bug in the suite, not a property of the subject.
+async fn await_coordinator(ctx: &ServerCtx, group: &str) -> Result<(), CheckError> {
+    let advertised = match ctx.range(FindCoordinatorRequest::API_KEY) {
+        Ok(a) => a,
+        // No FindCoordinator advertised: let the offsets exchange itself
+        // report whatever it reports.
+        Err(_) => return Ok(()),
+    };
+    let Ok(version) = negotiate(
+        "FindCoordinator",
+        advertised,
+        FindCoordinatorRequest::MIN_VERSION,
+        FindCoordinatorRequest::MAX_VERSION,
+    ) else {
+        return Ok(());
+    };
+    let mut request = FindCoordinatorRequest::default();
+    request.key_type = 0;
+    if version >= FIND_COORDINATOR_BATCHED {
+        request.coordinator_keys = vec![group.to_owned()];
+    } else {
+        request.key = group.to_owned();
+    }
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding FindCoordinator: {e}")))?;
+
+    let mut conn = connect(&ctx.addr).await?;
+    for attempt in 0..ctx.config.settle_attempts() {
+        if attempt > 0 {
+            tokio::time::sleep(ctx.config.settle_delay).await;
+        }
+        let resp: FindCoordinatorResponse = api_call(
+            &mut conn,
+            FindCoordinatorRequest::API_KEY,
+            version,
+            80 + i32::try_from(attempt).unwrap_or(0),
+            &body,
+        )
+        .await?;
+        if !is_coordinator_settling(coordinator_error(&resp, version)) {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// Commit an offset for one partition of `topic` under `group`.
+async fn commit_offset(
+    conn: &mut RawConnection,
+    version: i16,
+    group: &str,
+    topic: &str,
+    topic_id: [u8; 16],
+    offset: i64,
+    correlation_id: i32,
+) -> Result<(), CheckError> {
+    let mut partition = OffsetCommitRequestPartition::default();
+    partition.partition_index = 0;
+    partition.committed_offset = offset;
+    partition.committed_leader_epoch = -1;
+    let mut req_topic = OffsetCommitRequestTopic::default();
+    // v10 addresses by id and drops the name from the wire entirely, so
+    // sending the name there would name nothing.
+    if version >= OFFSETS_BY_TOPIC_ID {
+        req_topic.topic_id = topic_id;
+    } else {
+        req_topic.name = topic.to_owned();
+    }
+    req_topic.partitions = vec![partition];
+    let mut request = OffsetCommitRequest::default();
+    request.group_id = group.to_owned();
+    // A simple (non-member) commit: no generation, no member id. This is
+    // the path a consumer that manages its own partitions uses.
+    request.generation_id_or_member_epoch = -1;
+    request.member_id = String::new();
+    request.retention_time_ms = -1;
+    request.topics = vec![req_topic];
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding OffsetCommit: {e}")))?;
+    let resp: OffsetCommitResponse = api_call(
+        conn,
+        OffsetCommitRequest::API_KEY,
+        version,
+        correlation_id,
+        &body,
+    )
+    .await?;
+    let partition = resp
+        .topics
+        .iter()
+        .find(|t| {
+            if version >= OFFSETS_BY_TOPIC_ID {
+                t.topic_id == topic_id
+            } else {
+                t.name == topic
+            }
+        })
+        .and_then(|t| t.partitions.first())
+        .ok_or_else(|| CheckError::Violation(format!("OffsetCommit response omits {topic}[0]")))?;
+    let code = ErrorCode(partition.error_code);
+    if !code.is_ok() {
+        return Err(CheckError::Violation(format!(
+            "committing {offset} for {topic}[0] failed: {code}"
+        )));
+    }
+    Ok(())
+}
+
+/// Read back what a group committed for one partition.
+async fn fetch_committed(
+    conn: &mut RawConnection,
+    version: i16,
+    group: &str,
+    topic: &str,
+    topic_id: [u8; 16],
+    correlation_id: i32,
+) -> Result<i64, CheckError> {
+    let mut request = OffsetFetchRequest::default();
+    if version >= OFFSET_FETCH_BATCHED {
+        let mut topics = OffsetFetchRequestTopics::default();
+        if version >= OFFSETS_BY_TOPIC_ID {
+            topics.topic_id = topic_id;
+        } else {
+            topics.name = topic.to_owned();
+        }
+        topics.partition_indexes = vec![0];
+        let mut req_group = OffsetFetchRequestGroup::default();
+        req_group.group_id = group.to_owned();
+        req_group.member_epoch = -1;
+        req_group.topics = Some(vec![topics]);
+        request.groups = vec![req_group];
+    } else {
+        let mut req_topic = OffsetFetchRequestTopic::default();
+        req_topic.name = topic.to_owned();
+        req_topic.partition_indexes = vec![0];
+        request.group_id = group.to_owned();
+        request.topics = Some(vec![req_topic]);
+    }
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding OffsetFetch: {e}")))?;
+    let resp: OffsetFetchResponse = api_call(
+        conn,
+        OffsetFetchRequest::API_KEY,
+        version,
+        correlation_id,
+        &body,
+    )
+    .await?;
+
+    let (error_code, committed) = if version >= OFFSET_FETCH_BATCHED {
+        let group_resp = resp
+            .groups
+            .iter()
+            .find(|g| g.group_id == group)
+            .ok_or_else(|| {
+                CheckError::Violation(format!("OffsetFetch response omits group {group:?}"))
+            })?;
+        let partition = group_resp
+            .topics
+            .iter()
+            .find(|t| {
+                if version >= OFFSETS_BY_TOPIC_ID {
+                    t.topic_id == topic_id
+                } else {
+                    t.name == topic
+                }
+            })
+            .and_then(|t| t.partitions.first())
+            .ok_or_else(|| {
+                CheckError::Violation(format!("OffsetFetch response omits {topic}[0]"))
+            })?;
+        (
+            if group_resp.error_code != 0 {
+                group_resp.error_code
+            } else {
+                partition.error_code
+            },
+            partition.committed_offset,
+        )
+    } else {
+        let partition = resp
+            .topics
+            .iter()
+            .find(|t| t.name == topic)
+            .and_then(|t| t.partitions.first())
+            .ok_or_else(|| {
+                CheckError::Violation(format!("OffsetFetch response omits {topic}[0]"))
+            })?;
+        (partition.error_code, partition.committed_offset)
+    };
+    let code = ErrorCode(error_code);
+    if !code.is_ok() {
+        return Err(CheckError::Violation(format!(
+            "reading the committed offset for {topic}[0] failed: {code}"
+        )));
+    }
+    Ok(committed)
+}
+
+/// What OffsetCommit stored is what OffsetFetch returns.
+///
+/// The round trip is the assertion. A server that accepts commits and
+/// loses them answers every commit with success, so only reading the
+/// value back distinguishes the two.
+async fn offsets_commit_fetch_roundtrip(ctx: &ServerCtx) -> Verdict {
+    let (commit_version, fetch_version) = match offsets_versions(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let mut produced = match produce_flow(ctx, "offsets", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    if let Some(skip) = skip_without_topic_id(&produced, commit_version.max(fetch_version)) {
+        return skip;
+    }
+    let group = check_group(&produced.topic);
+    if let Err(e) = await_coordinator(ctx, &group).await {
+        return e.into_verdict();
+    }
+    // Not 0, and not the log end either: a number nothing else would
+    // produce by accident.
+    let committed = 7;
+
+    if let Err(e) = commit_offset(
+        &mut produced.conn,
+        commit_version,
+        &group,
+        &produced.topic,
+        produced.topic_id,
+        committed,
+        61,
+    )
+    .await
+    {
+        return e.into_verdict();
+    }
+    match fetch_committed(
+        &mut produced.conn,
+        fetch_version,
+        &group,
+        &produced.topic,
+        produced.topic_id,
+        62,
+    )
+    .await
+    {
+        Ok(got) if got == committed => Verdict::Pass,
+        Ok(got) => Verdict::Fail {
+            details: format!("committed offset {committed}, read back {got}"),
+        },
+        Err(e) => e.into_verdict(),
+    }
+}
+
+/// A partition a group never committed reads as -1, not 0 and not an error.
+///
+/// Worth its own check because the wrong answer here is plausible: 0 is a
+/// valid offset, so a server that reports 0 for "nothing committed" sends
+/// a resuming consumer back to the start of the log instead of to wherever
+/// its configured default says.
+async fn offsets_unset_is_sentinel(ctx: &ServerCtx) -> Verdict {
+    let (_, fetch_version) = match offsets_versions(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let mut produced = match produce_flow(ctx, "unset", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    if let Some(skip) = skip_without_topic_id(&produced, fetch_version) {
+        return skip;
+    }
+    // A group that has never existed, let alone committed.
+    let group = format!("{}-never-committed", check_group(&produced.topic));
+    if let Err(e) = await_coordinator(ctx, &group).await {
+        return e.into_verdict();
+    }
+    match fetch_committed(
+        &mut produced.conn,
+        fetch_version,
+        &group,
+        &produced.topic,
+        produced.topic_id,
+        71,
+    )
+    .await
+    {
+        Ok(got) if got == UNSET_OFFSET => Verdict::Pass,
+        Ok(got) => Verdict::Fail {
+            details: format!(
+                "a group that never committed reads as offset {got}, expected \
+                 {UNSET_OFFSET}"
+            ),
+        },
+        Err(e) => e.into_verdict(),
+    }
+}
+
+/// From v10 the offset APIs name topics only by id, so a subject whose
+/// CreateTopics did not hand one back cannot be asked the question.
+fn skip_without_topic_id(produced: &ProducedTopic, version: i16) -> Option<Verdict> {
+    if version >= OFFSETS_BY_TOPIC_ID && produced.topic_id == [0u8; 16] {
+        return Some(Verdict::Skipped {
+            reason: format!(
+                "offsets v{version} addresses topics by id, and CreateTopics \
+                 returned none for {}",
+                produced.topic
+            ),
+        });
+    }
+    None
+}
+
+/// Negotiate both halves of the offsets pair, since either can be absent.
+fn offsets_versions(ctx: &ServerCtx) -> Result<(i16, i16), Verdict> {
+    let commit = negotiate(
+        "OffsetCommit",
+        ctx.range(OffsetCommitRequest::API_KEY)?,
+        OffsetCommitRequest::MIN_VERSION,
+        OffsetCommitRequest::MAX_VERSION,
+    )?;
+    let fetch = negotiate(
+        "OffsetFetch",
+        ctx.range(OffsetFetchRequest::API_KEY)?,
+        OffsetFetchRequest::MIN_VERSION,
+        OffsetFetchRequest::MAX_VERSION,
+    )?;
+    Ok((commit, fetch))
 }
 
 /// One exchange at a negotiated version on an existing connection, header

@@ -78,6 +78,16 @@ const SENSITIVITY: &[(Fault, &str)] = &[
     (Fault::FetchCorruptBatch, "fetch/batch-integrity"),
     (Fault::ProduceTopicIdUnknown, "produce/topic-id"),
     (Fault::FetchWrongTopicId, "fetch/topic-id"),
+    (
+        Fault::ListOffsetsWrongEarliest,
+        "list-offsets/earliest-latest",
+    ),
+    (Fault::FindCoordinatorWrongKey, "find-coordinator/group"),
+    (
+        Fault::OffsetFetchLosesCommit,
+        "offsets/commit-fetch-roundtrip",
+    ),
+    (Fault::OffsetFetchUnsetIsZero, "offsets/unset-is-sentinel"),
 ];
 
 /// The calibration registry is exhaustive in both directions against the

@@ -86,7 +86,15 @@ Early but functional end to end:
   incremental reconciliation on Kafka 4.1's new coordinator).
 - `odradek-acceptance`: conformance checks for **both roles** over raw
   connections independent of the client crate — `api-versions/*`,
-  `metadata/*`, `produce/*`, and `fetch/*` server checks (including a
+  `metadata/*`, `produce/*`, `fetch/*`, `list-offsets/*`,
+  `find-coordinator/*`, and `offsets/*` server checks, covering
+  everything a consumer needs short of group membership: the log start
+  and log end bracket exactly what was produced, a group key names a
+  reachable coordinator in whichever shape the negotiated version
+  defines, an offset read back from OffsetFetch is the one OffsetCommit
+  was given, and a partition a group never committed reads as the -1
+  sentinel rather than as 0 (which would send a resuming consumer back
+  to the start of the log). Also (including a
   create → produce → fetch flow that asserts the broker returns the
   produced batch byte-identical in the crc-covered region) and `client/*`
   client checks, where the harness impersonates a three-broker cluster so
