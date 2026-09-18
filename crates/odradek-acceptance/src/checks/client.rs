@@ -7,7 +7,10 @@
 //! answers just enough of the protocol to keep a real client talking
 //! (ApiVersions, Metadata, and empty Produce/Fetch successes) and records
 //! every frame; the catalogued checks ([`CLIENT_CHECKS`]) are evaluated
-//! over the recorded `Session`. When the harness itself cannot run —
+//! over the recorded `Session`. A session ends when the subject hangs up
+//! (its last connection closes), when it has said enough
+//! ([`ObserveConfig::max_requests`]), or when it falls silent
+//! ([`ObserveConfig::idle_timeout`]). When the harness itself cannot run —
 //! a listener fails to bind, or no client ever connects before the
 //! [`ObserveConfig::accept_timeout`] deadline — [`run`] returns an
 //! infrastructure error instead of fabricating check outcomes.
@@ -146,7 +149,9 @@ pub enum HarnessFault {
 pub struct ObserveConfig {
     /// Stop after this many requests (the checks need finite input).
     pub max_requests: usize,
-    /// Stop when every connection goes quiet for this long.
+    /// Stop when every connection goes quiet for this long. This is the
+    /// backstop for a client that connects and then says nothing: a
+    /// client that hangs up ends the session at once instead.
     pub idle_timeout: Duration,
     /// How long to wait for the client's *first* connection before giving
     /// up with an infrastructure error — the harness must not hang
@@ -204,6 +209,38 @@ pub(crate) struct Session {
     observations: Vec<Observation>,
     fault: Option<HarnessFault>,
     events: Vec<FaultEvent>,
+}
+
+/// Connection bookkeeping for one session: hands out connection ordinals
+/// and signals when the last live connection closes.
+///
+/// A client that has hung up has nothing left to say, so the session can
+/// be judged immediately instead of waiting out
+/// [`ObserveConfig::idle_timeout`] — which remains the backstop for a
+/// client that connects and then falls silent.
+#[derive(Debug)]
+struct ConnTracker {
+    next_id: AtomicUsize,
+    live: AtomicUsize,
+    ended: mpsc::UnboundedSender<()>,
+}
+
+impl ConnTracker {
+    /// Register a connection about to be handled and return its ordinal.
+    /// Called before the handler is spawned, so the live count never dips
+    /// through zero between accept and handling.
+    fn open(&self) -> usize {
+        self.live.fetch_add(1, Ordering::SeqCst);
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Retire a connection, signalling the session's end when it was the
+    /// last one live.
+    fn close(&self) {
+        if self.live.fetch_sub(1, Ordering::SeqCst) == 1 {
+            let _ = self.ended.send(());
+        }
+    }
 }
 
 /// The impersonated cluster: endpoints (broker `i` on `ports[i]`) and
@@ -300,25 +337,31 @@ pub async fn run(listener: &TcpListener, config: &ObserveConfig) -> io::Result<R
     });
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let conn_counter = Arc::new(AtomicUsize::new(0));
+    let (ended_tx, mut ended_rx) = mpsc::unbounded_channel();
+    let conns = Arc::new(ConnTracker {
+        next_id: AtomicUsize::new(0),
+        live: AtomicUsize::new(0),
+        ended: ended_tx,
+    });
     let mut accept_tasks = Vec::new();
     for (i, l) in extra.into_iter().enumerate() {
         let node_id = i32::try_from(i).unwrap_or(0) + 1;
         let view = Arc::clone(&view);
         let tx = tx.clone();
-        let conn_counter = Arc::clone(&conn_counter);
+        let conns = Arc::clone(&conns);
         accept_tasks.push(tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = l.accept().await else {
                     return;
                 };
-                let conn_id = conn_counter.fetch_add(1, Ordering::Relaxed);
+                let conn_id = conns.open();
                 tokio::spawn(handle_conn(
                     stream,
                     node_id,
                     conn_id,
                     Arc::clone(&view),
                     tx.clone(),
+                    Arc::clone(&conns),
                 ));
             }
         }));
@@ -340,36 +383,49 @@ pub async fn run(listener: &TcpListener, config: &ObserveConfig) -> io::Result<R
             return Err(io::Error::new(e.kind(), format!("accept failed: {e}")));
         }
         Ok(Ok((stream, peer))) => {
-            let conn_id = conn_counter.fetch_add(1, Ordering::Relaxed);
+            let conn_id = conns.open();
             tokio::spawn(handle_conn(
                 stream,
                 0,
                 conn_id,
                 Arc::clone(&view),
                 tx.clone(),
+                Arc::clone(&conns),
             ));
             peer
         }
     };
 
-    // Collect observations until the whole session goes idle.
+    // Collect observations until the client hangs up (or goes idle, or
+    // says enough).
     let mut observations = Vec::new();
     while observations.len() < config.max_requests {
         tokio::select! {
             accepted = listener.accept() => {
                 if let Ok((stream, _)) = accepted {
-                    let conn_id = conn_counter.fetch_add(1, Ordering::Relaxed);
-                    tokio::spawn(handle_conn(stream, 0, conn_id, Arc::clone(&view), tx.clone()));
+                    let conn_id = conns.open();
+                    tokio::spawn(handle_conn(
+                        stream, 0, conn_id, Arc::clone(&view), tx.clone(), Arc::clone(&conns),
+                    ));
                 }
             }
             obs = rx.recv() => match obs {
                 Some(obs) => observations.push(obs),
                 None => break,
             },
+            _ = ended_rx.recv() => break,
             () = tokio::time::sleep(config.idle_timeout) => break,
         }
     }
     abort_all(&accept_tasks);
+    // The last connection's closing can win the race against its own
+    // final observations, which are already queued: take what is there.
+    while observations.len() < config.max_requests {
+        match rx.try_recv() {
+            Ok(obs) => observations.push(obs),
+            Err(_) => break,
+        }
+    }
     let events = view.events.lock().unwrap().clone();
     let session = Session {
         observations,
@@ -385,7 +441,21 @@ fn abort_all(tasks: &[JoinHandle<()>]) {
     }
 }
 
+/// Serve one client connection, retiring it with the tracker however it
+/// ends — closed, unreadable, or with the collector gone.
 async fn handle_conn(
+    stream: TcpStream,
+    node_id: i32,
+    conn_id: usize,
+    view: Arc<ClusterView>,
+    tx: mpsc::UnboundedSender<Observation>,
+    conns: Arc<ConnTracker>,
+) {
+    serve_conn(stream, node_id, conn_id, view, tx).await;
+    conns.close();
+}
+
+async fn serve_conn(
     mut stream: TcpStream,
     node_id: i32,
     conn_id: usize,

@@ -9,7 +9,10 @@
 //!
 //! Each subject runs in a throwaway container on an ephemeral host port,
 //! with the broker's advertised listener pointed back at that port so a
-//! future metadata-following check keeps working. Baselines live in
+//! future metadata-following check keeps working. Subjects share no
+//! state, so they run concurrently — one thread each, output buffered and
+//! printed per subject — and the wall clock is the slowest broker's
+//! startup rather than the sum. Baselines live in
 //! `conformance/<name>.json` as versioned envelopes (`format`/`suite`
 //! plus the per-check statuses); a run that diverges from its baseline
 //! fails, which is what makes real brokers ground truth for the suite
@@ -17,10 +20,11 @@
 //! outcomes) never satisfy a baseline, but odradek-accept reports them
 //! distinctly from protocol failures.
 
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -86,7 +90,7 @@ const SUBJECTS: &[Subject] = &[
 pub fn conformance(args: &[String]) -> Result<()> {
     let record = args.iter().any(|a| a == "--record");
     let filters: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
-    let selected: Vec<&Subject> = SUBJECTS
+    let selected: Vec<&'static Subject> = SUBJECTS
         .iter()
         .filter(|s| filters.is_empty() || filters.iter().any(|f| s.name.contains(f.as_str())))
         .collect();
@@ -107,12 +111,51 @@ pub fn conformance(args: &[String]) -> Result<()> {
     let conf_dir = root.join("conformance");
     std::fs::create_dir_all(&conf_dir)?;
 
+    // Subjects share nothing: ephemeral host ports, container names
+    // stamped with the port, topic names stamped with pid and clock. So
+    // run each on its own thread (everything below is blocking std) and
+    // pay one startup instead of their sum. Each thread buffers its own
+    // output; the reports are printed grouped, in matrix order, once its
+    // subject is done.
+    if selected.len() > 1 {
+        eprintln!(
+            "running {} subjects in parallel: {}",
+            selected.len(),
+            selected
+                .iter()
+                .map(|s| s.name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let running: Vec<_> = selected
+        .iter()
+        .map(|&subject| {
+            let accept = accept.clone();
+            let conf_dir = conf_dir.clone();
+            std::thread::spawn(move || {
+                let mut log = String::new();
+                let result = run_subject(subject, &accept, &conf_dir, record, &mut log);
+                (log, result)
+            })
+        })
+        .collect();
+
     let mut failures = Vec::new();
-    for subject in selected {
+    for (subject, handle) in selected.iter().zip(running) {
         eprintln!("=== {} ({}) ===", subject.name, subject.image);
-        if let Err(e) = run_subject(subject, &accept, &conf_dir, record) {
-            eprintln!("{}: {e:#}", subject.name);
-            failures.push(subject.name);
+        match handle.join() {
+            Ok((log, result)) => {
+                eprint!("{log}");
+                if let Err(e) = result {
+                    eprintln!("{}: {e:#}", subject.name);
+                    failures.push(subject.name);
+                }
+            }
+            Err(_) => {
+                eprintln!("{}: subject thread panicked", subject.name);
+                failures.push(subject.name);
+            }
         }
     }
     if !failures.is_empty() {
@@ -133,13 +176,22 @@ fn build_accept(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_subject(subject: &Subject, accept: &Path, conf_dir: &Path, record: bool) -> Result<()> {
+/// Run one subject end to end, appending everything a human should see
+/// to `log` rather than printing it — concurrent subjects would otherwise
+/// interleave their reports line by line.
+fn run_subject(
+    subject: &Subject,
+    accept: &Path,
+    conf_dir: &Path,
+    record: bool,
+    log: &mut String,
+) -> Result<()> {
     let port = ephemeral_port()?;
     let container = Container::start(subject, port)?;
     let addr = format!("127.0.0.1:{port}");
 
     if let Err(e) = wait_ready(&addr) {
-        container.dump_logs();
+        container.dump_logs(log);
         return Err(e);
     }
 
@@ -151,18 +203,21 @@ fn run_subject(subject: &Subject, accept: &Path, conf_dir: &Path, record: bool) 
     } else {
         cmd.args(["--baseline".as_ref(), baseline.as_os_str()]);
     }
-    let status = cmd.status().context("running odradek-accept")?;
-    if !status.success() {
+    let out = cmd.output().context("running odradek-accept")?;
+    log.push_str(&String::from_utf8_lossy(&out.stdout));
+    log.push_str(&String::from_utf8_lossy(&out.stderr));
+    if !out.status.success() {
         // In record mode the accept run may exit non-zero because the
         // subject deviates; the point of recording is to capture exactly
         // that, so only enforcement failures are errors.
         if record {
-            eprintln!(
+            let _ = writeln!(
+                log,
                 "note: {} deviates from full conformance (recorded)",
                 subject.name
             );
         } else {
-            container.dump_logs();
+            container.dump_logs(log);
             bail!("acceptance run failed against {}", subject.name);
         }
     }
@@ -218,19 +273,45 @@ impl Container {
         Ok(Container { name })
     }
 
-    fn dump_logs(&self) {
-        eprintln!("--- docker logs {} (tail) ---", self.name);
-        let _ = Command::new("docker")
+    fn dump_logs(&self, log: &mut String) {
+        let _ = writeln!(log, "--- docker logs {} (tail) ---", self.name);
+        match Command::new("docker")
             .args(["logs", "--tail", "40", &self.name])
-            .status();
+            .output()
+        {
+            Ok(out) => {
+                log.push_str(&String::from_utf8_lossy(&out.stdout));
+                log.push_str(&String::from_utf8_lossy(&out.stderr));
+            }
+            Err(e) => {
+                let _ = writeln!(log, "(docker logs failed: {e})");
+            }
+        }
     }
 }
 
 impl Drop for Container {
     fn drop(&mut self) {
-        let _ = Command::new("docker")
+        // `docker rm -f` blocks for seconds on daemon-side teardown
+        // (network namespace and published port release), and nothing
+        // here needs to see the end of it: the container was started with
+        // `--rm`, so the daemon reaps it either way, and the next run
+        // picks a fresh ephemeral port rather than reusing this one. Fire
+        // it and walk away — including on the error and panic paths this
+        // guard exists for.
+        let child = Command::new("docker")
             .args(["rm", "-f", &self.name])
-            .output();
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        // Reap it off-thread so a long-lived xtask leaves no zombie; the
+        // thread dies with the process if we exit first.
+        if let Ok(mut child) = child {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
     }
 }
 

@@ -2,6 +2,9 @@
 //!
 //! `cargo xtask codegen` regenerates `odradek-protocol/src/messages/` from
 //! the Kafka message schemas vendored in `odradek-protocol/schemas/`.
+//! Output is rustfmt-formatted (so it matches what the repo commits) and
+//! written only where it differs, leaving a no-op run with nothing to
+//! rebuild.
 //!
 //! `cargo xtask conformance` runs the acceptance suite against real broker
 //! implementations in Docker; see `conformance.rs`.
@@ -13,7 +16,9 @@
 
 use std::fmt::Write as _;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -64,12 +69,35 @@ fn codegen() -> Result<()> {
          //! schemas or the generator and re-run.\n"
     );
 
-    let mut module_names = Vec::new();
+    // Generating is cheap and formatting is not, so format the modules in
+    // parallel; the result is what gets compared against what is already
+    // on disk.
+    let mut generated = Vec::new();
     for msg in &messages {
         let module = snake_case(&msg.name);
         let code = generate_message(msg).with_context(|| format!("generating {}", msg.name))?;
-        fs::write(out_dir.join(format!("{module}.rs")), code)?;
-        module_names.push((module, msg));
+        generated.push((module, msg, code));
+    }
+    let formatted: Vec<String> = std::thread::scope(|scope| {
+        let workers: Vec<_> = generated
+            .iter()
+            .map(|(_, _, code)| scope.spawn(move || rustfmt_or(code)))
+            .collect();
+        workers
+            .into_iter()
+            .zip(&generated)
+            .map(|(worker, (_, _, code))| worker.join().unwrap_or_else(|_| code.clone()))
+            .collect()
+    });
+
+    let mut rewritten = 0usize;
+    let mut module_names = Vec::new();
+    for ((module, msg, _), code) in generated.iter().zip(&formatted) {
+        rewritten += usize::from(write_if_changed(
+            &out_dir.join(format!("{module}.rs")),
+            code,
+        )?);
+        module_names.push((module.clone(), *msg));
     }
 
     for (module, _) in &module_names {
@@ -117,13 +145,75 @@ fn codegen() -> Result<()> {
     }
     let _ = writeln!(mod_rs, "        _ => None,\n    }}\n}}");
 
-    fs::write(out_dir.join("mod.rs"), mod_rs)?;
+    rewritten += usize::from(write_if_changed(
+        &out_dir.join("mod.rs"),
+        &rustfmt_or(&mod_rs),
+    )?);
     println!(
-        "generated {} message modules in {}",
+        "generated {} message modules in {} ({rewritten} file(s) changed)",
         module_names.len(),
         out_dir.display()
     );
     Ok(())
+}
+
+/// Write `contents` only if the file does not already say exactly that.
+///
+/// Rewriting a byte-identical file still bumps its mtime, and a bumped
+/// mtime under `src/messages/` makes cargo rebuild the protocol crate and
+/// everything downstream — six seconds of compiling to reach the state it
+/// was already in. Returns whether the file changed.
+fn write_if_changed(path: &Path, contents: &str) -> Result<bool> {
+    if fs::read_to_string(path).is_ok_and(|on_disk| on_disk == contents) {
+        return Ok(false);
+    }
+    fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
+    Ok(true)
+}
+
+/// Format generated code as `cargo fmt` would.
+///
+/// The generator emits legible-enough but unformatted Rust, while what is
+/// committed is formatted — so without this every file would differ from
+/// its own last output and [`write_if_changed`] could never skip a write.
+/// Returns an empty string if rustfmt is unavailable or unhappy; callers
+/// then keep the unformatted source, and `cargo fmt` (which CI runs right
+/// after codegen anyway) settles the final shape.
+fn rustfmt(code: &str) -> String {
+    let Ok(mut child) = Command::new("rustfmt")
+        .args(["--edition", "2024", "--emit", "stdout"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return String::new();
+    };
+    // rustfmt parses the whole input before emitting anything, so writing
+    // it all and then reading cannot deadlock on a full pipe.
+    let Some(mut stdin) = child.stdin.take() else {
+        return String::new();
+    };
+    let written = stdin
+        .write_all(code.as_bytes())
+        .and_then(|()| stdin.flush());
+    drop(stdin);
+    match (written, child.wait_with_output()) {
+        (Ok(()), Ok(out)) if out.status.success() => {
+            String::from_utf8(out.stdout).unwrap_or_default()
+        }
+        _ => String::new(),
+    }
+}
+
+/// [`rustfmt`], falling back to the unformatted source.
+fn rustfmt_or(code: &str) -> String {
+    let formatted = rustfmt(code);
+    if formatted.is_empty() {
+        code.to_owned()
+    } else {
+        formatted
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -109,10 +109,53 @@ pub static SERVER_CHECKS: &[Check] = &[
     },
 ];
 
-/// Run the catalogued Server-role checks against `addr` and collect a
-/// report.
+/// Limits for one server-side run.
+///
+/// The settle budget is the only knob that costs wall-clock time: a
+/// freshly created topic on a real broker genuinely takes seconds to
+/// elect a leader, but a subject that answers instantly (the calibration
+/// [`crate::subject`], or any in-process stub) never needs the wait — and
+/// a subject that answers a *permanent* error the flow treats as
+/// retriable burns the whole budget before reaching the right verdict.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ProbeConfig {
+    /// How long the produce/fetch flows tolerate retriable errors from a
+    /// freshly created topic before calling it a failure.
+    pub settle_budget: Duration,
+    /// How long to wait between attempts within that budget.
+    pub settle_delay: Duration,
+}
+
+impl Default for ProbeConfig {
+    fn default() -> Self {
+        ProbeConfig {
+            settle_budget: Duration::from_secs(5),
+            settle_delay: Duration::from_millis(100),
+        }
+    }
+}
+
+impl ProbeConfig {
+    /// How many attempts the budget affords, `settle_delay` apart. Always
+    /// at least one: a zero budget still gets a single try, so the flow
+    /// can never skip the exchange it is there to make.
+    fn settle_attempts(&self) -> u32 {
+        let delay = self.settle_delay.as_millis().max(1);
+        let attempts = self.settle_budget.as_millis() / delay;
+        u32::try_from(attempts).unwrap_or(u32::MAX).max(1)
+    }
+}
+
+/// Run the catalogued Server-role checks against `addr` with the default
+/// [`ProbeConfig`] and collect a report.
 pub async fn run(addr: &str) -> Report {
-    let ctx = ServerCtx::discover(addr).await;
+    run_with(addr, &ProbeConfig::default()).await
+}
+
+/// Run the catalogued Server-role checks against `addr` under `config`.
+pub async fn run_with(addr: &str, config: &ProbeConfig) -> Report {
+    let ctx = ServerCtx::discover(addr, config.clone()).await;
     let mut outcomes = Vec::new();
     for check in crate::checks::catalog() {
         if check.role() != SubjectRole::Server {
@@ -188,10 +231,11 @@ pub(crate) struct ServerCtx {
     /// protocol problem `api-versions/v0-basic` reports, which the other
     /// checks answer with skips exactly as before.
     discovery: Result<Vec<ApiVersion>, String>,
+    config: ProbeConfig,
 }
 
 impl ServerCtx {
-    async fn discover(addr: &str) -> ServerCtx {
+    async fn discover(addr: &str, config: ProbeConfig) -> ServerCtx {
         let discovery = match exchange(addr, 0, 1, 9, 0).await {
             Ok(resp) => Ok(resp.api_keys),
             Err(CheckError::Violation(_)) => Ok(Vec::new()),
@@ -202,6 +246,7 @@ impl ServerCtx {
         ServerCtx {
             addr: addr.into(),
             discovery,
+            config,
         }
     }
 
@@ -591,11 +636,6 @@ const FETCH_NAME_MAX: i16 = 12;
 const PRODUCE_ID_MIN: i16 = 13;
 const FETCH_ID_MIN: i16 = 13;
 
-/// How long the flow tolerates a freshly created topic answering with
-/// retriable errors before calling it a failure.
-const SETTLE_ATTEMPTS: u32 = 50;
-const SETTLE_DELAY: Duration = Duration::from_millis(100);
-
 fn retriable(code: ErrorCode) -> bool {
     // The topic or its leadership is still materializing after create;
     // id-addressed requests surface the same lag as UNKNOWN_TOPIC_ID.
@@ -777,7 +817,8 @@ async fn produce_flow(
         .map_err(|e| infra(e.to_string()))?;
 
     let mut last_code = ErrorCode(0);
-    for _ in 0..SETTLE_ATTEMPTS {
+    let attempts = ctx.config.settle_attempts();
+    for _ in 0..attempts {
         let resp: ProduceResponse = api_call(
             &mut conn,
             ProduceRequest::API_KEY,
@@ -806,10 +847,12 @@ async fn produce_flow(
             return Err(fail(format!("Produce failed with {code}")));
         }
         last_code = code;
-        tokio::time::sleep(SETTLE_DELAY).await;
+        tokio::time::sleep(ctx.config.settle_delay).await;
     }
     Err(fail(format!(
-        "topic never became producible: still {last_code} after {SETTLE_ATTEMPTS} attempts"
+        "topic never became producible: still {last_code} after {attempts} attempts \
+         over {:?}",
+        ctx.config.settle_budget
     )))
 }
 
@@ -843,6 +886,7 @@ async fn run_fetch(
     produced: &mut ProducedTopic,
     fetch_version: i16,
     addressing: Addressing,
+    config: &ProbeConfig,
 ) -> Result<Bytes, CheckError> {
     let mut fetch_partition = FetchPartition::default();
     fetch_partition.partition = 0;
@@ -876,7 +920,7 @@ async fn run_fetch(
     // acks=-1 already committed the batch, but give replication internals
     // a moment anyway rather than failing on an empty first response.
     let mut last = String::from("fetch returned no records");
-    for _ in 0..SETTLE_ATTEMPTS {
+    for _ in 0..config.settle_attempts() {
         let outcome = async {
             let resp: FetchResponse = api_call(
                 &mut produced.conn,
@@ -931,7 +975,7 @@ async fn run_fetch(
                 last = details;
             }
         }
-        tokio::time::sleep(SETTLE_DELAY).await;
+        tokio::time::sleep(config.settle_delay).await;
     }
     Err(CheckError::Violation(last))
 }
@@ -956,7 +1000,7 @@ async fn fetch_batch_integrity(ctx: &ServerCtx) -> Verdict {
         Ok(p) => p,
         Err(verdict) => return verdict,
     };
-    match run_fetch(&mut produced, fetch_version, Addressing::Name).await {
+    match run_fetch(&mut produced, fetch_version, Addressing::Name, &ctx.config).await {
         Ok(got) => batch_integrity(&produced.sent, &got),
         Err(e) => e.into_verdict(),
     }
@@ -987,7 +1031,14 @@ async fn fetch_topic_id(ctx: &ServerCtx) -> Verdict {
             reason: "CreateTopics did not return a topic id (needs v7+)".into(),
         };
     }
-    match run_fetch(&mut produced, fetch_version, Addressing::TopicId).await {
+    match run_fetch(
+        &mut produced,
+        fetch_version,
+        Addressing::TopicId,
+        &ctx.config,
+    )
+    .await
+    {
         Ok(got) => batch_integrity(&produced.sent, &got),
         Err(e) => e.into_verdict(),
     }

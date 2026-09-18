@@ -4,11 +4,26 @@
 //! The check catalog is the single source of truth: id lists and counts
 //! here are derived from it, never restated.
 
-use odradek_acceptance::checks;
+use std::time::Duration;
+
 use odradek_acceptance::checks::catalog;
+use odradek_acceptance::checks::server::{self, ProbeConfig};
 use odradek_acceptance::report::{BaselineDiff, BaselineStatus, FORMAT, Report};
 use odradek_acceptance::subject::{Fault, SubjectServer};
 use odradek_acceptance::{SubjectRole, Verdict};
+
+/// Every subject here is in-process and answers instantly, so the default
+/// settle budget — five seconds, right for a real broker electing a
+/// leader for a fresh topic — is pure latency. Worse, a fault that answers
+/// a *permanent* UNKNOWN_TOPIC_ID (which the flow treats as retriable)
+/// burns the whole budget before reaching the correct verdict. Three
+/// tenths of a second is still an order of magnitude more than these
+/// subjects ever need.
+async fn run(addr: &str) -> Report {
+    let mut config = ProbeConfig::default();
+    config.settle_budget = Duration::from_millis(300);
+    server::run_with(addr, &config).await
+}
 
 fn server_check_ids() -> Vec<&'static str> {
     catalog()
@@ -20,7 +35,7 @@ fn server_check_ids() -> Vec<&'static str> {
 #[tokio::test]
 async fn compliant_subject_passes_all_checks() {
     let subject = SubjectServer::spawn(vec![]).await.unwrap();
-    let report = checks::server::run(subject.addr()).await;
+    let report = run(subject.addr()).await;
     assert!(report.is_conformant(), "false positives:\n{report}");
     let expected = server_check_ids();
     assert_eq!(
@@ -96,7 +111,7 @@ fn every_check_has_a_fault_and_every_fault_a_check() {
 async fn each_fault_trips_its_targeted_check() {
     for &(fault, target) in SENSITIVITY {
         let subject = SubjectServer::spawn(vec![fault]).await.unwrap();
-        let report = checks::server::run(subject.addr()).await;
+        let report = run(subject.addr()).await;
         assert!(
             matches!(report.verdict(target), Some(Verdict::Fail { .. })),
             "fault {fault:?} was not detected by {target}:\n{report}"
@@ -132,7 +147,7 @@ async fn isolated_faults_cause_no_collateral_failures() {
             .map(|(_, t)| *t)
             .unwrap();
         let subject = SubjectServer::spawn(vec![fault]).await.unwrap();
-        let report = checks::server::run(subject.addr()).await;
+        let report = run(subject.addr()).await;
         for outcome in &report.outcomes {
             if outcome.id.0 == target {
                 assert!(
@@ -160,7 +175,7 @@ async fn unreachable_subject_errors_instead_of_failing() {
     let addr = listener.local_addr().unwrap().to_string();
     drop(listener);
 
-    let report = checks::server::run(&addr).await;
+    let report = run(&addr).await;
     assert_eq!(report.outcomes.len(), server_check_ids().len());
     for outcome in &report.outcomes {
         assert!(
@@ -174,7 +189,7 @@ async fn unreachable_subject_errors_instead_of_failing() {
     assert!(report.is_conformant());
 
     let compliant = SubjectServer::spawn(vec![]).await.unwrap();
-    let baseline = checks::server::run(compliant.addr()).await.to_baseline();
+    let baseline = run(compliant.addr()).await.to_baseline();
     let diffs = report.diff_against(&baseline);
     assert_eq!(diffs.len(), report.outcomes.len(), "{diffs:?}");
     for diff in &diffs {
@@ -190,7 +205,7 @@ async fn baseline_roundtrip_and_diff() {
     let subject = SubjectServer::spawn(vec![Fault::FlexibleHeaderOnV3])
         .await
         .unwrap();
-    let report = checks::server::run(subject.addr()).await;
+    let report = run(subject.addr()).await;
 
     // A run always matches the baseline derived from itself, even with a
     // known deviation recorded as an expected failure.
@@ -203,7 +218,7 @@ async fn baseline_roundtrip_and_diff() {
     // Against the compliant subject's baseline the deviation surfaces as
     // a regression (the check exists in both, its outcome changed).
     let compliant = SubjectServer::spawn(vec![]).await.unwrap();
-    let compliant_report = checks::server::run(compliant.addr()).await;
+    let compliant_report = run(compliant.addr()).await;
     let diffs = report.diff_against(&compliant_report.to_baseline());
     assert_eq!(diffs.len(), 1, "{diffs:?}");
     match &diffs[0] {
@@ -226,7 +241,7 @@ async fn baseline_roundtrip_and_diff() {
 #[tokio::test]
 async fn baseline_diff_distinguishes_new_and_removed_checks() {
     let subject = SubjectServer::spawn(vec![]).await.unwrap();
-    let report = checks::server::run(subject.addr()).await;
+    let report = run(subject.addr()).await;
     let mut baseline = report.to_baseline();
     let (known_id, _) = baseline.checks.pop_first().unwrap();
     baseline
@@ -256,7 +271,7 @@ async fn baseline_diff_distinguishes_new_and_removed_checks() {
 #[tokio::test]
 async fn report_envelope_round_trips() {
     let subject = SubjectServer::spawn(vec![]).await.unwrap();
-    let report = checks::server::run(subject.addr()).await;
+    let report = run(subject.addr()).await;
     assert_eq!(report.format, FORMAT);
     assert_eq!(report.suite, env!("CARGO_PKG_VERSION"));
 

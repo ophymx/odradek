@@ -63,4 +63,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: enforce committed baselines against Kafka and Redpanda
-        run: cargo xtask conformance
+        # ~850MB of images, otherwise pulled implicitly by the first
+        # `docker run` — that is, only once the build is over. Start both
+        # pulls first so they overlap the compile. Nothing here depends on
+        # them succeeding: `docker run` pulls whatever is missing anyway.
+        run: |
+          docker pull -q apache/kafka:4.1.0 &
+          docker pull -q redpandadata/redpanda:v25.2.1 &
+          cargo xtask conformance
+          wait || true
