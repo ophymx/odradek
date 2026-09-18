@@ -87,8 +87,8 @@ Early but functional end to end:
 - `odradek-acceptance`: conformance checks for **both roles** over raw
   connections independent of the client crate — `api-versions/*`,
   `metadata/*`, `produce/*`, `fetch/*`, `list-offsets/*`,
-  `find-coordinator/*`, `offsets/*`, and `create-topics/*` server
-  checks, covering
+  `find-coordinator/*`, `offsets/*`, `create-topics/*`, and `groups/*`
+  server checks, covering
   everything a consumer needs short of group membership: the log start
   and log end bracket exactly what was produced, a group key names a
   reachable coordinator in whichever shape the negotiated version
@@ -111,7 +111,14 @@ Early but functional end to end:
   absent from ignored), a duplicate CreateTopics must be refused with
   TOPIC_ALREADY_EXISTS, and `validate_only` must answer without
   creating — checked by creating for real afterwards and watching for
-  the give-away. Also (including a
+  the give-away. The group checks came out of implementing the protocol
+  in the reference subject rather than out of reading the schemas: a
+  join carrying no member id must be refused with MEMBER_ID_REQUIRED
+  *and* handed an id to rejoin with, the assignment bytes a leader
+  supplies must reach their member unexamined (the same opacity the
+  record-batch codec promises), and a heartbeat from a generation the
+  group has left must be fenced with ILLEGAL_GENERATION. Also (including
+  a
   create → produce → fetch flow that asserts the broker returns the
   produced batch byte-identical in the crc-covered region) and `client/*`
   client checks, where the harness impersonates a three-broker cluster so

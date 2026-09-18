@@ -23,6 +23,12 @@ use odradek_protocol::messages::fetch_response::{
 };
 use odradek_protocol::messages::find_coordinator_request::FindCoordinatorRequest;
 use odradek_protocol::messages::find_coordinator_response::{Coordinator, FindCoordinatorResponse};
+use odradek_protocol::messages::heartbeat_request::HeartbeatRequest;
+use odradek_protocol::messages::heartbeat_response::HeartbeatResponse;
+use odradek_protocol::messages::join_group_request::JoinGroupRequest;
+use odradek_protocol::messages::join_group_response::{JoinGroupResponse, JoinGroupResponseMember};
+use odradek_protocol::messages::leave_group_request::LeaveGroupRequest;
+use odradek_protocol::messages::leave_group_response::LeaveGroupResponse;
 use odradek_protocol::messages::list_offsets_request::ListOffsetsRequest;
 use odradek_protocol::messages::list_offsets_response::{
     ListOffsetsPartitionResponse, ListOffsetsResponse, ListOffsetsTopicResponse,
@@ -46,6 +52,8 @@ use odradek_protocol::messages::produce_response::{
 };
 use odradek_protocol::messages::request_header::RequestHeader;
 use odradek_protocol::messages::response_header::ResponseHeader;
+use odradek_protocol::messages::sync_group_request::SyncGroupRequest;
+use odradek_protocol::messages::sync_group_response::SyncGroupResponse;
 use odradek_protocol::records;
 use odradek_protocol::{ErrorCode, frame, header};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -119,6 +127,14 @@ pub enum Fault {
     /// Answer a never-committed partition with 0 rather than the -1
     /// sentinel — a plausible offset where "nothing here" was meant.
     OffsetFetchUnsetIsZero,
+    /// Admit a join with no member id instead of answering
+    /// MEMBER_ID_REQUIRED with one to retry with.
+    JoinGroupAcceptsEmptyMemberId,
+    /// Alter the assignment bytes the leader supplied before handing
+    /// them to their member.
+    SyncGroupRewritesAssignment,
+    /// Accept any generation on a post-join request.
+    GroupIgnoresGeneration,
     /// Answer a fetch past the high watermark with an empty batch set
     /// instead of OFFSET_OUT_OF_RANGE.
     FetchPastEndSucceeds,
@@ -175,6 +191,9 @@ impl Fault {
         Fault::MetadataUnknownTopicOmitted,
         Fault::CreateTopicsDuplicateSucceeds,
         Fault::CreateTopicsValidateOnlyCreates,
+        Fault::JoinGroupAcceptsEmptyMemberId,
+        Fault::SyncGroupRewritesAssignment,
+        Fault::GroupIgnoresGeneration,
     ];
 }
 
@@ -262,6 +281,26 @@ fn advertised_keys() -> Vec<ApiVersion> {
             OffsetFetchRequest::MIN_VERSION,
             OffsetFetchRequest::MAX_VERSION,
         ),
+        (
+            JoinGroupRequest::API_KEY,
+            JoinGroupRequest::MIN_VERSION,
+            JoinGroupRequest::MAX_VERSION,
+        ),
+        (
+            SyncGroupRequest::API_KEY,
+            SyncGroupRequest::MIN_VERSION,
+            SyncGroupRequest::MAX_VERSION,
+        ),
+        (
+            HeartbeatRequest::API_KEY,
+            HeartbeatRequest::MIN_VERSION,
+            HeartbeatRequest::MAX_VERSION,
+        ),
+        (
+            LeaveGroupRequest::API_KEY,
+            LeaveGroupRequest::MIN_VERSION,
+            LeaveGroupRequest::MAX_VERSION,
+        ),
     ]
     .into_iter()
     .map(|(api_key, min_version, max_version)| {
@@ -292,10 +331,45 @@ struct ConnState {
     topic_names: HashMap<[u8; 16], String>,
     /// Committed offsets, keyed by (group, topic, partition).
     committed: HashMap<(String, String, i32), i64>,
+    /// Consumer groups this connection has joined.
+    groups: HashMap<String, GroupState>,
     /// Topics CreateTopics actually created. Distinct from `logs`, which
     /// only gains an entry once something is produced, and from
     /// `topic_names`, which maps ids: a topic can exist and be empty.
     created: HashMap<String, [u8; 16]>,
+}
+
+/// One consumer group, as much of it as the classic protocol needs.
+///
+/// Writing this down is what surfaced the checks that go with it. Three
+/// things the request/response schemas do not say, and an implementer
+/// has to decide:
+///
+/// 1. A join with no member id cannot simply be given one and waved
+///    through — from JoinGroup v4 the coordinator answers
+///    MEMBER_ID_REQUIRED *and* hands back the id to retry with, so a
+///    client always rejoins with an id the coordinator minted. Without
+///    that round trip a client that dies mid-join leaves a member
+///    nobody can name.
+/// 2. The assignment bytes are the group leader's to decide and the
+///    coordinator's only to deliver. They are opaque: the coordinator
+///    that parses or rewrites them has broken the same guarantee a
+///    proxy breaks by re-encoding a record batch.
+/// 3. The generation is the fence. Every later request carries it, and
+///    one that carries a stale one has to be refused rather than
+///    applied, or a member evicted during a rebalance quietly keeps
+///    acting on an assignment it no longer owns.
+#[derive(Debug, Default)]
+struct GroupState {
+    generation_id: i32,
+    /// Members in join order; the first is the leader.
+    members: Vec<String>,
+    protocol_type: String,
+    protocol_name: String,
+    /// Set by the leader at SyncGroup, handed back verbatim.
+    assignments: HashMap<String, Bytes>,
+    /// Member ids minted for a join that had none, awaiting the rejoin.
+    minted: Vec<String>,
 }
 
 /// A deterministic per-name topic id; never the zero uuid.
@@ -356,6 +430,16 @@ async fn handle_connection(mut stream: TcpStream, faults: Vec<Fault>) {
             OffsetFetchRequest::API_KEY => {
                 offset_fetch_exchange(frame, api_version, &faults, &state)
             }
+            JoinGroupRequest::API_KEY => {
+                join_group_exchange(frame, api_version, &faults, &mut state)
+            }
+            SyncGroupRequest::API_KEY => {
+                sync_group_exchange(frame, api_version, &faults, &mut state)
+            }
+            HeartbeatRequest::API_KEY => {
+                heartbeat_exchange(frame, api_version, &faults, &mut state)
+            }
+            LeaveGroupRequest::API_KEY => leave_group_exchange(frame, api_version, &mut state),
             _ => return,
         };
         let Some(out) = out else {
@@ -374,6 +458,237 @@ fn response_header_version(api_key: i16, api_version: i16) -> i16 {
 }
 
 /// Frame a response: length prefix, header at `header_version`, body bytes.
+/// The version from which a join with no member id must be refused and
+/// given one to retry with.
+const JOIN_GROUP_MEMBER_ID_REQUIRED: i16 = 4;
+
+/// JoinGroup: mint a member id, or admit the member and name a leader.
+fn join_group_exchange(
+    mut frame: Bytes,
+    api_version: i16,
+    faults: &[Fault],
+    state: &mut ConnState,
+) -> Option<BytesMut> {
+    if !(JoinGroupRequest::MIN_VERSION..=JoinGroupRequest::MAX_VERSION).contains(&api_version) {
+        return None;
+    }
+    let hv = header::request_header_version(JoinGroupRequest::API_KEY, api_version)?;
+    let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
+    let request = JoinGroupRequest::decode(&mut frame, api_version).ok()?;
+
+    let group = state.groups.entry(request.group_id.clone()).or_default();
+    let mut resp = JoinGroupResponse::default();
+
+    let needs_id = request.member_id.is_empty()
+        && api_version >= JOIN_GROUP_MEMBER_ID_REQUIRED
+        && !faults.contains(&Fault::JoinGroupAcceptsEmptyMemberId);
+    if needs_id {
+        // The id is minted here and the join refused, so the member that
+        // comes back is one the coordinator named.
+        let minted = format!("odradek-member-{}", group.minted.len() + 1);
+        group.minted.push(minted.clone());
+        resp.error_code = ErrorCode::MEMBER_ID_REQUIRED.0;
+        resp.member_id = minted;
+        resp.generation_id = -1;
+        resp.leader = String::new();
+        resp.protocol_type = Some(request.protocol_type.clone());
+        resp.protocol_name = None;
+        return frame_response(
+            req_header.correlation_id,
+            response_header_version(JoinGroupRequest::API_KEY, api_version),
+            |out| resp.encode(out, api_version).unwrap(),
+            false,
+        );
+    }
+
+    let member_id = if request.member_id.is_empty() {
+        let minted = format!("odradek-member-{}", group.minted.len() + 1);
+        group.minted.push(minted.clone());
+        minted
+    } else {
+        request.member_id.clone()
+    };
+    if !group.members.contains(&member_id) {
+        group.members.push(member_id.clone());
+        group.generation_id += 1;
+        group.assignments.clear();
+    }
+    group.protocol_type = request.protocol_type.clone();
+    group.protocol_name = request
+        .protocols
+        .first()
+        .map(|p| p.name.clone())
+        .unwrap_or_default();
+
+    let leader = group.members.first().cloned().unwrap_or_default();
+    resp.error_code = 0;
+    resp.generation_id = group.generation_id;
+    resp.protocol_type = Some(group.protocol_type.clone());
+    resp.protocol_name = Some(group.protocol_name.clone());
+    resp.leader = leader.clone();
+    resp.member_id = member_id.clone();
+    // Only the leader is told who else is in the group: it is the one
+    // that has to compute an assignment for them.
+    resp.members = if member_id == leader {
+        group
+            .members
+            .iter()
+            .map(|id| {
+                let mut m = JoinGroupResponseMember::default();
+                m.member_id = id.clone();
+                m.metadata = request
+                    .protocols
+                    .first()
+                    .map(|p| p.metadata.clone())
+                    .unwrap_or_default();
+                m
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    frame_response(
+        req_header.correlation_id,
+        response_header_version(JoinGroupRequest::API_KEY, api_version),
+        |out| resp.encode(out, api_version).unwrap(),
+        false,
+    )
+}
+
+/// SyncGroup: take the leader's assignments, hand each member its own.
+fn sync_group_exchange(
+    mut frame: Bytes,
+    api_version: i16,
+    faults: &[Fault],
+    state: &mut ConnState,
+) -> Option<BytesMut> {
+    if !(SyncGroupRequest::MIN_VERSION..=SyncGroupRequest::MAX_VERSION).contains(&api_version) {
+        return None;
+    }
+    let hv = header::request_header_version(SyncGroupRequest::API_KEY, api_version)?;
+    let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
+    let request = SyncGroupRequest::decode(&mut frame, api_version).ok()?;
+
+    let mut resp = SyncGroupResponse::default();
+    let group = state.groups.entry(request.group_id.clone()).or_default();
+    if let Some(code) = fence(group, request.generation_id, &request.member_id, faults) {
+        resp.error_code = code.0;
+    } else {
+        // The leader's assignments land here; everyone else is told what
+        // the leader decided for them.
+        if group.members.first() == Some(&request.member_id) {
+            for a in &request.assignments {
+                let bytes = if faults.contains(&Fault::SyncGroupRewritesAssignment) {
+                    let mut mangled = BytesMut::from(&a.assignment[..]);
+                    if mangled.is_empty() {
+                        mangled.extend_from_slice(b"x");
+                    } else {
+                        let last = mangled.len() - 1;
+                        mangled[last] ^= 0x01;
+                    }
+                    mangled.freeze()
+                } else {
+                    a.assignment.clone()
+                };
+                group.assignments.insert(a.member_id.clone(), bytes);
+            }
+        }
+        resp.error_code = 0;
+        resp.protocol_type = Some(group.protocol_type.clone());
+        resp.protocol_name = Some(group.protocol_name.clone());
+        resp.assignment = group
+            .assignments
+            .get(&request.member_id)
+            .cloned()
+            .unwrap_or_default();
+    }
+    frame_response(
+        req_header.correlation_id,
+        response_header_version(SyncGroupRequest::API_KEY, api_version),
+        |out| resp.encode(out, api_version).unwrap(),
+        false,
+    )
+}
+
+/// Heartbeat: alive, and still of this generation.
+fn heartbeat_exchange(
+    mut frame: Bytes,
+    api_version: i16,
+    faults: &[Fault],
+    state: &mut ConnState,
+) -> Option<BytesMut> {
+    if !(HeartbeatRequest::MIN_VERSION..=HeartbeatRequest::MAX_VERSION).contains(&api_version) {
+        return None;
+    }
+    let hv = header::request_header_version(HeartbeatRequest::API_KEY, api_version)?;
+    let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
+    let request = HeartbeatRequest::decode(&mut frame, api_version).ok()?;
+
+    let mut resp = HeartbeatResponse::default();
+    let group = state.groups.entry(request.group_id.clone()).or_default();
+    resp.error_code =
+        fence(group, request.generation_id, &request.member_id, faults).map_or(0, |code| code.0);
+    frame_response(
+        req_header.correlation_id,
+        response_header_version(HeartbeatRequest::API_KEY, api_version),
+        |out| resp.encode(out, api_version).unwrap(),
+        false,
+    )
+}
+
+/// LeaveGroup: forget the member.
+fn leave_group_exchange(
+    mut frame: Bytes,
+    api_version: i16,
+    state: &mut ConnState,
+) -> Option<BytesMut> {
+    if !(LeaveGroupRequest::MIN_VERSION..=LeaveGroupRequest::MAX_VERSION).contains(&api_version) {
+        return None;
+    }
+    let hv = header::request_header_version(LeaveGroupRequest::API_KEY, api_version)?;
+    let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
+    let request = LeaveGroupRequest::decode(&mut frame, api_version).ok()?;
+
+    if let Some(group) = state.groups.get_mut(&request.group_id) {
+        group.members.retain(|id| *id != request.member_id);
+        group.assignments.remove(&request.member_id);
+    }
+    let mut resp = LeaveGroupResponse::default();
+    resp.error_code = 0;
+    frame_response(
+        req_header.correlation_id,
+        response_header_version(LeaveGroupRequest::API_KEY, api_version),
+        |out| resp.encode(out, api_version).unwrap(),
+        false,
+    )
+}
+
+/// The generation fence every post-join request passes through.
+///
+/// `None` means the request may proceed. A member the group does not
+/// know is UNKNOWN_MEMBER_ID; a known member carrying the wrong
+/// generation is ILLEGAL_GENERATION — the distinction matters because a
+/// client answers them differently, rejoining from scratch versus
+/// rejoining as itself.
+fn fence(
+    group: &GroupState,
+    generation_id: i32,
+    member_id: &str,
+    faults: &[Fault],
+) -> Option<ErrorCode> {
+    if faults.contains(&Fault::GroupIgnoresGeneration) {
+        return None;
+    }
+    if !group.members.iter().any(|id| id == member_id) {
+        return Some(ErrorCode::UNKNOWN_MEMBER_ID);
+    }
+    if generation_id != group.generation_id {
+        return Some(ErrorCode::ILLEGAL_GENERATION);
+    }
+    None
+}
+
+/// ListOffsets: `-2` is the log start, `-1` the log end, and any other
 /// ListOffsets: `-2` is the log start, `-1` the log end, and any other
 /// timestamp is a lookup this subject answers "no such message" to.
 fn list_offsets_exchange(

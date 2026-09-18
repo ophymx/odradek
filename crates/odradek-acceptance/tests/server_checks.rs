@@ -102,6 +102,18 @@ const SENSITIVITY: &[(Fault, &str)] = &[
         Fault::CreateTopicsValidateOnlyCreates,
         "create-topics/validate-only",
     ),
+    (
+        Fault::JoinGroupAcceptsEmptyMemberId,
+        "groups/member-id-required",
+    ),
+    (
+        Fault::SyncGroupRewritesAssignment,
+        "groups/assignment-round-trips",
+    ),
+    (
+        Fault::GroupIgnoresGeneration,
+        "groups/stale-generation-fenced",
+    ),
 ];
 
 /// The calibration registry is exhaustive in both directions against the

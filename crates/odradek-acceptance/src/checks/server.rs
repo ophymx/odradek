@@ -21,6 +21,10 @@ use odradek_protocol::messages::fetch_request::{FetchPartition, FetchRequest, Fe
 use odradek_protocol::messages::fetch_response::FetchResponse;
 use odradek_protocol::messages::find_coordinator_request::FindCoordinatorRequest;
 use odradek_protocol::messages::find_coordinator_response::FindCoordinatorResponse;
+use odradek_protocol::messages::heartbeat_request::HeartbeatRequest;
+use odradek_protocol::messages::heartbeat_response::HeartbeatResponse;
+use odradek_protocol::messages::join_group_request::{JoinGroupRequest, JoinGroupRequestProtocol};
+use odradek_protocol::messages::join_group_response::JoinGroupResponse;
 use odradek_protocol::messages::list_offsets_request::{
     ListOffsetsPartition, ListOffsetsRequest, ListOffsetsTopic,
 };
@@ -41,6 +45,10 @@ use odradek_protocol::messages::produce_request::{
 use odradek_protocol::messages::produce_response::ProduceResponse;
 use odradek_protocol::messages::request_header::RequestHeader;
 use odradek_protocol::messages::response_header::ResponseHeader;
+use odradek_protocol::messages::sync_group_request::{
+    SyncGroupRequest, SyncGroupRequestAssignment,
+};
+use odradek_protocol::messages::sync_group_response::SyncGroupResponse;
 use odradek_protocol::records::{Record, RecordBatch, RecordHeader, Records, decode_set};
 use odradek_protocol::{ErrorCode, Message, frame, header};
 
@@ -170,6 +178,24 @@ pub static SERVER_CHECKS: &[Check] = &[
         requirement: "a validate_only request reports what would happen without \
                       creating the topic",
         runner: Runner::Server(|ctx| Box::pin(create_topics_validate_only(ctx))),
+    },
+    Check {
+        id: "groups/member-id-required",
+        requirement: "refuses a JoinGroup (v4+) that carries no member id, \
+                      answering MEMBER_ID_REQUIRED with an id to rejoin with",
+        runner: Runner::Server(|ctx| Box::pin(groups_member_id_required(ctx))),
+    },
+    Check {
+        id: "groups/assignment-round-trips",
+        requirement: "hands a member the assignment bytes its leader supplied, \
+                      unexamined and unchanged",
+        runner: Runner::Server(|ctx| Box::pin(groups_assignment_round_trips(ctx))),
+    },
+    Check {
+        id: "groups/stale-generation-fenced",
+        requirement: "refuses a Heartbeat carrying a generation the group has \
+                      moved past, with ILLEGAL_GENERATION",
+        runner: Runner::Server(|ctx| Box::pin(groups_stale_generation_fenced(ctx))),
     },
 ];
 
@@ -1100,6 +1126,311 @@ async fn api_call<T: Message>(
         body,
     )
     .await
+}
+
+/// The version from which a join with no member id must be refused.
+const JOIN_GROUP_MEMBER_ID_REQUIRED: i16 = 4;
+/// The consumer protocol name these checks join under. The bytes are
+/// opaque to the coordinator, so the suite does not have to speak it.
+const GROUP_PROTOCOL_TYPE: &str = "consumer";
+
+/// One JoinGroup exchange.
+async fn join_group(
+    conn: &mut RawConnection,
+    version: i16,
+    group: &str,
+    member_id: &str,
+    correlation_id: i32,
+) -> Result<JoinGroupResponse, CheckError> {
+    let mut protocol = JoinGroupRequestProtocol::default();
+    protocol.name = "range".to_owned();
+    protocol.metadata = Bytes::from_static(b"\x00\x01");
+    let mut request = JoinGroupRequest::default();
+    request.group_id = group.to_owned();
+    request.session_timeout_ms = 30_000;
+    request.rebalance_timeout_ms = 30_000;
+    request.member_id = member_id.to_owned();
+    request.protocol_type = GROUP_PROTOCOL_TYPE.to_owned();
+    request.protocols = vec![protocol];
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding JoinGroup: {e}")))?;
+    api_call(
+        conn,
+        JoinGroupRequest::API_KEY,
+        version,
+        correlation_id,
+        &body,
+    )
+    .await
+}
+
+/// Join a group and become its leader, returning (member id, generation).
+async fn join_as_leader(
+    ctx: &ServerCtx,
+    conn: &mut RawConnection,
+    version: i16,
+    group: &str,
+    correlation_base: i32,
+) -> Result<(String, i32), CheckError> {
+    let _ = ctx;
+    let first = join_group(conn, version, group, "", correlation_base).await?;
+    let code = ErrorCode(first.error_code);
+    // v4+ answers the first join with an id to come back with; below
+    // that the coordinator simply assigns one.
+    let (member_id, joined) = if code == ErrorCode::MEMBER_ID_REQUIRED {
+        let minted = first.member_id.clone();
+        let second = join_group(conn, version, group, &minted, correlation_base + 1).await?;
+        (minted, second)
+    } else if code.is_ok() {
+        (first.member_id.clone(), first)
+    } else {
+        return Err(CheckError::Violation(format!(
+            "joining a fresh group answered {code}"
+        )));
+    };
+    let code = ErrorCode(joined.error_code);
+    if !code.is_ok() {
+        return Err(CheckError::Violation(format!(
+            "rejoining with the coordinator's own member id answered {code}"
+        )));
+    }
+    if joined.leader != member_id {
+        return Err(CheckError::Violation(format!(
+            "sole member {member_id:?} was not made leader (leader is {:?})",
+            joined.leader
+        )));
+    }
+    Ok((member_id, joined.generation_id))
+}
+
+/// A join with no member id is refused, and told what to come back as.
+///
+/// Handing an anonymous join a membership instead leaves a member the
+/// coordinator named but the client never acknowledged: if the client
+/// dies before it learns its own id, nothing can name that member to
+/// remove it, and the group waits out the session timeout.
+async fn groups_member_id_required(ctx: &ServerCtx) -> Verdict {
+    let version = match negotiate(
+        "JoinGroup",
+        match ctx.range(JoinGroupRequest::API_KEY) {
+            Ok(a) => a,
+            Err(v) => return v,
+        },
+        JOIN_GROUP_MEMBER_ID_REQUIRED,
+        JoinGroupRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let mut conn = match connect(&ctx.addr).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
+    let group = check_group("memberid");
+    if let Err(e) = await_coordinator(ctx, &group).await {
+        return e.into_verdict();
+    }
+
+    let resp = match join_group(&mut conn, version, &group, "", 120).await {
+        Ok(r) => r,
+        Err(e) => return e.into_verdict(),
+    };
+    let code = ErrorCode(resp.error_code);
+    if code != ErrorCode::MEMBER_ID_REQUIRED {
+        return Verdict::Fail {
+            details: format!(
+                "JoinGroup v{version} with an empty member id answered {code}, expected \
+                 MEMBER_ID_REQUIRED"
+            ),
+        };
+    }
+    if resp.member_id.is_empty() {
+        return Verdict::Fail {
+            details: "MEMBER_ID_REQUIRED carried no member id, so there is nothing to \
+                      rejoin with"
+                .into(),
+        };
+    }
+    // The id it gave has to actually work.
+    match join_group(&mut conn, version, &group, &resp.member_id, 121).await {
+        Ok(second) if ErrorCode(second.error_code).is_ok() => Verdict::Pass,
+        Ok(second) => Verdict::Fail {
+            details: format!(
+                "rejoining with the id MEMBER_ID_REQUIRED supplied answered {}",
+                ErrorCode(second.error_code)
+            ),
+        },
+        Err(e) => e.into_verdict(),
+    }
+}
+
+/// The leader's assignment bytes reach their member unchanged.
+///
+/// The same guarantee the record-batch codec makes: the coordinator is
+/// delivering an opaque payload it has no business reading. A
+/// coordinator that parses assignments is one that breaks the day a
+/// client uses an assignor it has never heard of.
+async fn groups_assignment_round_trips(ctx: &ServerCtx) -> Verdict {
+    let (join_version, sync_version) = match group_versions(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let mut conn = match connect(&ctx.addr).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
+    let group = check_group("assignment");
+    if let Err(e) = await_coordinator(ctx, &group).await {
+        return e.into_verdict();
+    }
+    let (member_id, generation) =
+        match join_as_leader(ctx, &mut conn, join_version, &group, 130).await {
+            Ok(v) => v,
+            Err(e) => return e.into_verdict(),
+        };
+
+    // Deliberately not a valid consumer-protocol assignment: the
+    // coordinator has no business knowing the difference.
+    let payload = Bytes::from_static(&[0x00, 0x03, 0xff, 0x7f, 0x00, 0xde, 0xad, 0xbe, 0xef]);
+    let mut assignment = SyncGroupRequestAssignment::default();
+    assignment.member_id = member_id.clone();
+    assignment.assignment = payload.clone();
+    let mut request = SyncGroupRequest::default();
+    request.group_id = group.clone();
+    request.generation_id = generation;
+    request.member_id = member_id.clone();
+    request.protocol_type = Some(GROUP_PROTOCOL_TYPE.to_owned());
+    request.protocol_name = Some("range".to_owned());
+    request.assignments = vec![assignment];
+    let mut body = BytesMut::new();
+    if let Err(e) = request.encode(&mut body, sync_version) {
+        return Verdict::Error {
+            details: format!("encoding SyncGroup: {e}"),
+        };
+    }
+    let resp: SyncGroupResponse = match api_call(
+        &mut conn,
+        SyncGroupRequest::API_KEY,
+        sync_version,
+        132,
+        &body,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return e.into_verdict(),
+    };
+    let code = ErrorCode(resp.error_code);
+    if !code.is_ok() {
+        return Verdict::Fail {
+            details: format!("SyncGroup as the group's leader answered {code}"),
+        };
+    }
+    if resp.assignment == payload {
+        Verdict::Pass
+    } else {
+        Verdict::Fail {
+            details: format!(
+                "leader supplied {} assignment byte(s), member received {}: {:?} vs {:?}",
+                payload.len(),
+                resp.assignment.len(),
+                payload.as_ref(),
+                resp.assignment.as_ref()
+            ),
+        }
+    }
+}
+
+/// A heartbeat from a generation the group has left is refused.
+async fn groups_stale_generation_fenced(ctx: &ServerCtx) -> Verdict {
+    let (join_version, _) = match group_versions(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let heartbeat_version = match negotiate(
+        "Heartbeat",
+        match ctx.range(HeartbeatRequest::API_KEY) {
+            Ok(a) => a,
+            Err(v) => return v,
+        },
+        HeartbeatRequest::MIN_VERSION,
+        HeartbeatRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let mut conn = match connect(&ctx.addr).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
+    let group = check_group("fencing");
+    if let Err(e) = await_coordinator(ctx, &group).await {
+        return e.into_verdict();
+    }
+    let (member_id, generation) =
+        match join_as_leader(ctx, &mut conn, join_version, &group, 140).await {
+            Ok(v) => v,
+            Err(e) => return e.into_verdict(),
+        };
+
+    // One generation behind: a member that missed a rebalance.
+    let stale = generation - 1;
+    let mut request = HeartbeatRequest::default();
+    request.group_id = group.clone();
+    request.generation_id = stale;
+    request.member_id = member_id;
+    let mut body = BytesMut::new();
+    if let Err(e) = request.encode(&mut body, heartbeat_version) {
+        return Verdict::Error {
+            details: format!("encoding Heartbeat: {e}"),
+        };
+    }
+    let resp: HeartbeatResponse = match api_call(
+        &mut conn,
+        HeartbeatRequest::API_KEY,
+        heartbeat_version,
+        142,
+        &body,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return e.into_verdict(),
+    };
+    let code = ErrorCode(resp.error_code);
+    if code == ErrorCode::ILLEGAL_GENERATION {
+        Verdict::Pass
+    } else if code.is_ok() {
+        Verdict::Fail {
+            details: format!(
+                "heartbeat carrying generation {stale} (the group is at {generation}) was \
+                 accepted, so a member that missed a rebalance keeps its old assignment"
+            ),
+        }
+    } else {
+        Verdict::Fail {
+            details: format!("stale heartbeat answered {code}, expected ILLEGAL_GENERATION"),
+        }
+    }
+}
+
+/// JoinGroup and SyncGroup versions, since either can be absent.
+fn group_versions(ctx: &ServerCtx) -> Result<(i16, i16), Verdict> {
+    let join = negotiate(
+        "JoinGroup",
+        ctx.range(JoinGroupRequest::API_KEY)?,
+        JoinGroupRequest::MIN_VERSION,
+        JoinGroupRequest::MAX_VERSION,
+    )?;
+    let sync = negotiate(
+        "SyncGroup",
+        ctx.range(SyncGroupRequest::API_KEY)?,
+        SyncGroupRequest::MIN_VERSION,
+        SyncGroupRequest::MAX_VERSION,
+    )?;
+    Ok((join, sync))
 }
 
 /// A fetch past the end of the log is an error, not silence.
