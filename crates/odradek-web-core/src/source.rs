@@ -1,8 +1,9 @@
 //! Where events come from: an offset-addressed record source.
 //!
 //! The pump is written against this trait so the engine tests run
-//! against an in-memory log; [`KafkaSource`] adapts
-//! [`odradek_client::Consumer`] for the real thing.
+//! against an in-memory log; `KafkaSource` adapts `odradek_client`'s
+//! `Consumer` for the real thing — both behind the `kafka` feature,
+//! hence named rather than linked.
 
 use std::future::Future;
 
@@ -13,6 +14,7 @@ use crate::event::Event;
 
 /// A fetch's worth of events plus the cursors that follow it.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct SourceBatch {
     pub events: Vec<Event>,
     /// Where the next fetch should start.
@@ -143,6 +145,27 @@ impl From<odradek_client::ClientError> for SourceError {
 ///
 /// Methods return `impl Future + Send` (rather than plain `async fn`) so
 /// pumps holding a source can be spawned.
+///
+/// # Implementing this trait
+///
+/// Two things to know before you write one, neither of which the
+/// signatures tell you.
+///
+/// **It is not dyn-compatible.** Returning `impl Future` from a trait
+/// method rules out `Box<dyn RecordSource>`, so a program that picks its
+/// source at runtime — Kafka here, something else there, by
+/// configuration — cannot do it with a trait object. Wrap the
+/// alternatives in an enum and implement this trait on the enum,
+/// forwarding each method. That costs a match per call, against a
+/// network round trip.
+///
+/// **New methods will arrive with defaults.** Adding a required method
+/// to a trait breaks every implementor, and the implementors of this one
+/// are, by design, code this project cannot see. Anything added here
+/// later will have a default body, even where that default is worse than
+/// what an implementor could write. `Message::decode_with_limits` in
+/// `odradek-protocol` is the pattern already in use, and says so where
+/// it is defined.
 pub trait RecordSource: Send + 'static {
     fn fetch(
         &mut self,

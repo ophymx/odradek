@@ -48,11 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.client_id = "odradek-secure-smoke".into();
     config.tls = tls;
     config.allow_plaintext_credentials = allow_plaintext_credentials;
-    config.sasl = mechanism.map(|mechanism| SaslConfig {
-        mechanism,
-        username: user,
-        password: odradek_client::sasl::Zeroizing::new(pass),
-    });
+    config.sasl = mechanism.map(|mechanism| SaslConfig::new(mechanism, user, pass));
 
     let topic = format!(
         "odradek-secure-{}-{}",

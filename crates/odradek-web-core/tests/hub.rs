@@ -45,11 +45,13 @@ impl RecordSource for SlowSource {
         offset: i64,
     ) -> Result<SourceBatch, SourceError> {
         tokio::time::sleep(self.poll).await;
-        Ok(SourceBatch {
-            events: Vec::new(),
-            next_offset: offset,
-            high_watermark: offset,
-        })
+        // Built the way an out-of-tree adapter must: `SourceBatch` is
+        // non-exhaustive, so `Default` plus assignment is the path, and
+        // this test is the proof that path is usable.
+        let mut batch = SourceBatch::default();
+        batch.next_offset = offset;
+        batch.high_watermark = offset;
+        Ok(batch)
     }
 
     async fn earliest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {

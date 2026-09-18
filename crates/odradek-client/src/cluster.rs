@@ -58,6 +58,7 @@ const METADATA_SUPPORTED: (i16, i16) = (1, MetadataRequest::MAX_VERSION);
 
 /// One broker's advertised endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BrokerInfo {
     pub node_id: i32,
     pub host: String,
@@ -72,6 +73,7 @@ impl BrokerInfo {
 
 /// One partition's leadership as last reported by metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PartitionInfo {
     pub index: i32,
     pub leader_id: i32,

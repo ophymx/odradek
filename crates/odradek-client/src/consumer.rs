@@ -143,6 +143,7 @@ impl Default for ConsumerConfig {
 
 /// One record, materialized with absolute coordinates.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ConsumedRecord {
     pub offset: i64,
     /// Milliseconds since epoch (batch base + record delta).
@@ -154,6 +155,7 @@ pub struct ConsumedRecord {
 
 /// What one fetch returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FetchResult {
     pub records: Vec<ConsumedRecord>,
     /// Where the next fetch should start.

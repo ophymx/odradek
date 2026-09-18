@@ -73,6 +73,7 @@ impl Default for GroupConfig {
 
 /// What a heartbeat learned about the membership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HeartbeatStatus {
     /// All good; keep consuming.
     Stable,

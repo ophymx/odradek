@@ -13,6 +13,14 @@ use crate::error::{DecodeError, EncodeError};
 
 /// A versioned Kafka message: encode/decode plus its identity in the
 /// api-key registry.
+///
+/// Generated code implements this for every top-level message, but the
+/// trait is public because hand-written implementations are a reason it
+/// exists — a proxy with its own representation of a message can join
+/// the same dispatch loops. Anything added here later will come with a
+/// default body, so such an implementation does not break;
+/// [`Message::decode_with_limits`] was added exactly that way and its
+/// documentation records why.
 pub trait Message: Sized {
     /// The api key identifying this message's request type.
     const API_KEY: i16;

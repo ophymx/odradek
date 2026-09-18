@@ -41,6 +41,13 @@ jobs:
         run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
+      - name: docs build warning-free without the kafka feature too
+        # A doc link to a cfg'd-out item is an error only in the
+        # configuration that omits it, so the default-feature run above
+        # cannot see those. This one caught three.
+        run: cargo doc -p odradek-web-core --no-deps --no-default-features --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
       - name: hardware-accelerated crc is bit-identical
         run: cargo test -p odradek-protocol --features hardware-crc --locked
       - name: lean client builds (no tls/sasl/codecs)

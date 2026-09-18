@@ -11,7 +11,31 @@ use bytes::Bytes;
 /// `Position::Offset(offset + 1)`) and hands the client something to
 /// echo back. Minting is the server's side of that contract; clients are
 /// told only "send this back", never how it is built.
+///
+/// # Construction
+///
+/// [`Event::at`] takes the four values a record cannot be without and
+/// leaves the rest to assignment:
+///
+/// ```
+/// # use odradek_web_core::Event;
+/// let mut event = Event::at("orders", 0, 17, 1_700_000_000_000);
+/// event.value = Some(b"{}".as_slice().into());
+/// ```
+///
+/// There is a constructor rather than a struct literal because this
+/// type is `#[non_exhaustive]`, and that is deliberate: `Event` is what
+/// crosses the [`RecordSource`](crate::RecordSource) boundary in both
+/// directions, so every implementor downstream builds one. A Kafka
+/// record carries more than is exposed here — the leader epoch, the
+/// timestamp type — and pulling any of it up later must not be a major
+/// version for everyone who wrote an adapter.
+///
+/// `Default` would have been the cheaper way to allow construction and
+/// is the wrong one: an event at offset 0 of the empty topic is not a
+/// sensible default, it is a bug that compiles.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Event {
     pub topic: String,
     pub partition: i32,
@@ -21,6 +45,22 @@ pub struct Event {
     pub key: Option<Bytes>,
     pub value: Option<Bytes>,
     pub headers: Vec<(String, Option<Bytes>)>,
+}
+
+impl Event {
+    /// An event at a position, with no key, value, or headers; assign
+    /// those after. See the [type docs](Event#construction).
+    pub fn at(topic: impl Into<String>, partition: i32, offset: i64, timestamp: i64) -> Event {
+        Event {
+            topic: topic.into(),
+            partition,
+            offset,
+            timestamp,
+            key: None,
+            value: None,
+            headers: Vec::new(),
+        }
+    }
 }
 
 /// One [`Event`] as every subscriber of a partition sees it: a shared
@@ -97,6 +137,7 @@ impl Eq for SharedEvent {}
 
 /// Where a subscription starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Position {
     /// The oldest available record (full replay).
     Earliest,
@@ -108,6 +149,7 @@ pub enum Position {
 
 /// Where a topic-level subscription starts, across all partitions.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TopicPosition {
     /// Every partition from its oldest record.
     Earliest,

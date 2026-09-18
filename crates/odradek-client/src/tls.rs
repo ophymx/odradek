@@ -14,6 +14,7 @@ use crate::error::ClientError;
 
 /// Whether and how connections are wrapped in TLS.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub enum Tls {
     /// Plaintext TCP (the default; fine for local development, not for
     /// networks you do not own).

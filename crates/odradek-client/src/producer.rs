@@ -84,6 +84,7 @@ impl Default for ProducerConfig {
 
 /// One delivered batch: where it landed.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Delivery {
     pub topic: String,
     pub partition: i32,

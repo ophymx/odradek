@@ -33,8 +33,11 @@
 //!   it costs.
 //!
 //! The engine reads through the [`RecordSource`] trait, so it tests
-//! against an in-memory log; [`KafkaSource`] adapts
-//! [`odradek_client::Consumer`] for production.
+//! against an in-memory log; `KafkaSource` adapts `odradek_client`'s
+//! `Consumer` for production. (Those two are named without links
+//! because they exist only under the `kafka` feature, and a doc link
+//! to a cfg'd-out item is an error in the configuration that omits
+//! it.)
 //!
 //! This crate is the engine plus the shared web wire contract — the
 //! query grammar ([`StreamParams`]), the JSON event shape

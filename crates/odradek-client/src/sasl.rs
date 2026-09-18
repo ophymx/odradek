@@ -96,11 +96,39 @@ pub const DEFAULT_MAX_SCRAM_ITERATIONS: u32 = 1_000_000;
 /// the caller can clear those. And a `String` that reallocated while
 /// being built leaves the old buffer behind. Treat this as shortening
 /// the window, not closing it.
+///
+/// Build with [`SaslConfig::new`]: the type is `#[non_exhaustive]`
+/// because SASL is where a mechanism gets added, and the mechanism this
+/// client does not yet speak — OAUTHBEARER — authenticates with a token
+/// rather than a username and password. Carrying one means a new field,
+/// and a new field must not be a major version for everyone.
+///
+/// There is no `Default`, deliberately: it would have to pick a
+/// mechanism, and the only mechanism with an obvious claim to being
+/// first alphabetically is the one that puts the password on the wire.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct SaslConfig {
     pub mechanism: Mechanism,
     pub username: String,
     pub password: Zeroizing<String>,
+}
+
+impl SaslConfig {
+    /// Credentials for `mechanism`. The password is wrapped for you;
+    /// see the [type docs](SaslConfig) on what zeroizing does and does
+    /// not cover.
+    pub fn new(
+        mechanism: Mechanism,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> SaslConfig {
+        SaslConfig {
+            mechanism,
+            username: username.into(),
+            password: Zeroizing::new(password.into()),
+        }
+    }
 }
 
 impl std::fmt::Debug for SaslConfig {
@@ -114,6 +142,7 @@ impl std::fmt::Debug for SaslConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Mechanism {
     Plain,
     ScramSha256,
