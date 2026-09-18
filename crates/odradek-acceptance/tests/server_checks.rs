@@ -130,6 +130,14 @@ const SENSITIVITY: &[(Fault, &str)] = &[
         Fault::ConsumerGroupIgnoresEpoch,
         "consumer-group/fenced-epoch",
     ),
+    (
+        Fault::SaslAuthenticateWithoutHandshake,
+        "sasl/authenticate-requires-handshake",
+    ),
+    (
+        Fault::SaslHandshakeHidesMechanisms,
+        "sasl/refusal-names-mechanisms",
+    ),
 ];
 
 /// The calibration registry is exhaustive in both directions against the

@@ -47,6 +47,10 @@ use odradek_protocol::messages::produce_request::{
 use odradek_protocol::messages::produce_response::ProduceResponse;
 use odradek_protocol::messages::request_header::RequestHeader;
 use odradek_protocol::messages::response_header::ResponseHeader;
+use odradek_protocol::messages::sasl_authenticate_request::SaslAuthenticateRequest;
+use odradek_protocol::messages::sasl_authenticate_response::SaslAuthenticateResponse;
+use odradek_protocol::messages::sasl_handshake_request::SaslHandshakeRequest;
+use odradek_protocol::messages::sasl_handshake_response::SaslHandshakeResponse;
 use odradek_protocol::messages::sync_group_request::{
     SyncGroupRequest, SyncGroupRequestAssignment,
 };
@@ -223,6 +227,19 @@ pub static SERVER_CHECKS: &[Check] = &[
         requirement: "refuses a heartbeat carrying an epoch the member has moved \
                       past, with FENCED_MEMBER_EPOCH",
         runner: Runner::Server(|ctx| Box::pin(consumer_group_fenced_epoch(ctx))),
+    },
+    Check {
+        id: "sasl/authenticate-requires-handshake",
+        requirement: "refuses a SASL token on a connection that negotiated no \
+                      mechanism, as a state error rather than as bad credentials",
+        runner: Runner::Server(|ctx| Box::pin(sasl_authenticate_requires_handshake(ctx))),
+    },
+    Check {
+        id: "sasl/refusal-names-mechanisms",
+        requirement: "answers an unsupported mechanism with \
+                      UNSUPPORTED_SASL_MECHANISM and the mechanisms it does \
+                      support, so a client has something to fall back to",
+        runner: Runner::Server(|ctx| Box::pin(sasl_refusal_names_mechanisms(ctx))),
     },
 ];
 
@@ -1153,6 +1170,149 @@ async fn api_call<T: Message>(
         body,
     )
     .await
+}
+
+/// A SASL token on a connection that negotiated nothing is refused.
+///
+/// The interesting part is *which* refusal. A token arriving before a
+/// mechanism has been chosen cannot be interpreted at all — there is no
+/// mechanism to interpret it under — so the answer has to say "your
+/// sequence is wrong", not "your credentials are wrong". A client told
+/// the latter retries with the same broken sequence forever, and an
+/// operator reading the logs goes looking for a password problem that
+/// does not exist.
+///
+/// This one needs no credentials and no SASL listener, which is why it
+/// runs everywhere: the question is about state, and a connection that
+/// has done nothing is in the same state either way.
+async fn sasl_authenticate_requires_handshake(ctx: &ServerCtx) -> Verdict {
+    let version = match negotiate(
+        "SaslAuthenticate",
+        match ctx.range(SaslAuthenticateRequest::API_KEY) {
+            Ok(a) => a,
+            Err(v) => return v,
+        },
+        SaslAuthenticateRequest::MIN_VERSION,
+        SaslAuthenticateRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    // A fresh connection: nothing negotiated on it, by construction.
+    let mut conn = match connect(&ctx.addr).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
+
+    let mut request = SaslAuthenticateRequest::default();
+    request.auth_bytes = Bytes::from_static(b"not-a-token");
+    let mut body = BytesMut::new();
+    if let Err(e) = request.encode(&mut body, version) {
+        return Verdict::Error {
+            details: format!("encoding SaslAuthenticate: {e}"),
+        };
+    }
+    let resp: SaslAuthenticateResponse = match api_call(
+        &mut conn,
+        SaslAuthenticateRequest::API_KEY,
+        version,
+        200,
+        &body,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return e.into_verdict(),
+    };
+    let code = ErrorCode(resp.error_code);
+    if code == ErrorCode::ILLEGAL_SASL_STATE {
+        Verdict::Pass
+    } else if code.is_ok() {
+        Verdict::Fail {
+            details: "a SASL token was accepted on a connection that negotiated no \
+                      mechanism"
+                .into(),
+        }
+    } else {
+        Verdict::Fail {
+            details: format!(
+                "an out-of-sequence SASL token answered {code}; ILLEGAL_SASL_STATE is \
+                 what tells a client its sequence is wrong rather than its credentials"
+            ),
+        }
+    }
+}
+
+/// A refused mechanism comes with the list of ones that would work.
+///
+/// Skipped rather than failed on a listener with no SASL configured:
+/// such a listener answers ILLEGAL_SASL_STATE to every SASL request,
+/// which is correct — there is no SASL session to negotiate within — and
+/// reporting that as nonconformance would be reporting the operator's
+/// listener configuration.
+async fn sasl_refusal_names_mechanisms(ctx: &ServerCtx) -> Verdict {
+    let version = match negotiate(
+        "SaslHandshake",
+        match ctx.range(SaslHandshakeRequest::API_KEY) {
+            Ok(a) => a,
+            Err(v) => return v,
+        },
+        SaslHandshakeRequest::MIN_VERSION,
+        SaslHandshakeRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let mut conn = match connect(&ctx.addr).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
+
+    let mut request = SaslHandshakeRequest::default();
+    // A mechanism no registry will ever contain.
+    request.mechanism = "ODRADEK-NOSUCH-MECHANISM".to_owned();
+    let mut body = BytesMut::new();
+    if let Err(e) = request.encode(&mut body, version) {
+        return Verdict::Error {
+            details: format!("encoding SaslHandshake: {e}"),
+        };
+    }
+    let resp: SaslHandshakeResponse = match api_call(
+        &mut conn,
+        SaslHandshakeRequest::API_KEY,
+        version,
+        202,
+        &body,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return e.into_verdict(),
+    };
+    let code = ErrorCode(resp.error_code);
+    if code == ErrorCode::ILLEGAL_SASL_STATE {
+        return Verdict::Skipped {
+            reason: "listener has no SASL configured (every SASL request is \
+                     ILLEGAL_SASL_STATE here)"
+                .into(),
+        };
+    }
+    if code != ErrorCode::UNSUPPORTED_SASL_MECHANISM {
+        return Verdict::Fail {
+            details: format!(
+                "an unknown mechanism answered {code}, expected \
+                 UNSUPPORTED_SASL_MECHANISM"
+            ),
+        };
+    }
+    if resp.mechanisms.is_empty() {
+        return Verdict::Fail {
+            details: "mechanism refused without naming a supported one, so a client \
+                      has nothing to fall back to and must guess"
+                .into(),
+        };
+    }
+    Verdict::Pass
 }
 
 /// The assignment shape a heartbeat response carries.

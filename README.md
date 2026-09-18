@@ -88,7 +88,7 @@ Early but functional end to end:
   connections independent of the client crate — `api-versions/*`,
   `metadata/*`, `produce/*`, `fetch/*`, `list-offsets/*`,
   `find-coordinator/*`, `offsets/*`, `create-topics/*`, `groups/*`, and
-  `consumer-group/*` (KIP-848) server checks, covering
+  `consumer-group/*` (KIP-848), and `sasl/*` server checks, covering
   everything a consumer needs short of group membership: the log start
   and log end bracket exactly what was produced, a group key names a
   reachable coordinator in whichever shape the negotiated version
@@ -126,7 +126,15 @@ Early but functional end to end:
   steady-state heartbeat is told apart from an unsubscribe. Redpanda
   25.2 does not implement KIP-848 at all, so those four checks skip
   there: the first place the two implementations genuinely part company
-  rather than agreeing. Also (including a
+  rather than agreeing. SASL is checked for sequencing rather than
+  secrets: a token arriving before any mechanism was negotiated has to
+  be refused as ILLEGAL_SASL_STATE — "your sequence is wrong", not "your
+  credentials are wrong", the difference between a client that fixes
+  itself and one that retries forever — and that question needs no
+  credentials, so both brokers answer it. The companion check, that a
+  refused mechanism names the ones that would work, skips on a listener
+  with no SASL configured rather than reporting the operator's listener
+  as nonconformance. Also (including a
   create → produce → fetch flow that asserts the broker returns the
   produced batch byte-identical in the crc-covered region) and `client/*`
   client checks, where the harness impersonates a three-broker cluster so

@@ -56,6 +56,10 @@ use odradek_protocol::messages::produce_response::{
 };
 use odradek_protocol::messages::request_header::RequestHeader;
 use odradek_protocol::messages::response_header::ResponseHeader;
+use odradek_protocol::messages::sasl_authenticate_request::SaslAuthenticateRequest;
+use odradek_protocol::messages::sasl_authenticate_response::SaslAuthenticateResponse;
+use odradek_protocol::messages::sasl_handshake_request::SaslHandshakeRequest;
+use odradek_protocol::messages::sasl_handshake_response::SaslHandshakeResponse;
 use odradek_protocol::messages::sync_group_request::SyncGroupRequest;
 use odradek_protocol::messages::sync_group_response::SyncGroupResponse;
 use odradek_protocol::records;
@@ -131,6 +135,12 @@ pub enum Fault {
     /// Answer a never-committed partition with 0 rather than the -1
     /// sentinel — a plausible offset where "nothing here" was meant.
     OffsetFetchUnsetIsZero,
+    /// Refuse an unsupported mechanism without naming any supported
+    /// one, leaving the client nothing to fall back to.
+    SaslHandshakeHidesMechanisms,
+    /// Accept a SASL token on a connection that never negotiated a
+    /// mechanism.
+    SaslAuthenticateWithoutHandshake,
     /// Never advance a KIP-848 member past epoch 0.
     ConsumerGroupEpochStuck,
     /// Treat an omitted `subscribed_topic_names` as "subscribed to
@@ -212,6 +222,8 @@ impl Fault {
         Fault::ConsumerGroupNullSubscriptionRevokes,
         Fault::ConsumerGroupAssignsNothing,
         Fault::ConsumerGroupIgnoresEpoch,
+        Fault::SaslHandshakeHidesMechanisms,
+        Fault::SaslAuthenticateWithoutHandshake,
     ];
 }
 
@@ -324,6 +336,16 @@ fn advertised_keys() -> Vec<ApiVersion> {
             ConsumerGroupHeartbeatRequest::MIN_VERSION,
             ConsumerGroupHeartbeatRequest::MAX_VERSION,
         ),
+        (
+            SaslHandshakeRequest::API_KEY,
+            SaslHandshakeRequest::MIN_VERSION,
+            SaslHandshakeRequest::MAX_VERSION,
+        ),
+        (
+            SaslAuthenticateRequest::API_KEY,
+            SaslAuthenticateRequest::MIN_VERSION,
+            SaslAuthenticateRequest::MAX_VERSION,
+        ),
     ]
     .into_iter()
     .map(|(api_key, min_version, max_version)| {
@@ -358,6 +380,8 @@ struct ConnState {
     groups: HashMap<String, GroupState>,
     /// KIP-848 members, keyed by (group, member id).
     members_848: HashMap<(String, String), Member848>,
+    /// Where this connection is in the SASL exchange.
+    sasl: SaslState,
     /// Topics CreateTopics actually created. Distinct from `logs`, which
     /// only gains an entry once something is produced, and from
     /// `topic_names`, which maps ids: a topic can exist and be empty.
@@ -396,6 +420,31 @@ struct GroupState {
     /// Member ids minted for a join that had none, awaiting the rejoin.
     minted: Vec<String>,
 }
+
+/// How far along a connection's SASL exchange is.
+///
+/// The exchange is a sequence, and writing it as one is what surfaces
+/// the requirements. A token that arrives before the handshake has
+/// chosen a mechanism cannot be interpreted at all — there is no
+/// mechanism to interpret it under — so it is refused as a *state*
+/// error rather than as bad credentials. The two answers are different
+/// on purpose: one tells a client its code is wrong, the other tells it
+/// its password is.
+#[derive(Debug, Default, PartialEq, Eq)]
+enum SaslState {
+    /// Nothing has been negotiated on this connection.
+    #[default]
+    Unstarted,
+    /// A handshake named this mechanism; tokens are now interpretable.
+    Negotiated(String),
+    /// Authentication completed.
+    Authenticated,
+}
+
+/// The mechanisms this subject claims. The list is what a client falls
+/// back on, so a refusal that omits it leaves the client with nothing to
+/// try next.
+const SASL_MECHANISMS: &[&str] = &["SCRAM-SHA-256", "PLAIN"];
 
 /// One KIP-848 member.
 ///
@@ -500,6 +549,12 @@ async fn handle_connection(mut stream: TcpStream, faults: Vec<Fault>) {
             ConsumerGroupHeartbeatRequest::API_KEY => {
                 consumer_group_heartbeat_exchange(frame, api_version, &faults, &mut state)
             }
+            SaslHandshakeRequest::API_KEY => {
+                sasl_handshake_exchange(frame, api_version, &faults, &mut state)
+            }
+            SaslAuthenticateRequest::API_KEY => {
+                sasl_authenticate_exchange(frame, api_version, &faults, &mut state)
+            }
             _ => return,
         };
         let Some(out) = out else {
@@ -518,6 +573,87 @@ fn response_header_version(api_key: i16, api_version: i16) -> i16 {
 }
 
 /// Frame a response: length prefix, header at `header_version`, body bytes.
+/// SaslHandshake: agree a mechanism, or say what is on offer.
+fn sasl_handshake_exchange(
+    mut frame: Bytes,
+    api_version: i16,
+    faults: &[Fault],
+    state: &mut ConnState,
+) -> Option<BytesMut> {
+    if !(SaslHandshakeRequest::MIN_VERSION..=SaslHandshakeRequest::MAX_VERSION)
+        .contains(&api_version)
+    {
+        return None;
+    }
+    let hv = header::request_header_version(SaslHandshakeRequest::API_KEY, api_version)?;
+    let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
+    let request = SaslHandshakeRequest::decode(&mut frame, api_version).ok()?;
+
+    let supported = SASL_MECHANISMS.contains(&request.mechanism.as_str());
+    let mut resp = SaslHandshakeResponse::default();
+    if supported {
+        state.sasl = SaslState::Negotiated(request.mechanism.clone());
+        resp.error_code = 0;
+    } else {
+        resp.error_code = ErrorCode::UNSUPPORTED_SASL_MECHANISM.0;
+    }
+    // The list goes out either way, and it matters most on the refusal:
+    // a client told only "no" has nothing to try next, and a client that
+    // has to guess will guess PLAIN.
+    resp.mechanisms = if faults.contains(&Fault::SaslHandshakeHidesMechanisms) {
+        Vec::new()
+    } else {
+        SASL_MECHANISMS.iter().map(|m| (*m).to_owned()).collect()
+    };
+    frame_response(
+        req_header.correlation_id,
+        response_header_version(SaslHandshakeRequest::API_KEY, api_version),
+        |out| resp.encode(out, api_version).unwrap(),
+        false,
+    )
+}
+
+/// SaslAuthenticate: carry one mechanism token, once a mechanism exists.
+///
+/// This subject authenticates nobody — it has no credential store and
+/// the checks that use it are about sequencing, not secrets. What it
+/// does model is the part a reimplementer has to get right regardless of
+/// mechanism: a token arriving with no negotiated mechanism is a state
+/// error, not an authentication failure.
+fn sasl_authenticate_exchange(
+    mut frame: Bytes,
+    api_version: i16,
+    faults: &[Fault],
+    state: &mut ConnState,
+) -> Option<BytesMut> {
+    if !(SaslAuthenticateRequest::MIN_VERSION..=SaslAuthenticateRequest::MAX_VERSION)
+        .contains(&api_version)
+    {
+        return None;
+    }
+    let hv = header::request_header_version(SaslAuthenticateRequest::API_KEY, api_version)?;
+    let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
+    let _request = SaslAuthenticateRequest::decode(&mut frame, api_version).ok()?;
+
+    let mut resp = SaslAuthenticateResponse::default();
+    let out_of_state = state.sasl == SaslState::Unstarted
+        && !faults.contains(&Fault::SaslAuthenticateWithoutHandshake);
+    if out_of_state {
+        resp.error_code = ErrorCode::ILLEGAL_SASL_STATE.0;
+        resp.error_message = Some("no mechanism negotiated".into());
+    } else {
+        state.sasl = SaslState::Authenticated;
+        resp.error_code = 0;
+        resp.auth_bytes = Bytes::new();
+    }
+    frame_response(
+        req_header.correlation_id,
+        response_header_version(SaslAuthenticateRequest::API_KEY, api_version),
+        |out| resp.encode(out, api_version).unwrap(),
+        false,
+    )
+}
+
 /// The interval this subject tells members to heartbeat at.
 const HEARTBEAT_INTERVAL_MS: i32 = 5_000;
 /// A heartbeat carrying this epoch is the member leaving.

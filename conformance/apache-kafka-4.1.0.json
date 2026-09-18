@@ -26,6 +26,8 @@
     "offsets/commit-fetch-roundtrip": "pass",
     "offsets/unset-is-sentinel": "pass",
     "produce/basic": "pass",
-    "produce/topic-id": "pass"
+    "produce/topic-id": "pass",
+    "sasl/authenticate-requires-handshake": "pass",
+    "sasl/refusal-names-mechanisms": "skipped"
   }
 }
