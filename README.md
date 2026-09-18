@@ -87,8 +87,8 @@ Early but functional end to end:
 - `odradek-acceptance`: conformance checks for **both roles** over raw
   connections independent of the client crate — `api-versions/*`,
   `metadata/*`, `produce/*`, `fetch/*`, `list-offsets/*`,
-  `find-coordinator/*`, `offsets/*`, `create-topics/*`, and `groups/*`
-  server checks, covering
+  `find-coordinator/*`, `offsets/*`, `create-topics/*`, `groups/*`, and
+  `consumer-group/*` (KIP-848) server checks, covering
   everything a consumer needs short of group membership: the log start
   and log end bracket exactly what was produced, a group key names a
   reachable coordinator in whichever shape the negotiated version
@@ -117,8 +117,16 @@ Early but functional end to end:
   *and* handed an id to rejoin with, the assignment bytes a leader
   supplies must reach their member unexamined (the same opacity the
   record-batch codec promises), and a heartbeat from a generation the
-  group has left must be fenced with ILLEGAL_GENERATION. Also (including
-  a
+  group has left must be fenced with ILLEGAL_GENERATION. The KIP-848
+  checks came the same way, and cost two wrong guesses that the real
+  broker corrected: a member introducing itself must *state* that it
+  owns nothing rather than stay silent about it, and a response omits
+  the assignment when nothing changed — so an absent assignment means
+  "unchanged" while an empty one means "revoked", which is exactly how a
+  steady-state heartbeat is told apart from an unsubscribe. Redpanda
+  25.2 does not implement KIP-848 at all, so those four checks skip
+  there: the first place the two implementations genuinely part company
+  rather than agreeing. Also (including a
   create → produce → fetch flow that asserts the broker returns the
   produced batch byte-identical in the crc-covered region) and `client/*`
   client checks, where the harness impersonates a three-broker cluster so

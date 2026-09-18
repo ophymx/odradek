@@ -15,6 +15,8 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use odradek_protocol::messages::api_versions_request::ApiVersionsRequest;
 use odradek_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
+use odradek_protocol::messages::consumer_group_heartbeat_request::ConsumerGroupHeartbeatRequest;
+use odradek_protocol::messages::consumer_group_heartbeat_response::ConsumerGroupHeartbeatResponse;
 use odradek_protocol::messages::create_topics_request::{CreatableTopic, CreateTopicsRequest};
 use odradek_protocol::messages::create_topics_response::CreateTopicsResponse;
 use odradek_protocol::messages::fetch_request::{FetchPartition, FetchRequest, FetchTopic};
@@ -196,6 +198,31 @@ pub static SERVER_CHECKS: &[Check] = &[
         requirement: "refuses a Heartbeat carrying a generation the group has \
                       moved past, with ILLEGAL_GENERATION",
         runner: Runner::Server(|ctx| Box::pin(groups_stale_generation_fenced(ctx))),
+    },
+    Check {
+        id: "consumer-group/epoch-advances",
+        requirement: "admits a KIP-848 member that names itself at epoch 0, \
+                      answering with a non-zero epoch and a usable heartbeat \
+                      interval",
+        runner: Runner::Server(|ctx| Box::pin(consumer_group_epoch_advances(ctx))),
+    },
+    Check {
+        id: "consumer-group/assigns-subscription",
+        requirement: "assigns the partitions of a subscribed topic, addressed by \
+                      topic id",
+        runner: Runner::Server(|ctx| Box::pin(consumer_group_assigns_subscription(ctx))),
+    },
+    Check {
+        id: "consumer-group/omitted-subscription-is-unchanged",
+        requirement: "treats a heartbeat that omits subscribed_topic_names as \
+                      saying nothing about the subscription, not as unsubscribing",
+        runner: Runner::Server(|ctx| Box::pin(consumer_group_omitted_subscription(ctx))),
+    },
+    Check {
+        id: "consumer-group/fenced-epoch",
+        requirement: "refuses a heartbeat carrying an epoch the member has moved \
+                      past, with FENCED_MEMBER_EPOCH",
+        runner: Runner::Server(|ctx| Box::pin(consumer_group_fenced_epoch(ctx))),
     },
 ];
 
@@ -1126,6 +1153,432 @@ async fn api_call<T: Message>(
         body,
     )
     .await
+}
+
+/// The assignment shape a heartbeat response carries.
+type AssignedPartitions =
+    odradek_protocol::messages::consumer_group_heartbeat_response::TopicPartitions;
+
+/// A KIP-848 member names itself; this is the shape of that name.
+///
+/// Kafka takes any string here, but a uuid is what every real client
+/// sends and what the field was designed around.
+fn mint_member_id(tag: &str) -> String {
+    format!("odradek-acceptance-{tag}-{}", std::process::id())
+}
+
+/// One ConsumerGroupHeartbeat exchange.
+///
+/// `subscribed` distinguishes the three states the field has, and the
+/// distinction is the point: `None` says nothing about the subscription,
+/// `Some(&[])` says there is none, and `Some(names)` states one.
+async fn consumer_group_heartbeat(
+    conn: &mut RawConnection,
+    version: i16,
+    group: &str,
+    member_id: &str,
+    epoch: i32,
+    subscribed: Option<&[String]>,
+    correlation_id: i32,
+) -> Result<ConsumerGroupHeartbeatResponse, CheckError> {
+    let mut request = ConsumerGroupHeartbeatRequest::default();
+    request.group_id = group.to_owned();
+    request.member_id = member_id.to_owned();
+    request.member_epoch = epoch;
+    request.rebalance_timeout_ms = 30_000;
+    request.subscribed_topic_names = subscribed.map(<[String]>::to_vec);
+    // A heartbeat that states a subscription is a member (re)introducing
+    // itself, and it must also state what it currently owns — nothing,
+    // as an empty list. Omitting the field is not the same as an empty
+    // one here either: Kafka answers INVALID_REQUEST for the silence.
+    if subscribed.is_some() {
+        request.topic_partitions = Some(Vec::new());
+    }
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding ConsumerGroupHeartbeat: {e}")))?;
+    api_call(
+        conn,
+        ConsumerGroupHeartbeatRequest::API_KEY,
+        version,
+        correlation_id,
+        &body,
+    )
+    .await
+}
+
+/// The KIP-848 version this subject and these checks share.
+fn consumer_group_version(ctx: &ServerCtx) -> Result<i16, Verdict> {
+    negotiate(
+        "ConsumerGroupHeartbeat",
+        ctx.range(ConsumerGroupHeartbeatRequest::API_KEY)?,
+        ConsumerGroupHeartbeatRequest::MIN_VERSION,
+        ConsumerGroupHeartbeatRequest::MAX_VERSION,
+    )
+}
+
+/// A member that introduces itself is admitted at a non-zero epoch.
+///
+/// Epoch 0 is what a member says on the way in, so it cannot also be
+/// what the coordinator says back: a client that is told 0 has no way to
+/// distinguish having joined from having been ignored, and the epoch it
+/// must echo on every later heartbeat is the one thing it cannot guess.
+async fn consumer_group_epoch_advances(ctx: &ServerCtx) -> Verdict {
+    let version = match consumer_group_version(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let group = check_group("epoch");
+    if let Err(e) = await_coordinator(ctx, &group).await {
+        return e.into_verdict();
+    }
+    let mut conn = match connect(&ctx.addr).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
+    let member_id = mint_member_id("epoch");
+    let topics = vec![unique_topic("cgnone")];
+
+    let resp = match consumer_group_heartbeat(
+        &mut conn,
+        version,
+        &group,
+        &member_id,
+        0,
+        Some(&topics),
+        150,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return e.into_verdict(),
+    };
+    let code = ErrorCode(resp.error_code);
+    if !code.is_ok() {
+        return Verdict::Fail {
+            details: format!("a member introducing itself at epoch 0 was answered {code}"),
+        };
+    }
+    if resp.member_epoch == 0 {
+        return Verdict::Fail {
+            details: "member was admitted at epoch 0, which is the epoch it arrived \
+                      with: nothing distinguishes joining from being ignored"
+                .into(),
+        };
+    }
+    if resp.heartbeat_interval_ms <= 0 {
+        return Verdict::Fail {
+            details: format!(
+                "heartbeat interval is {}ms, so a member has no pace to keep",
+                resp.heartbeat_interval_ms
+            ),
+        };
+    }
+    // The coordinator may rename a member; it may not silently drop the id.
+    if resp.member_id.as_deref().unwrap_or_default().is_empty() {
+        return Verdict::Fail {
+            details: "response carries no member id".into(),
+        };
+    }
+    let _ = leave_consumer_group(&mut conn, version, &group, &member_id, 151).await;
+    Verdict::Pass
+}
+
+/// Leaving is epoch -1, and the suite does it so a check leaves no member
+/// behind to be rebalanced against on a live cluster.
+async fn leave_consumer_group(
+    conn: &mut RawConnection,
+    version: i16,
+    group: &str,
+    member_id: &str,
+    correlation_id: i32,
+) -> Result<(), CheckError> {
+    consumer_group_heartbeat(conn, version, group, member_id, -1, None, correlation_id)
+        .await
+        .map(|_| ())
+}
+
+/// A subscription produces an assignment, addressed by topic id.
+async fn consumer_group_assigns_subscription(ctx: &ServerCtx) -> Verdict {
+    let version = match consumer_group_version(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    // A real topic, so there is something to assign.
+    let mut produced = match produce_flow(ctx, "cgassign", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    if produced.topic_id == [0u8; 16] {
+        return Verdict::Skipped {
+            reason: "assignments are addressed by topic id and CreateTopics returned none".into(),
+        };
+    }
+    let group = check_group("cgassign");
+    if let Err(e) = await_coordinator(ctx, &group).await {
+        return e.into_verdict();
+    }
+    let member_id = mint_member_id("assign");
+    let topics = vec![produced.topic.clone()];
+
+    let (assigned, _epoch) = match settle_assignment(
+        ctx,
+        &mut produced.conn,
+        version,
+        &group,
+        &member_id,
+        &topics,
+        160,
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(verdict) => return verdict,
+    };
+    let _ = leave_consumer_group(&mut produced.conn, version, &group, &member_id, 169).await;
+
+    match assigned.iter().find(|tp| tp.topic_id == produced.topic_id) {
+        Some(tp) if tp.partitions.contains(&0) => Verdict::Pass,
+        Some(tp) => Verdict::Fail {
+            details: format!(
+                "subscribed to a 1-partition topic; assignment names it with partitions {:?}",
+                tp.partitions
+            ),
+        },
+        None => Verdict::Fail {
+            details: format!(
+                "subscribed to {:?} and was assigned {} topic(s), none of them that one",
+                produced.topic,
+                assigned.len()
+            ),
+        },
+    }
+}
+
+/// Heartbeat until the coordinator has an assignment to give, or the
+/// settle budget runs out.
+///
+/// A real coordinator computes assignments asynchronously, so the first
+/// heartbeat legitimately returns nothing. That is reconciliation, not
+/// nonconformance.
+async fn settle_assignment(
+    ctx: &ServerCtx,
+    conn: &mut RawConnection,
+    version: i16,
+    group: &str,
+    member_id: &str,
+    topics: &[String],
+    correlation_base: i32,
+) -> Result<(Vec<AssignedPartitions>, i32), Verdict> {
+    let mut epoch = 0;
+    let mut subscribed = Some(topics);
+    for attempt in 0..ctx.config.settle_attempts() {
+        if attempt > 0 {
+            tokio::time::sleep(ctx.config.settle_delay).await;
+        }
+        let correlation = correlation_base + i32::try_from(attempt).unwrap_or(0);
+        let resp = match consumer_group_heartbeat(
+            conn,
+            version,
+            group,
+            member_id,
+            epoch,
+            subscribed,
+            correlation,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => return Err(e.into_verdict()),
+        };
+        let code = ErrorCode(resp.error_code);
+        if !code.is_ok() {
+            return Err(Verdict::Fail {
+                details: format!("heartbeat at epoch {epoch} answered {code}"),
+            });
+        }
+        epoch = resp.member_epoch;
+        // Stated once; from here the member is saying nothing new.
+        subscribed = None;
+        let assigned = resp
+            .assignment
+            .map(|a| a.topic_partitions)
+            .unwrap_or_default();
+        if !assigned.is_empty() {
+            return Ok((assigned, epoch));
+        }
+    }
+    Err(Verdict::Fail {
+        details: format!(
+            "no assignment for a subscribed topic after {:?}",
+            ctx.config.settle_budget
+        ),
+    })
+}
+
+/// Omitting the subscription says nothing; it does not unsubscribe.
+///
+/// This is the steady state: a member that has settled sends heartbeats
+/// carrying only its id and epoch. A coordinator that reads the absent
+/// field as an empty subscription revokes the assignment of every member
+/// that is idling correctly.
+async fn consumer_group_omitted_subscription(ctx: &ServerCtx) -> Verdict {
+    let version = match consumer_group_version(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let mut produced = match produce_flow(ctx, "cgsteady", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    if produced.topic_id == [0u8; 16] {
+        return Verdict::Skipped {
+            reason: "assignments are addressed by topic id and CreateTopics returned none".into(),
+        };
+    }
+    let group = check_group("cgsteady");
+    if let Err(e) = await_coordinator(ctx, &group).await {
+        return e.into_verdict();
+    }
+    let member_id = mint_member_id("steady");
+    let topics = vec![produced.topic.clone()];
+
+    let (_assigned, epoch) = match settle_assignment(
+        ctx,
+        &mut produced.conn,
+        version,
+        &group,
+        &member_id,
+        &topics,
+        170,
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(verdict) => return verdict,
+    };
+
+    // Now heartbeat the way a settled member does: its id and the epoch
+    // it was last told, and nothing else. No re-reading the epoch first —
+    // a known member arriving at epoch 0 is a rejoin, and being fenced
+    // for it is correct.
+    let quiet = match consumer_group_heartbeat(
+        &mut produced.conn,
+        version,
+        &group,
+        &member_id,
+        epoch,
+        None,
+        180,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return e.into_verdict(),
+    };
+    let code = ErrorCode(quiet.error_code);
+    let _ = leave_consumer_group(&mut produced.conn, version, &group, &member_id, 181).await;
+    if !code.is_ok() {
+        return Verdict::Fail {
+            details: format!("a heartbeat stating nothing new was answered {code}"),
+        };
+    }
+    // An *absent* assignment means nothing changed, which is the whole
+    // point of the steady-state heartbeat: the response omits what has
+    // not moved exactly as the request does. So absence is the passing
+    // case, and so is being told the same assignment again.
+    //
+    // Revocation is what the broken behaviour looks like on the wire,
+    // and it is distinguishable: dropping the subscription *changes* the
+    // assignment to nothing, so the coordinator has to say so — an
+    // assignment that is present and empty.
+    match quiet.assignment {
+        None => Verdict::Pass,
+        Some(a)
+            if a.topic_partitions
+                .iter()
+                .any(|tp| tp.topic_id == produced.topic_id) =>
+        {
+            Verdict::Pass
+        }
+        Some(a) if a.topic_partitions.is_empty() => Verdict::Fail {
+            details: "a heartbeat that omitted subscribed_topic_names was answered with \
+                      an empty assignment: the absent field was read as unsubscribing"
+                .into(),
+        },
+        Some(a) => Verdict::Fail {
+            details: format!(
+                "a heartbeat that stated nothing new was reassigned to {} other topic(s)",
+                a.topic_partitions.len()
+            ),
+        },
+    }
+}
+
+/// An epoch the member has moved past is fenced.
+async fn consumer_group_fenced_epoch(ctx: &ServerCtx) -> Verdict {
+    let version = match consumer_group_version(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let group = check_group("cgfence");
+    if let Err(e) = await_coordinator(ctx, &group).await {
+        return e.into_verdict();
+    }
+    let mut conn = match connect(&ctx.addr).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
+    let member_id = mint_member_id("fence");
+    let topics = vec![unique_topic("cgfence")];
+
+    let joined = match consumer_group_heartbeat(
+        &mut conn,
+        version,
+        &group,
+        &member_id,
+        0,
+        Some(&topics),
+        190,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return e.into_verdict(),
+    };
+    let code = ErrorCode(joined.error_code);
+    if !code.is_ok() {
+        return Verdict::Fail {
+            details: format!("joining answered {code}"),
+        };
+    }
+    // An epoch beyond anything the coordinator has issued: a member
+    // claiming to be further ahead than the group.
+    let ahead = joined.member_epoch + 99;
+    let fenced =
+        match consumer_group_heartbeat(&mut conn, version, &group, &member_id, ahead, None, 191)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return e.into_verdict(),
+        };
+    let code = ErrorCode(fenced.error_code);
+    let _ = leave_consumer_group(&mut conn, version, &group, &member_id, 192).await;
+    if code == ErrorCode::FENCED_MEMBER_EPOCH || code == ErrorCode::UNKNOWN_MEMBER_ID {
+        Verdict::Pass
+    } else if code.is_ok() {
+        Verdict::Fail {
+            details: format!(
+                "heartbeat claiming epoch {ahead} (the group issued {}) was accepted",
+                joined.member_epoch
+            ),
+        }
+    } else {
+        Verdict::Fail {
+            details: format!("a bogus epoch answered {code}, expected FENCED_MEMBER_EPOCH"),
+        }
+    }
 }
 
 /// The version from which a join with no member id must be refused.

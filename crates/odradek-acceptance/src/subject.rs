@@ -13,6 +13,10 @@ use std::io;
 use bytes::{Bytes, BytesMut};
 use odradek_protocol::messages::api_versions_request::ApiVersionsRequest;
 use odradek_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
+use odradek_protocol::messages::consumer_group_heartbeat_request::ConsumerGroupHeartbeatRequest;
+use odradek_protocol::messages::consumer_group_heartbeat_response::{
+    Assignment, ConsumerGroupHeartbeatResponse, TopicPartitions,
+};
 use odradek_protocol::messages::create_topics_request::CreateTopicsRequest;
 use odradek_protocol::messages::create_topics_response::{
     CreatableTopicResult, CreateTopicsResponse,
@@ -127,6 +131,16 @@ pub enum Fault {
     /// Answer a never-committed partition with 0 rather than the -1
     /// sentinel — a plausible offset where "nothing here" was meant.
     OffsetFetchUnsetIsZero,
+    /// Never advance a KIP-848 member past epoch 0.
+    ConsumerGroupEpochStuck,
+    /// Treat an omitted `subscribed_topic_names` as "subscribed to
+    /// nothing" rather than "unchanged", revoking a steady-state
+    /// member's assignment.
+    ConsumerGroupNullSubscriptionRevokes,
+    /// Assign nothing, however the member subscribed.
+    ConsumerGroupAssignsNothing,
+    /// Accept any member epoch.
+    ConsumerGroupIgnoresEpoch,
     /// Admit a join with no member id instead of answering
     /// MEMBER_ID_REQUIRED with one to retry with.
     JoinGroupAcceptsEmptyMemberId,
@@ -194,6 +208,10 @@ impl Fault {
         Fault::JoinGroupAcceptsEmptyMemberId,
         Fault::SyncGroupRewritesAssignment,
         Fault::GroupIgnoresGeneration,
+        Fault::ConsumerGroupEpochStuck,
+        Fault::ConsumerGroupNullSubscriptionRevokes,
+        Fault::ConsumerGroupAssignsNothing,
+        Fault::ConsumerGroupIgnoresEpoch,
     ];
 }
 
@@ -301,6 +319,11 @@ fn advertised_keys() -> Vec<ApiVersion> {
             LeaveGroupRequest::MIN_VERSION,
             LeaveGroupRequest::MAX_VERSION,
         ),
+        (
+            ConsumerGroupHeartbeatRequest::API_KEY,
+            ConsumerGroupHeartbeatRequest::MIN_VERSION,
+            ConsumerGroupHeartbeatRequest::MAX_VERSION,
+        ),
     ]
     .into_iter()
     .map(|(api_key, min_version, max_version)| {
@@ -331,8 +354,10 @@ struct ConnState {
     topic_names: HashMap<[u8; 16], String>,
     /// Committed offsets, keyed by (group, topic, partition).
     committed: HashMap<(String, String, i32), i64>,
-    /// Consumer groups this connection has joined.
+    /// Consumer groups this connection has joined (classic protocol).
     groups: HashMap<String, GroupState>,
+    /// KIP-848 members, keyed by (group, member id).
+    members_848: HashMap<(String, String), Member848>,
     /// Topics CreateTopics actually created. Distinct from `logs`, which
     /// only gains an entry once something is produced, and from
     /// `topic_names`, which maps ids: a topic can exist and be empty.
@@ -370,6 +395,38 @@ struct GroupState {
     assignments: HashMap<String, Bytes>,
     /// Member ids minted for a join that had none, awaiting the rejoin.
     minted: Vec<String>,
+}
+
+/// One KIP-848 member.
+///
+/// The decisions this shape forced, none of which the schema states:
+///
+/// 1. **The member names itself.** Classic JoinGroup has the coordinator
+///    mint the id; here the client generates one and the first heartbeat
+///    arrives carrying it at epoch 0. The coordinator accepts it and
+///    answers with the epoch it has been admitted at, which is never 0 —
+///    a member at epoch 0 has not been admitted yet, so "still 0" is how
+///    a client learns nothing happened.
+/// 2. **An omitted subscription means unchanged, not empty.** Every
+///    field a heartbeat can omit is one the client is saying nothing
+///    about. A coordinator that reads `subscribed_topic_names: null` as
+///    "subscribed to nothing" revokes the assignment of every member
+///    that is simply idling correctly — and the steady-state heartbeat
+///    is exactly the one that omits everything.
+/// 3. **Assignments are addressed by topic id.** The coordinator has to
+///    resolve the names a member subscribed by into ids, which means a
+///    subscription naming a topic that does not exist is not an error,
+///    it is an assignment that does not mention it.
+#[derive(Debug, Default)]
+struct Member848 {
+    epoch: i32,
+    /// Last subscription the member actually stated.
+    subscribed: Vec<String>,
+    /// The assignment this member was last *told*. The response carries
+    /// one only when it differs — the same rule the request follows in
+    /// the other direction, and the reason a steady-state heartbeat is
+    /// nearly empty in both directions.
+    told: Option<Vec<([u8; 16], Vec<i32>)>>,
 }
 
 /// A deterministic per-name topic id; never the zero uuid.
@@ -440,6 +497,9 @@ async fn handle_connection(mut stream: TcpStream, faults: Vec<Fault>) {
                 heartbeat_exchange(frame, api_version, &faults, &mut state)
             }
             LeaveGroupRequest::API_KEY => leave_group_exchange(frame, api_version, &mut state),
+            ConsumerGroupHeartbeatRequest::API_KEY => {
+                consumer_group_heartbeat_exchange(frame, api_version, &faults, &mut state)
+            }
             _ => return,
         };
         let Some(out) = out else {
@@ -458,6 +518,139 @@ fn response_header_version(api_key: i16, api_version: i16) -> i16 {
 }
 
 /// Frame a response: length prefix, header at `header_version`, body bytes.
+/// The interval this subject tells members to heartbeat at.
+const HEARTBEAT_INTERVAL_MS: i32 = 5_000;
+/// A heartbeat carrying this epoch is the member leaving.
+const LEAVE_EPOCH: i32 = -1;
+
+/// ConsumerGroupHeartbeat: the whole KIP-848 membership in one call.
+fn consumer_group_heartbeat_exchange(
+    mut frame: Bytes,
+    api_version: i16,
+    faults: &[Fault],
+    state: &mut ConnState,
+) -> Option<BytesMut> {
+    if !(ConsumerGroupHeartbeatRequest::MIN_VERSION..=ConsumerGroupHeartbeatRequest::MAX_VERSION)
+        .contains(&api_version)
+    {
+        return None;
+    }
+    let hv = header::request_header_version(ConsumerGroupHeartbeatRequest::API_KEY, api_version)?;
+    let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
+    let request = ConsumerGroupHeartbeatRequest::decode(&mut frame, api_version).ok()?;
+
+    let key = (request.group_id.clone(), request.member_id.clone());
+    let mut resp = ConsumerGroupHeartbeatResponse::default();
+    resp.member_id = Some(request.member_id.clone());
+    resp.heartbeat_interval_ms = HEARTBEAT_INTERVAL_MS;
+
+    // Leaving: acknowledged by echoing the epoch back, and the member is
+    // gone. Nothing to assign and nothing to fence against.
+    if request.member_epoch == LEAVE_EPOCH {
+        state.members_848.remove(&key);
+        resp.error_code = 0;
+        resp.member_epoch = LEAVE_EPOCH;
+        return frame_response(
+            req_header.correlation_id,
+            response_header_version(ConsumerGroupHeartbeatRequest::API_KEY, api_version),
+            |out| resp.encode(out, api_version).unwrap(),
+            false,
+        );
+    }
+
+    let known = state.members_848.contains_key(&key);
+    if known {
+        let current = state.members_848[&key].epoch;
+        if request.member_epoch != current && !faults.contains(&Fault::ConsumerGroupIgnoresEpoch) {
+            resp.error_code = ErrorCode::FENCED_MEMBER_EPOCH.0;
+            resp.member_epoch = 0;
+            return frame_response(
+                req_header.correlation_id,
+                response_header_version(ConsumerGroupHeartbeatRequest::API_KEY, api_version),
+                |out| resp.encode(out, api_version).unwrap(),
+                false,
+            );
+        }
+    } else if request.member_epoch != 0 {
+        // An unknown member can only be introducing itself, which is
+        // epoch 0. Anything else is a member the coordinator forgot.
+        resp.error_code = ErrorCode::UNKNOWN_MEMBER_ID.0;
+        resp.member_epoch = 0;
+        return frame_response(
+            req_header.correlation_id,
+            response_header_version(ConsumerGroupHeartbeatRequest::API_KEY, api_version),
+            |out| resp.encode(out, api_version).unwrap(),
+            false,
+        );
+    }
+
+    let stuck = faults.contains(&Fault::ConsumerGroupEpochStuck);
+    let member = state.members_848.entry(key).or_default();
+    if !known {
+        // Admission is what the epoch records. Leaving it at 0 tells the
+        // member it was never admitted, however cheerful the error code.
+        member.epoch = if stuck { 0 } else { 1 };
+    }
+    // Omitted means unchanged. Only a stated subscription replaces the
+    // one on file — including a stated empty one, which really is
+    // "nothing", unlike an absent one.
+    match &request.subscribed_topic_names {
+        Some(names) => member.subscribed = names.clone(),
+        None if faults.contains(&Fault::ConsumerGroupNullSubscriptionRevokes) => {
+            member.subscribed.clear();
+        }
+        None => {}
+    }
+    let epoch = member.epoch;
+    let subscribed = member.subscribed.clone();
+
+    // Server-side assignment: every partition of every subscribed topic
+    // that exists, addressed by id because that is what the wire carries.
+    let assigned: Vec<TopicPartitions> = if faults.contains(&Fault::ConsumerGroupAssignsNothing) {
+        Vec::new()
+    } else {
+        subscribed
+            .iter()
+            .filter_map(|name| state.created.get(name).map(|id| (name, *id)))
+            .map(|(_, topic_id)| {
+                let mut tp = TopicPartitions::default();
+                tp.topic_id = topic_id;
+                tp.partitions = vec![0];
+                tp
+            })
+            .collect()
+    };
+    // Send the assignment only when it is news. An unchanged assignment
+    // is reported by saying nothing about it, so a member that hears
+    // nothing keeps what it has — and, crucially, a member whose
+    // assignment was *revoked* hears an empty one, which is how the two
+    // are told apart on the wire.
+    let current: Vec<([u8; 16], Vec<i32>)> = assigned
+        .iter()
+        .map(|tp| (tp.topic_id, tp.partitions.clone()))
+        .collect();
+    let member = state
+        .members_848
+        .get_mut(&(request.group_id.clone(), request.member_id.clone()))
+        .expect("member was just inserted");
+    let changed = member.told.as_ref() != Some(&current);
+    member.told = Some(current);
+
+    resp.error_code = 0;
+    resp.member_epoch = epoch;
+    if changed {
+        let mut assignment = Assignment::default();
+        assignment.topic_partitions = assigned;
+        resp.assignment = Some(assignment);
+    }
+    frame_response(
+        req_header.correlation_id,
+        response_header_version(ConsumerGroupHeartbeatRequest::API_KEY, api_version),
+        |out| resp.encode(out, api_version).unwrap(),
+        false,
+    )
+}
+
 /// The version from which a join with no member id must be refused and
 /// given one to retry with.
 const JOIN_GROUP_MEMBER_ID_REQUIRED: i16 = 4;

@@ -114,6 +114,22 @@ const SENSITIVITY: &[(Fault, &str)] = &[
         Fault::GroupIgnoresGeneration,
         "groups/stale-generation-fenced",
     ),
+    (
+        Fault::ConsumerGroupEpochStuck,
+        "consumer-group/epoch-advances",
+    ),
+    (
+        Fault::ConsumerGroupAssignsNothing,
+        "consumer-group/assigns-subscription",
+    ),
+    (
+        Fault::ConsumerGroupNullSubscriptionRevokes,
+        "consumer-group/omitted-subscription-is-unchanged",
+    ),
+    (
+        Fault::ConsumerGroupIgnoresEpoch,
+        "consumer-group/fenced-epoch",
+    ),
 ];
 
 /// The calibration registry is exhaustive in both directions against the
