@@ -12,9 +12,33 @@ yanked = "deny"
 
 [licenses]
 version = 2
-# Everything in the tree is permissive. The workspace's own crates are
-# MIT OR Apache-2.0; webpki-roots carries CDLA-Permissive-2.0 (the
-# Mozilla root store data license).
+# This gate is not a stand-in for a consumer's license policy; it is how
+# "MIT OR Apache-2.0" stays true of the whole closure a consumer
+# receives, rather than only of the files written here. A copyleft
+# dependency in a library propagates an obligation downstream that
+# nobody downstream chose, and it is not reasonably detectable from
+# their side — they see one flat list of ~160 crates with no way to
+# tell which subtree arrived through us.
+#
+# Everything resolves permissive. Three entries are worth naming so a
+# later audit can tell "considered" from "overlooked":
+#
+#   webpki-roots  CDLA-Permissive-2.0 — the Mozilla root store data
+#                 license, and only present under the `tls` feature.
+#   zlib-rs       Zlib — the only crate here under that license alone.
+#   r-efi         MIT OR Apache-2.0 OR LGPL-2.1-or-later. The copyleft
+#                 branch is one option of three; we take MIT, and
+#                 cargo-deny resolves the expression the same way. It
+#                 reaches the graph only because `cargo metadata`
+#                 enumerates every target: it is a UEFI dependency of
+#                 getrandom and compiles on no platform this workspace
+#                 supports. A consumer's SPDX scanner will still surface
+#                 the string, hence this note.
+#
+# Entries below that nothing currently uses are left in place
+# deliberately (cargo-deny warns rather than fails): they are the set
+# considered acceptable for this workspace, not a census of today's
+# lockfile.
 allow = [
   "0BSD",
   "Apache-2.0",

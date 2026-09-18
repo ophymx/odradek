@@ -1,0 +1,35 @@
+odradek
+Copyright 2026 Jeffrey T. Peckham (Ophymx)
+
+Licensed under the MIT license or the Apache License, Version 2.0, at
+your option. See LICENSE-MIT and LICENSE-APACHE.
+
+-----------------------------------------------------------------------
+
+This product includes material from Apache Kafka.
+
+    Apache Kafka
+    Copyright 2025 The Apache Software Foundation.
+
+    This product includes software developed at
+    The Apache Software Foundation (https://www.apache.org/).
+
+The message-definition schemas in crates/odradek-protocol/schemas/ are
+copied verbatim from apache/kafka at tag 4.1.0, out of
+clients/src/main/resources/common/message/. They remain licensed to the
+Apache Software Foundation under the Apache License, Version 2.0, and
+each file carries the ASF header. The Rust code in
+crates/odradek-protocol/src/messages/ is generated from them.
+
+Apache License 2.0 section 4(d) requires a redistribution to carry the
+attribution notices from the upstream NOTICE that pertain to the part
+being redistributed. Apache Kafka's NOTICE also covers jersey, jqwik,
+streams-scala, and code taken from Apache Hive; none of those appear in
+the schemas, so they are excluded here, as that section allows.
+
+A copy of this file ships inside the odradek-protocol package as well,
+because that crate is the one that actually redistributes the schemas.
+
+Apache Kafka is a trademark of The Apache Software Foundation. This
+project is not affiliated with, endorsed by, or sponsored by the Apache
+Software Foundation.
