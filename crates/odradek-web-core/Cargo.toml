@@ -27,9 +27,16 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+criterion = { workspace = true }
+
 [[example]]
 name = "tail"
 required-features = ["kafka"]
+
+[[bench]]
+name = "fanout"
+harness = false
 
 [lints]
 workspace = true

@@ -8,6 +8,29 @@
 //! queue drains. Events are delivered in offset order with no gaps and
 //! no duplicates, however slow the consumer.
 //!
+//! Fan-out is by [`SharedEvent`]: one event is read once, rendered (if
+//! a transport asks) once, and handed to every subscriber as a refcount
+//! bump — the per-subscriber cost of a live event is a channel send.
+//!
+//! Catch-up is *scheduled*, not unbounded, because it shares the loop
+//! with the live fetch:
+//!
+//! - Subscribers whose cursor is still inside the ring are served from
+//!   memory every iteration — no source call, so no effect on the live
+//!   path.
+//! - Subscribers that have fallen behind the ring need a source fetch,
+//!   and the pump serves **at most one such fetch per iteration**,
+//!   round-robin. Without that bound, K laggards put K broker round
+//!   trips between consecutive live fetches, which widens the live gap,
+//!   pushes more subscribers out of the ring, and spirals.
+//!
+//! The honest cost of the bound: when K subscribers are behind the
+//! ring, each is served roughly every K iterations, so deep replays
+//! finish slower the more of them there are (they still lose nothing —
+//! this is latency, not loss). The live path pays one catch-up round
+//! trip per iteration regardless of K, and a laggard in the ring pays
+//! nothing at all.
+//!
 //! Lifecycle: dead subscribers (dropped receivers) are noticed every
 //! loop iteration, not just on delivery, so a quiet topic is never
 //! fetched for nobody; a pump with no subscribers for
@@ -25,8 +48,8 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::event::{Event, Filter, Position};
-use crate::source::{RecordSource, SourceError, SourceErrorKind};
+use crate::event::{Filter, Position, SharedEvent};
+use crate::source::{RecordSource, SourceBatch, SourceError, SourceErrorKind};
 
 /// Tuning for one pump.
 #[derive(Debug, Clone)]
@@ -137,9 +160,13 @@ impl From<SourceError> for StreamError {
 
 /// What a subscriber's channel carries: events until the stream ends,
 /// with an optional final error explaining an abnormal end.
-pub type StreamItem = Result<Event, StreamError>;
+///
+/// The event is a [`SharedEvent`] — one allocation shared by every
+/// subscriber of the partition. It derefs to
+/// [`Event`](crate::event::Event), so reading fields is unchanged.
+pub type StreamItem = Result<SharedEvent, StreamError>;
 
-/// A live subscription: a stream of [`Event`]s in offset order,
+/// A live subscription: a stream of [`SharedEvent`]s in offset order,
 /// possibly ending with one [`StreamError`].
 #[derive(Debug)]
 pub struct Subscription {
@@ -228,6 +255,13 @@ impl PumpHandle {
         let _ = self.commands.send(Command::Shutdown).await;
     }
 
+    /// True when both handles drive the same pump task — how the hub
+    /// tells "the pump I saw" from "the replacement another subscriber
+    /// installed while I was unlocked".
+    pub fn same_pump(&self, other: &PumpHandle) -> bool {
+        self.commands.same_channel(&other.commands)
+    }
+
     pub fn topic(&self) -> &str {
         &self.topic
     }
@@ -246,6 +280,8 @@ enum Mode {
 }
 
 struct SubState {
+    /// Identity within this pump, for round-robin catch-up service.
+    id: u64,
     sender: mpsc::Sender<StreamItem>,
     filter: Filter,
     mode: Mode,
@@ -254,7 +290,9 @@ struct SubState {
 
 impl SubState {
     /// Push one event, demoting to catch-up when the queue is full.
-    fn push_live(&mut self, event: &Event) {
+    /// The filter runs before the handle is cloned, so a subscriber
+    /// that does not want the event costs nothing but the test.
+    fn push_live(&mut self, event: &SharedEvent) {
         if self.mode != Mode::Live || self.closed {
             return;
         }
@@ -270,6 +308,79 @@ impl SubState {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => self.closed = true,
         }
+    }
+
+    /// True when this subscriber can only be advanced by a source fetch:
+    /// it is behind the live edge, its cursor predates the ring, and it
+    /// has room for what the fetch would bring. A subscriber whose queue
+    /// is full would stall on the first record, so spending the
+    /// iteration's one fetch on it would waste the turn.
+    fn needs_fetch(&self, ring_start: Option<i64>, live_edge: i64) -> bool {
+        if self.closed || self.sender.capacity() == 0 {
+            return false;
+        }
+        match self.mode {
+            Mode::Live => false,
+            Mode::CatchingUp { cursor } => {
+                cursor < live_edge && ring_start.is_none_or(|start| cursor < start)
+            }
+        }
+    }
+}
+
+/// The pump's subscribers, plus the bookkeeping that keeps catch-up
+/// fair: ids to take turns by, and the turn to resume from.
+#[derive(Default)]
+struct Subscribers {
+    list: Vec<SubState>,
+    next_id: u64,
+    /// The id the next out-of-ring catch-up round starts looking from.
+    rotor: u64,
+}
+
+impl Subscribers {
+    fn add(&mut self, sender: mpsc::Sender<StreamItem>, filter: Filter, mode: Mode) {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.list.push(SubState {
+            id,
+            sender,
+            filter,
+            mode,
+            closed: false,
+        });
+    }
+
+    /// Drop subscribers whose receivers are gone.
+    fn retain_live(&mut self) {
+        self.list.retain(|s| !s.closed && !s.sender.is_closed());
+    }
+
+    fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+
+    /// Take every subscriber out, for a terminal error.
+    fn take(&mut self) -> Vec<SubState> {
+        std::mem::take(&mut self.list)
+    }
+
+    /// Whose turn it is for the iteration's single catch-up fetch:
+    /// the next one owed a fetch at or after the rotor, wrapping to the
+    /// start, so no laggard starves behind another.
+    fn next_fetch(&mut self, ring_start: Option<i64>, live_edge: i64) -> Option<usize> {
+        let rotor = self.rotor;
+        let (index, id) = self
+            .list
+            .iter()
+            .enumerate()
+            .filter(|(_, sub)| sub.needs_fetch(ring_start, live_edge))
+            // `false < true`: ids from the rotor on come first, and the
+            // search wraps to the lowest id only if none remain.
+            .min_by_key(|(_, sub)| (sub.id < rotor, sub.id))
+            .map(|(index, sub)| (index, sub.id))?;
+        self.rotor = id + 1;
+        Some(index)
     }
 }
 
@@ -297,8 +408,8 @@ async fn run_pump<S: RecordSource>(
     config: PumpConfig,
     mut commands: mpsc::Receiver<Command>,
 ) {
-    let mut ring: VecDeque<Event> = VecDeque::new();
-    let mut subs: Vec<SubState> = Vec::new();
+    let mut ring: VecDeque<SharedEvent> = VecDeque::new();
+    let mut subs = Subscribers::default();
     // The next offset the live fetch reads; None until first needed.
     let mut live_cursor: Option<i64> = None;
     let mut consecutive_errors = 0u32;
@@ -306,7 +417,7 @@ async fn run_pump<S: RecordSource>(
     loop {
         // Notice dead subscribers every iteration — not just on
         // delivery — so a quiet topic is never fetched for nobody.
-        subs.retain(|s| !s.closed && !s.sender.is_closed());
+        subs.retain_live();
 
         // With nobody listening, sit idle on the command channel; give
         // up entirely after `idle_shutdown`.
@@ -348,7 +459,7 @@ async fn run_pump<S: RecordSource>(
                     tracing::warn!(topic, partition, error = %e, "latest offset lookup failed");
                     consecutive_errors += 1;
                     if e.is_permanent() || consecutive_errors > config.max_consecutive_errors {
-                        fail_subs(subs, &e);
+                        fail_subs(subs.take(), &e);
                         return;
                     }
                     tokio::time::sleep(config.error_backoff).await;
@@ -359,19 +470,27 @@ async fn run_pump<S: RecordSource>(
 
         // One live fetch: extend the ring, push to live subscribers.
         match source.fetch(&topic, partition, cursor).await {
-            Ok(batch) => {
+            Ok(SourceBatch {
+                events,
+                next_offset,
+                ..
+            }) => {
                 consecutive_errors = 0;
-                for event in &batch.events {
-                    for sub in &mut subs {
-                        sub.push_live(event);
+                let empty = events.is_empty();
+                for event in events {
+                    // Read once, shared by everyone: each subscriber
+                    // costs a filter test and a refcount bump.
+                    let event = SharedEvent::new(event);
+                    for sub in &mut subs.list {
+                        sub.push_live(&event);
                     }
-                    ring.push_back(event.clone());
+                    ring.push_back(event);
                     while ring.len() > config.ring_capacity {
                         ring.pop_front();
                     }
                 }
-                live_cursor = Some(batch.next_offset.max(cursor));
-                if batch.events.is_empty() {
+                live_cursor = Some(next_offset.max(cursor));
+                if empty {
                     tokio::time::sleep(config.idle_poll).await;
                 }
             }
@@ -379,27 +498,28 @@ async fn run_pump<S: RecordSource>(
                 tracing::warn!(topic, partition, error = %e, "live fetch failed");
                 consecutive_errors += 1;
                 if e.is_permanent() || consecutive_errors > config.max_consecutive_errors {
-                    fail_subs(subs, &e);
+                    fail_subs(subs.take(), &e);
                     return;
                 }
                 tokio::time::sleep(config.error_backoff).await;
             }
         }
 
-        // Advance every catching-up subscriber by one step.
+        // Catch-up, bounded so it cannot stall the live path: serve
+        // everyone the ring can serve (memory only), then spend one
+        // source fetch on whichever laggard's turn it is.
         let live_edge = live_cursor.unwrap_or(0);
-        let mut permanent: Option<SourceError> = None;
-        for sub in &mut subs {
-            if let Err(e) =
-                advance_catch_up(sub, &mut source, &topic, partition, &ring, live_edge).await
-            {
-                permanent = Some(e);
-                break;
-            }
+        let ring_start = ring.front().map(|e| e.offset);
+        for sub in &mut subs.list {
+            advance_from_ring(sub, &ring, live_edge);
         }
-        if let Some(e) = permanent {
-            fail_subs(subs, &e);
-            return;
+        if let Some(index) = subs.next_fetch(ring_start, live_edge) {
+            let outcome =
+                fetch_catch_up(&mut subs.list[index], &mut source, &topic, partition).await;
+            if let Err(e) = outcome {
+                fail_subs(subs.take(), &e);
+                return;
+            }
         }
     }
 }
@@ -410,7 +530,7 @@ async fn handle_command<S: RecordSource>(
     topic: &str,
     partition: i32,
     config: &PumpConfig,
-    subs: &mut Vec<SubState>,
+    subs: &mut Subscribers,
 ) {
     let Command::Subscribe {
         position,
@@ -432,12 +552,7 @@ async fn handle_command<S: RecordSource>(
     match mode {
         Ok(mode) => {
             let (sender, receiver) = mpsc::channel(config.queue_capacity);
-            subs.push(SubState {
-                sender,
-                filter,
-                mode,
-                closed: false,
-            });
+            subs.add(sender, filter, mode);
             let _ = reply.send(Ok(Subscription {
                 topic: topic.to_owned(),
                 partition,
@@ -460,17 +575,15 @@ enum PushOutcome {
     Closed,
 }
 
-/// Push filtered `events` (already in offset order) starting at
-/// `cursor`, advancing it per event.
+/// Push filtered `events` (already in offset order, and already
+/// positioned at `cursor`) to one subscriber, advancing the cursor per
+/// event.
 fn push_run<'a>(
     sub: &mut SubState,
-    events: impl Iterator<Item = &'a Event>,
+    events: impl Iterator<Item = &'a SharedEvent>,
     mut cursor: i64,
 ) -> PushOutcome {
     for event in events {
-        if event.offset < cursor {
-            continue;
-        }
         if sub.filter.matches(event) {
             match sub.sender.try_send(Ok(event.clone())) {
                 Ok(()) => {}
@@ -485,23 +598,15 @@ fn push_run<'a>(
     PushOutcome::Delivered(cursor)
 }
 
-/// Move one catching-up subscriber forward: from the ring when its
-/// cursor is inside it, else by one direct fetch from the source. Stops
-/// early (without losing its place) when the subscriber's queue fills.
-/// A permanent source error is returned to end the whole pump.
-async fn advance_catch_up<S: RecordSource>(
-    sub: &mut SubState,
-    source: &mut S,
-    topic: &str,
-    partition: i32,
-    ring: &VecDeque<Event>,
-    live_edge: i64,
-) -> Result<(), SourceError> {
+/// Advance one catching-up subscriber as far as the ring allows — pure
+/// memory, so every laggard can have this every iteration. Subscribers
+/// behind the ring are left for [`fetch_catch_up`].
+fn advance_from_ring(sub: &mut SubState, ring: &VecDeque<SharedEvent>, live_edge: i64) {
     let Mode::CatchingUp { cursor } = sub.mode else {
-        return Ok(());
+        return;
     };
     if sub.closed {
-        return Ok(());
+        return;
     }
     if cursor >= live_edge {
         // Caught up (or asked for a future offset: wait for the live
@@ -509,34 +614,55 @@ async fn advance_catch_up<S: RecordSource>(
         if cursor == live_edge {
             sub.mode = Mode::Live;
         }
-        return Ok(());
+        return;
     }
-
-    let ring_start = ring.front().map(|e| e.offset);
-    if ring_start.is_some_and(|start| cursor >= start) {
-        // Inside the ring: serve the remainder, then go live — the ring
-        // always ends at the live edge.
-        match push_run(sub, ring.iter(), cursor) {
-            PushOutcome::Delivered(_) => sub.mode = Mode::Live,
-            PushOutcome::Stalled(at) => sub.mode = Mode::CatchingUp { cursor: at },
-            PushOutcome::Closed => sub.closed = true,
-        }
-        return Ok(());
+    // Behind the ring (or the ring is empty): only a fetch can help.
+    if ring.front().is_none_or(|first| cursor < first.offset) {
+        return;
     }
+    // Inside the ring: serve the remainder from the cursor, then go
+    // live — the ring always ends at the live edge. The ring is
+    // offset-sorted, so finding the cursor is a binary search rather
+    // than a scan over everything already sent.
+    let from = ring.partition_point(|event| event.offset < cursor);
+    match push_run(sub, ring.range(from..), cursor) {
+        PushOutcome::Delivered(_) => sub.mode = Mode::Live,
+        PushOutcome::Stalled(at) => sub.mode = Mode::CatchingUp { cursor: at },
+        PushOutcome::Closed => sub.closed = true,
+    }
+}
 
-    // Behind the ring (or the ring is empty): fetch on the subscriber's
-    // behalf. The cursor still advances through record-less stretches
-    // (compaction gaps, control batches) via next_offset.
+/// Spend one source fetch on a subscriber that has fallen behind the
+/// ring. Stops early (without losing its place) when the subscriber's
+/// queue fills. A permanent source error is returned to end the whole
+/// pump; a transient one is left for the next iteration's turn.
+async fn fetch_catch_up<S: RecordSource>(
+    sub: &mut SubState,
+    source: &mut S,
+    topic: &str,
+    partition: i32,
+) -> Result<(), SourceError> {
+    let Mode::CatchingUp { cursor } = sub.mode else {
+        return Ok(());
+    };
+    // The cursor advances through record-less stretches (compaction
+    // gaps, control batches) via next_offset.
     match source.fetch(topic, partition, cursor).await {
-        Ok(batch) => match push_run(sub, batch.events.iter(), cursor) {
-            PushOutcome::Delivered(done) => {
-                sub.mode = Mode::CatchingUp {
-                    cursor: done.max(batch.next_offset),
-                };
+        Ok(batch) => {
+            let events: Vec<SharedEvent> = batch.events.into_iter().map(SharedEvent::new).collect();
+            // Sources answer from `cursor`, but skipping any earlier
+            // events they do return costs one binary search.
+            let from = events.partition_point(|event| event.offset < cursor);
+            match push_run(sub, events[from..].iter(), cursor) {
+                PushOutcome::Delivered(done) => {
+                    sub.mode = Mode::CatchingUp {
+                        cursor: done.max(batch.next_offset),
+                    };
+                }
+                PushOutcome::Stalled(at) => sub.mode = Mode::CatchingUp { cursor: at },
+                PushOutcome::Closed => sub.closed = true,
             }
-            PushOutcome::Stalled(at) => sub.mode = Mode::CatchingUp { cursor: at },
-            PushOutcome::Closed => sub.closed = true,
-        },
+        }
         Err(e) if e.is_permanent() => return Err(e),
         Err(e) => {
             // Transient; the next pump iteration retries.

@@ -25,6 +25,12 @@
 //! are valid UTF-8 (`key`, `value`), else base64 (`key_base64`,
 //! `value_base64`) — web-friendly without lying about binary data.
 //!
+//! One record's `data` is rendered once for all of that partition's
+//! subscribers, however many streams are open. The frame around it is
+//! per-stream: the `id` of a partition stream is that record's next
+//! offset, but a topic stream's `id` is the reader's own multi-partition
+//! cursor, so each stream writes its own.
+//!
 //! Subscribe failures are plain HTTP errors before the stream starts:
 //! `403` for a topic the hub's gate denies, `404` for a topic the
 //! source does not have, `503` after shutdown, `502` for other source
@@ -50,7 +56,6 @@ use axum::routing::get;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
-use odradek_web_core::json::event_json;
 use odradek_web_core::pump::StreamItem;
 use odradek_web_core::{
     Hub, Rejection, RejectionKind, SharedHub, StreamParams, TopicPosition, cursor,
@@ -157,10 +162,13 @@ async fn stream_partition<F: SourceFactory>(
 
     let stream = ReceiverStream::new(subscription.into_receiver()).map(|item: StreamItem| {
         Ok(match item {
+            // `event.json()` is rendered by whichever subscriber of this
+            // partition reaches it first; the rest copy the finished
+            // bytes into their own frame.
             Ok(event) => SseEvent::default()
                 .event("record")
                 .id((event.offset + 1).to_string())
-                .data(event_json(&event).to_string()),
+                .data(event.json()),
             // The final item of a failed stream; the channel closes
             // right after, ending the response.
             Err(err) => error_frame(&err),
@@ -201,7 +209,7 @@ async fn stream_topic<F: SourceFactory>(
                 SseEvent::default()
                     .event("record")
                     .id(cursor::encode(&running))
-                    .data(event_json(&event).to_string())
+                    .data(event.json())
             }
             // A partition pump failed; report it and let the stream
             // wind down.

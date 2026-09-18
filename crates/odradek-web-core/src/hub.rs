@@ -8,6 +8,15 @@
 //! [`Hub::shutdown`] stops every pump, closes remaining subscriber
 //! streams cleanly, and fails later subscribes with
 //! [`HubError::ShutDown`].
+//!
+//! [`SharedHub`] is the concurrent front door, and it is careful about
+//! what it holds its lock across: the map lookup (and, the first time a
+//! partition is asked for, the pump spawn) — never the subscribe round
+//! trip to a running pump. That matters because a pump on a quiet topic
+//! sits in a long poll: holding the lock across its reply would make one
+//! subscribe block every other subscribe in the process, which is
+//! exactly the reconnect-storm case. Topic-level subscribes go one step
+//! further and run their per-partition round trips concurrently.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -119,42 +128,21 @@ impl<F: SourceFactory> Hub<F> {
         position: TopicPosition,
         filter: Filter,
     ) -> Result<TopicSubscription, HubError> {
-        self.check_topic(topic)?;
-        if !self.topics.contains_key(topic) {
-            let partitions = self.factory.partitions(topic).await?;
-            self.topics.insert(topic.to_owned(), partitions);
-        }
-        let partitions = self.topics[topic].clone();
-
-        let (merged, receiver) = mpsc::channel(self.config.queue_capacity);
+        let partitions = self.partitions_of(topic).await?;
+        let mut subscriptions = Vec::with_capacity(partitions.len());
         for partition in &partitions {
-            let partition_position = match &position {
-                TopicPosition::Earliest => Position::Earliest,
-                TopicPosition::Latest => Position::Latest,
-                // Absent from the cursor = never seen: replay from the
-                // start rather than risk losing records.
-                TopicPosition::Offsets(cursor) => cursor
-                    .get(partition)
-                    .map_or(Position::Earliest, |next| Position::Offset(*next)),
-            };
-            let subscription = self
-                .subscribe(topic, *partition, partition_position, filter.clone())
-                .await?;
-            let merged = merged.clone();
-            tokio::spawn(async move {
-                let mut receiver = subscription.into_receiver();
-                while let Some(item) = receiver.recv().await {
-                    if merged.send(item).await.is_err() {
-                        return; // merged stream dropped
-                    }
-                }
-            });
+            let start = partition_position(&position, *partition);
+            subscriptions.push(
+                self.subscribe(topic, *partition, start, filter.clone())
+                    .await?,
+            );
         }
-        Ok(TopicSubscription {
-            topic: topic.to_owned(),
+        Ok(merge(
+            topic,
             partitions,
-            receiver,
-        })
+            subscriptions,
+            self.config.queue_capacity,
+        ))
     }
 
     /// Subscribe to one partition, starting the pump on first use.
@@ -165,34 +153,17 @@ impl<F: SourceFactory> Hub<F> {
         position: Position,
         filter: Filter,
     ) -> Result<Subscription, HubError> {
-        self.check_topic(topic)?;
-        let key = (topic.to_owned(), partition);
-        let mut created = false;
-        if !self.pumps.contains_key(&key) {
-            let handle = self.spawn_pump(topic, partition).await?;
-            self.pumps.insert(key.clone(), handle);
-            created = true;
-        }
-        let handle = &self.pumps[&key];
+        let (handle, created) = self.acquire(topic, partition).await?;
         match handle.subscribe(position, filter.clone()).await {
             Ok(sub) => Ok(sub),
             Err(HubError::PumpClosed) if !created => {
                 // The pump died (error budget exhausted) or exited
                 // idle; replace it once and retry.
-                let handle = match self.spawn_pump(topic, partition).await {
-                    Ok(handle) => handle,
-                    Err(e) => {
-                        // Do not cache a dead entry for a topic the
-                        // source no longer creates pumps for.
-                        self.pumps.remove(&key);
-                        return Err(e);
-                    }
-                };
-                self.pumps.insert(key.clone(), handle);
-                match self.pumps[&key].subscribe(position, filter).await {
+                let handle = self.respawn(topic, partition, &handle).await?;
+                match handle.subscribe(position, filter).await {
                     Ok(sub) => Ok(sub),
                     Err(e) => {
-                        self.pumps.remove(&key);
+                        self.forget(topic, partition, &handle);
                         Err(e)
                     }
                 }
@@ -201,12 +172,84 @@ impl<F: SourceFactory> Hub<F> {
                 if created {
                     // First creation failed outright (e.g. the topic
                     // does not exist): no permanent dead map entry.
-                    if let Some(handle) = self.pumps.remove(&key) {
-                        handle.shutdown().await;
-                    }
+                    self.forget(topic, partition, &handle);
+                    handle.shutdown().await;
                 }
                 Err(e)
             }
+        }
+    }
+
+    /// The partitions of `topic`, discovered once and cached.
+    async fn partitions_of(&mut self, topic: &str) -> Result<Vec<i32>, HubError> {
+        self.check_topic(topic)?;
+        if let Some(partitions) = self.topics.get(topic) {
+            return Ok(partitions.clone());
+        }
+        let partitions = self.factory.partitions(topic).await?;
+        self.topics.insert(topic.to_owned(), partitions.clone());
+        Ok(partitions)
+    }
+
+    /// The handle for one partition, spawning its pump on first use;
+    /// the flag says whether *this* call created it (and so owns
+    /// cleaning up after a pump that refuses its first subscriber).
+    ///
+    /// This is all a [`SharedHub`] subscribe holds the lock for.
+    async fn acquire(
+        &mut self,
+        topic: &str,
+        partition: i32,
+    ) -> Result<(PumpHandle, bool), HubError> {
+        self.check_topic(topic)?;
+        let key = (topic.to_owned(), partition);
+        if let Some(handle) = self.pumps.get(&key) {
+            return Ok((handle.clone(), false));
+        }
+        let handle = self.spawn_pump(topic, partition).await?;
+        self.pumps.insert(key, handle.clone());
+        Ok((handle, true))
+    }
+
+    /// Replace a pump that closed under a subscriber. If someone else
+    /// already replaced it (the map entry is no longer `stale`), take
+    /// theirs rather than spawn a second pump for the same partition.
+    async fn respawn(
+        &mut self,
+        topic: &str,
+        partition: i32,
+        stale: &PumpHandle,
+    ) -> Result<PumpHandle, HubError> {
+        let key = (topic.to_owned(), partition);
+        match self.pumps.get(&key) {
+            Some(current) if !current.same_pump(stale) => return Ok(current.clone()),
+            _ => {}
+        }
+        match self.spawn_pump(topic, partition).await {
+            Ok(handle) => {
+                self.pumps.insert(key, handle.clone());
+                Ok(handle)
+            }
+            Err(e) => {
+                // Do not cache a dead entry for a topic the source no
+                // longer creates pumps for.
+                self.pumps.remove(&key);
+                Err(e)
+            }
+        }
+    }
+
+    /// Drop the map entry for a pump that turned out to be unusable —
+    /// but only while it is still the entry, so a replacement installed
+    /// by a concurrent subscribe survives.
+    fn forget(&mut self, topic: &str, partition: i32, stale: &PumpHandle) {
+        let key = (topic.to_owned(), partition);
+        if self
+            .pumps
+            .get(&key)
+            .is_some_and(|current| current.same_pump(stale))
+        {
+            self.pumps.remove(&key);
         }
     }
 
@@ -236,6 +279,46 @@ impl<F: SourceFactory> Hub<F> {
     /// The pumps currently running.
     pub fn active_partitions(&self) -> impl Iterator<Item = (&str, i32)> {
         self.pumps.keys().map(|(t, p)| (t.as_str(), *p))
+    }
+}
+
+/// Where one partition of a topic-level subscription starts.
+fn partition_position(position: &TopicPosition, partition: i32) -> Position {
+    match position {
+        TopicPosition::Earliest => Position::Earliest,
+        TopicPosition::Latest => Position::Latest,
+        // Absent from the cursor = never seen: replay from the start
+        // rather than risk losing records.
+        TopicPosition::Offsets(cursor) => cursor
+            .get(&partition)
+            .map_or(Position::Earliest, |next| Position::Offset(*next)),
+    }
+}
+
+/// Fold per-partition subscriptions into one merged stream, one
+/// forwarder task each.
+fn merge(
+    topic: &str,
+    partitions: Vec<i32>,
+    subscriptions: Vec<Subscription>,
+    capacity: usize,
+) -> TopicSubscription {
+    let (merged, receiver) = mpsc::channel(capacity);
+    for subscription in subscriptions {
+        let merged = merged.clone();
+        tokio::spawn(async move {
+            let mut receiver = subscription.into_receiver();
+            while let Some(item) = receiver.recv().await {
+                if merged.send(item).await.is_err() {
+                    return; // merged stream dropped
+                }
+            }
+        });
+    }
+    TopicSubscription {
+        topic: topic.to_owned(),
+        partitions,
+        receiver,
     }
 }
 
@@ -290,7 +373,12 @@ impl<F: SourceFactory> SharedHub<F> {
         }
     }
 
-    /// [`Hub::subscribe`], serialized behind the lock.
+    /// [`Hub::subscribe`], with the lock held only over the pump map.
+    ///
+    /// The subscribe round trip itself runs unlocked, so a pump parked
+    /// in a long poll delays this caller alone. The lock does span the
+    /// *first* subscribe to a partition (creating the pump), which is
+    /// what keeps two callers from racing two pumps onto one partition.
     pub async fn subscribe(
         &self,
         topic: &str,
@@ -298,25 +386,95 @@ impl<F: SourceFactory> SharedHub<F> {
         position: Position,
         filter: Filter,
     ) -> Result<Subscription, HubError> {
-        self.hub
-            .lock()
-            .await
-            .subscribe(topic, partition, position, filter)
-            .await
+        let (handle, created) = self.hub.lock().await.acquire(topic, partition).await?;
+        match handle.subscribe(position, filter.clone()).await {
+            Ok(sub) => Ok(sub),
+            Err(HubError::PumpClosed) if !created => {
+                let handle = self
+                    .hub
+                    .lock()
+                    .await
+                    .respawn(topic, partition, &handle)
+                    .await?;
+                match handle.subscribe(position, filter).await {
+                    Ok(sub) => Ok(sub),
+                    Err(e) => {
+                        self.hub.lock().await.forget(topic, partition, &handle);
+                        Err(e)
+                    }
+                }
+            }
+            Err(e) => {
+                if created {
+                    self.hub.lock().await.forget(topic, partition, &handle);
+                    handle.shutdown().await;
+                }
+                Err(e)
+            }
+        }
     }
 
-    /// [`Hub::subscribe_topic`], serialized behind the lock.
+    /// [`Hub::subscribe_topic`], with the per-partition round trips run
+    /// concurrently and unlocked: a P-partition topic costs one pump
+    /// round trip, not P of them in series behind the hub's lock.
     pub async fn subscribe_topic(
         &self,
         topic: &str,
         position: TopicPosition,
         filter: Filter,
     ) -> Result<TopicSubscription, HubError> {
-        self.hub
-            .lock()
-            .await
-            .subscribe_topic(topic, position, filter)
-            .await
+        let partitions = self.hub.lock().await.partitions_of(topic).await?;
+        let mut handles = Vec::with_capacity(partitions.len());
+        let capacity = {
+            let mut hub = self.hub.lock().await;
+            for partition in &partitions {
+                handles.push(hub.acquire(topic, *partition).await?);
+            }
+            hub.config.queue_capacity
+        };
+
+        let mut pending = Vec::with_capacity(handles.len());
+        for ((handle, created), partition) in handles.into_iter().zip(&partitions) {
+            let start = partition_position(&position, *partition);
+            let filter = filter.clone();
+            let partition = *partition;
+            pending.push(tokio::spawn(async move {
+                let result = handle.subscribe(start, filter).await;
+                (partition, created, handle, result)
+            }));
+        }
+
+        let mut subscriptions = Vec::with_capacity(pending.len());
+        let mut retry = Vec::new();
+        for task in pending {
+            let (partition, created, handle, result) =
+                task.await.map_err(|_| HubError::PumpClosed)?;
+            match result {
+                Ok(subscription) => subscriptions.push(subscription),
+                Err(e) if created => {
+                    // A pump this call created and that refused its
+                    // first subscriber leaves no entry behind.
+                    self.hub.lock().await.forget(topic, partition, &handle);
+                    handle.shutdown().await;
+                    return Err(e);
+                }
+                // The pump closed between the lookup and the round trip
+                // (died, or exited idle): the single-partition path
+                // knows how to replace it, and this is rare enough to
+                // do one at a time.
+                Err(HubError::PumpClosed) => retry.push(partition),
+                Err(e) => return Err(e),
+            }
+        }
+        for partition in retry {
+            let start = partition_position(&position, partition);
+            subscriptions.push(
+                self.subscribe(topic, partition, start, filter.clone())
+                    .await?,
+            );
+        }
+
+        Ok(merge(topic, partitions, subscriptions, capacity))
     }
 
     /// [`Hub::shutdown`]: stop every pump and refuse further

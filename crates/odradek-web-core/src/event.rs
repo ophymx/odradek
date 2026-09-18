@@ -1,6 +1,9 @@
 //! The web-shaped view of a Kafka record, and how subscribers select
 //! where to start and what to see.
 
+use std::ops::Deref;
+use std::sync::{Arc, OnceLock};
+
 use bytes::Bytes;
 
 /// One record, self-describing enough for a web client to resume from:
@@ -17,6 +20,78 @@ pub struct Event {
     pub value: Option<Bytes>,
     pub headers: Vec<(String, Option<Bytes>)>,
 }
+
+/// One [`Event`] as every subscriber of a partition sees it: a shared
+/// handle, so fanning an event out to N subscribers costs N refcount
+/// bumps rather than N deep copies of its topic, key, value, and
+/// headers.
+///
+/// It derefs to the [`Event`], so `event.offset` and friends read the
+/// same as before. Its JSON rendering ([`SharedEvent::json`]) is
+/// computed by whichever subscriber gets there first and reused by the
+/// rest — the wire form of one event is built once, not once per
+/// subscriber.
+#[derive(Debug, Clone)]
+pub struct SharedEvent(Arc<Shared>);
+
+#[derive(Debug)]
+struct Shared {
+    event: Event,
+    json: OnceLock<Bytes>,
+}
+
+impl SharedEvent {
+    pub fn new(event: Event) -> SharedEvent {
+        SharedEvent(Arc::new(Shared {
+            event,
+            json: OnceLock::new(),
+        }))
+    }
+
+    /// The event itself.
+    pub fn event(&self) -> &Event {
+        &self.0.event
+    }
+
+    /// The event's JSON body (the shape [`event_json`](crate::json::event_json)
+    /// describes), rendered on first use and shared from then on.
+    pub fn json(&self) -> &str {
+        // Rendered by `serde_json`, so this is UTF-8 by construction.
+        std::str::from_utf8(self.json_bytes()).expect("rendered json is utf-8")
+    }
+
+    /// The same rendering as raw bytes, for transports that can send a
+    /// shared buffer without copying it.
+    pub fn json_bytes(&self) -> &Bytes {
+        self.0
+            .json
+            .get_or_init(|| crate::json::event_json_bytes(&self.0.event))
+    }
+}
+
+impl Deref for SharedEvent {
+    type Target = Event;
+
+    fn deref(&self) -> &Event {
+        &self.0.event
+    }
+}
+
+impl From<Event> for SharedEvent {
+    fn from(event: Event) -> SharedEvent {
+        SharedEvent::new(event)
+    }
+}
+
+/// Two handles are equal when their events are: the cached rendering is
+/// derived state, never identity.
+impl PartialEq for SharedEvent {
+    fn eq(&self, other: &SharedEvent) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.0.event == other.0.event
+    }
+}
+
+impl Eq for SharedEvent {}
 
 /// Where a subscription starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +178,20 @@ mod tests {
         assert!(filter.matches(&event(Some(b"user:42"), Vec::new())));
         assert!(!filter.matches(&event(Some(b"order:42"), Vec::new())));
         assert!(!filter.matches(&event(None, Vec::new())));
+    }
+
+    /// The point of the handle: clones share one buffer, so the JSON is
+    /// rendered for the first subscriber that asks and nobody else.
+    #[test]
+    fn clones_share_one_rendering() {
+        let first = SharedEvent::new(event(Some(b"k"), Vec::new()));
+        let second = first.clone();
+        assert_eq!(first.json(), second.json());
+        assert!(
+            std::ptr::eq(first.json_bytes(), second.json_bytes()),
+            "each clone rendered its own copy"
+        );
+        assert_eq!(first.offset, 0, "deref reaches the event's fields");
     }
 
     #[test]

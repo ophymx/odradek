@@ -7,7 +7,10 @@
 //! a [`Subscription`]; the hard parts live here:
 //!
 //! - **Fan-out**: one [`pump`](pump::PumpHandle) per (topic, partition)
-//!   owns the Kafka connection; any number of subscribers share it.
+//!   owns the Kafka connection; any number of subscribers share it —
+//!   and share the events themselves, as [`SharedEvent`] handles that
+//!   carry the record's JSON rendering with them, computed once however
+//!   many subscribers ask for it.
 //! - **Replay**: subscribers start [`Earliest`](Position::Earliest),
 //!   [`Latest`](Position::Latest), or at an exact offset — and every
 //!   [`Event`] carries its offset, so `offset + 1` is a natural resume
@@ -37,9 +40,9 @@ pub mod params;
 pub mod pump;
 pub mod source;
 
-pub use event::{Event, Filter, Position, TopicPosition};
+pub use event::{Event, Filter, Position, SharedEvent, TopicPosition};
 pub use hub::{Hub, Rejection, SharedHub, TopicSubscription};
-pub use json::event_json;
+pub use json::{event_json, event_json_bytes};
 pub use memory::{MemoryFactory, MemoryLog};
 pub use params::StreamParams;
 pub use pump::{

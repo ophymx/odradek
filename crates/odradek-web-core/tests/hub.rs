@@ -7,8 +7,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use odradek_web_core::memory::{MemoryFactory, MemoryLog};
 use odradek_web_core::{
-    Filter, Hub, HubError, Position, PumpConfig, PumpHandle, RecordSource, SourceBatch,
-    SourceError, SourceErrorKind, Subscription,
+    Filter, Hub, HubError, Position, PumpConfig, PumpHandle, RecordSource, SharedHub, SourceBatch,
+    SourceError, SourceErrorKind, SourceFactory, Subscription,
 };
 
 const TOPIC: &str = "bridge";
@@ -29,6 +29,53 @@ async fn collect(sub: &mut Subscription, n: usize) -> Vec<(i64, String)> {
         out.push((event.offset, value));
     }
     out
+}
+
+/// A source whose every fetch is slow, the way a broker parked in a
+/// long poll is: anything that waits on this pump waits a whole poll.
+struct SlowSource {
+    poll: Duration,
+}
+
+impl RecordSource for SlowSource {
+    async fn fetch(
+        &mut self,
+        _topic: &str,
+        _partition: i32,
+        offset: i64,
+    ) -> Result<SourceBatch, SourceError> {
+        tokio::time::sleep(self.poll).await;
+        Ok(SourceBatch {
+            events: Vec::new(),
+            next_offset: offset,
+            high_watermark: offset,
+        })
+    }
+
+    async fn earliest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
+        Ok(0)
+    }
+
+    async fn latest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
+        Ok(0)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SlowFactory {
+    poll: Duration,
+}
+
+impl SourceFactory for SlowFactory {
+    type Source = SlowSource;
+
+    async fn create(&self, _topic: &str, _partition: i32) -> Result<SlowSource, SourceError> {
+        Ok(SlowSource { poll: self.poll })
+    }
+
+    async fn partitions(&self, _topic: &str) -> Result<Vec<i32>, SourceError> {
+        Ok(vec![0, 1, 2])
+    }
 }
 
 /// A source that fails every call with one fixed error.
@@ -175,6 +222,39 @@ async fn slow_subscriber_loses_nothing() {
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
     assert_eq!(seen, (0..50).collect::<Vec<_>>());
+}
+
+/// Catch-up takes turns: with several subscribers past the ring, the
+/// pump's one-fetch-per-iteration budget rotates, so none of them is
+/// starved by the others and each still sees every offset in order.
+#[tokio::test]
+async fn several_slow_subscribers_all_catch_up() {
+    let log = MemoryLog::new();
+    let mut config = PumpConfig::default();
+    config.queue_capacity = 2;
+    config.ring_capacity = 4; // everyone falls out of the ring
+    let pump = pump_for(&log, config);
+
+    let mut subs = Vec::new();
+    for _ in 0..3 {
+        subs.push(
+            pump.subscribe(Position::Earliest, Filter::default())
+                .await
+                .unwrap(),
+        );
+    }
+    for i in 0..40 {
+        log.append(TOPIC, 0, None, format!("v{i}").as_bytes(), Vec::new());
+    }
+
+    for (which, sub) in subs.iter_mut().enumerate() {
+        let seen: Vec<i64> = collect(sub, 40).await.into_iter().map(|(o, _)| o).collect();
+        assert_eq!(
+            seen,
+            (0..40).collect::<Vec<_>>(),
+            "subscriber {which} lost or reordered events"
+        );
+    }
 }
 
 #[tokio::test]
@@ -407,6 +487,69 @@ async fn hub_shutdown_closes_streams_and_refuses_new_subscribes() {
         .subscribe(TOPIC, 0, Position::Latest, Filter::default())
         .await;
     assert!(matches!(result, Err(HubError::ShutDown)), "{result:?}");
+}
+
+/// The reconnect-storm shape: many clients subscribing at once to a
+/// pump that is inside a long poll. The hub's lock covers the pump map,
+/// not the round trip, so they all wait *one* poll rather than queueing
+/// one poll behind another.
+#[tokio::test]
+async fn concurrent_subscribes_do_not_queue_behind_a_slow_pump() {
+    let poll = Duration::from_millis(200);
+    let hub = std::sync::Arc::new(SharedHub::new(SlowFactory { poll }, PumpConfig::default()));
+    // The pump exists and is now inside a fetch.
+    let _first = hub
+        .subscribe(TOPIC, 0, Position::Latest, Filter::default())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let clients = 10;
+    let start = std::time::Instant::now();
+    let mut joined = Vec::new();
+    for _ in 0..clients {
+        let hub = std::sync::Arc::clone(&hub);
+        joined.push(tokio::spawn(async move {
+            hub.subscribe(TOPIC, 0, Position::Latest, Filter::default())
+                .await
+        }));
+    }
+    for task in joined {
+        task.await.unwrap().expect("subscribe should succeed");
+    }
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < poll * 3,
+        "{clients} concurrent subscribes took {elapsed:?}: they serialized behind the pump"
+    );
+}
+
+/// Topic-level subscribes fan out across partitions at once, so a
+/// P-partition topic costs about one pump round trip, not P.
+#[tokio::test]
+async fn topic_subscribe_runs_partition_round_trips_concurrently() {
+    use odradek_web_core::TopicPosition;
+
+    let poll = Duration::from_millis(200);
+    let hub = SharedHub::new(SlowFactory { poll }, PumpConfig::default());
+    // Warm the pumps so the measured call is round trips, not spawns.
+    let _warm = hub
+        .subscribe_topic(TOPIC, TopicPosition::Latest, Filter::default())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let start = std::time::Instant::now();
+    let sub = hub
+        .subscribe_topic(TOPIC, TopicPosition::Latest, Filter::default())
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(sub.partitions(), &[0, 1, 2]);
+    assert!(
+        elapsed < poll * 2,
+        "3 partitions took {elapsed:?}: their round trips ran in series"
+    );
 }
 
 /// A gated topic fails before any pump or source exists; ungated

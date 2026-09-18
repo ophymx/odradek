@@ -42,6 +42,15 @@ impl MemoryLog {
         }
     }
 
+    /// Events returned per fetch (default 3, small on purpose so
+    /// catch-up takes several rounds). Raise it for throughput work
+    /// where the fetch count, not the fan-out, would dominate.
+    #[must_use]
+    pub fn with_batch_limit(mut self, limit: usize) -> MemoryLog {
+        self.batch_limit = limit.max(1);
+        self
+    }
+
     /// Append one record to `partition`; returns its offset.
     pub fn append(
         &self,

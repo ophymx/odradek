@@ -12,7 +12,9 @@
 //! ```
 //!
 //! Each record arrives as one JSON text frame (the same shape as the
-//! SSE transport's `data`), carrying its partition and offset.
+//! SSE transport's `data`), carrying its partition and offset. That
+//! JSON is rendered once per record and shared by every socket reading
+//! the partition, so a frame costs each socket a refcount bump.
 //! WebSocket has no `Last-Event-ID`, so resume is explicit: reconnect
 //! with the resume token — `from=<next offset>` (partition streams) or
 //! `from=<partition:next_offset,...>` (topic streams). Tokens mean
@@ -37,13 +39,12 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::get;
 
-use odradek_web_core::json::event_json;
 use odradek_web_core::pump::{StreamError, StreamItem};
 use odradek_web_core::{Hub, Rejection, RejectionKind, SharedHub, SourceErrorKind, StreamParams};
 
@@ -177,8 +178,12 @@ async fn stream_events(mut socket: WebSocket, mut events: tokio::sync::mpsc::Rec
         tokio::select! {
             item = events.recv() => match item {
                 Some(Ok(event)) => {
-                    let frame = Message::Text(event_json(&event).to_string().into());
-                    if socket.send(frame).await.is_err() {
+                    // The JSON is rendered once per event, by whichever
+                    // socket gets there first; this is a refcount bump
+                    // plus the UTF-8 check `Utf8Bytes` insists on.
+                    let body = Utf8Bytes::try_from(event.json_bytes().clone())
+                        .expect("rendered json is utf-8");
+                    if socket.send(Message::Text(body)).await.is_err() {
                         return;
                     }
                 }

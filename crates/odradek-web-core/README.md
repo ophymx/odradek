@@ -5,11 +5,18 @@ subscribers.
 
 One pump per (topic, partition) fans out to any number of subscribers,
 each starting from earliest, latest, or a specific offset, with
-per-subscriber filters (key prefix, header match). Backpressure is
+per-subscriber filters (key prefix, header match). Fan-out is by shared
+handle: an event is read once, rendered as JSON at most once, and
+delivered to every subscriber as a refcount bump. Backpressure is
 self-healing: a slow subscriber falls out of the live path into
 catch-up — served from an in-memory ring, or from Kafka past it — and
 rejoins as it drains. Offset order, no gaps, no duplicates, at any
 subscriber speed.
+
+Catch-up past the ring is scheduled, at most one fetch per pump
+iteration, taking turns: laggards cannot put an unbounded queue of
+broker round trips in front of the live path, at the cost of replaying
+more slowly the more of them there are.
 
 This crate is the engine; transports are thin layers on top:
 
