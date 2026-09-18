@@ -226,11 +226,19 @@ impl Cluster {
     }
 
     /// The shared state; the guard must never live across an `.await`.
+    /// The shared state, ignoring lock poisoning.
+    ///
+    /// Poisoning means some thread panicked while holding this lock, not
+    /// that the map inside it is unusable — every critical section here
+    /// is a few inserts and lookups. Propagating the poison would matter
+    /// more than the panic did: [`BrokerLease`] settles its outstanding
+    /// count in `Drop`, so a panicking guard would panic again while
+    /// unwinding, and a panic during unwind aborts the process.
     fn state(&self) -> MutexGuard<'_, State> {
         self.inner
             .state
             .lock()
-            .expect("cluster state lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Fetch metadata for `topics` through the control-plane connection

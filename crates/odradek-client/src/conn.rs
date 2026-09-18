@@ -113,9 +113,21 @@ struct Shared {
 }
 
 impl Shared {
+    /// The in-flight table, ignoring lock poisoning.
+    ///
+    /// A panic while holding this lock leaves the map itself intact, and
+    /// refusing to look at it afterwards costs more than the panic did:
+    /// `fail_all` runs from `Inner::drop`, so propagating the poison
+    /// would panic while unwinding, which aborts.
+    fn in_flight(&self) -> std::sync::MutexGuard<'_, HashMap<i32, Pending>> {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn fail_all(&self) {
         self.closed.store(true, Ordering::SeqCst);
-        let pending = std::mem::take(&mut *self.in_flight.lock().unwrap());
+        let pending = std::mem::take(&mut *self.in_flight());
         for (_, p) in pending {
             let _ = p.reply.send(Err(ClientError::ConnectionClosed));
         }
@@ -213,6 +225,22 @@ impl Connection {
     /// matching response body. The request/response headers and framing are
     /// handled here.
     ///
+    /// # Cancellation
+    ///
+    /// Dropping this future is allowed and leaves nothing registered. It
+    /// is not free: if the drop lands while the request is still being
+    /// written, part of a frame is already on the socket, and no later
+    /// write can fix that — the peer would read it as the rest of the
+    /// truncated frame. The connection is therefore failed, exactly as a
+    /// timeout fails it, and every caller waiting on it gets
+    /// [`ClientError::ConnectionClosed`].
+    ///
+    /// So `select!` on this freely, but treat a cancelled request as
+    /// having cost the connection rather than just the request. The
+    /// blocking pool already assumes this: [`BrokerLease`](crate::cluster::BrokerLease) hands a
+    /// connection back only on an explicit `release`, so a lease dropped
+    /// by cancellation discards it instead of returning it for reuse.
+    ///
     /// The wait is bounded by [`crate::ClientConfig::request_timeout`]. A
     /// request that blows it fails with [`ClientError::Timeout`] and closes
     /// the connection: the broker answers a connection's requests strictly
@@ -268,29 +296,88 @@ impl Connection {
         })?;
 
         let (reply_tx, reply_rx) = oneshot::channel();
-        inner.shared.in_flight.lock().unwrap().insert(
+        inner.shared.in_flight().insert(
             correlation_id,
             Pending {
                 response_header_version: resp_header_version,
                 reply: reply_tx,
             },
         );
+        // From here on this future may be dropped at any await —
+        // `select!`, an outer timeout, a caller that goes away. Both
+        // guards below exist because a dropped future runs no more of
+        // this function, so cleanup cannot live at the end of it.
+        let mut registered = InFlightGuard {
+            shared: &inner.shared,
+            correlation_id,
+            armed: true,
+        };
 
         // Register-then-write: the response cannot beat the table entry.
         {
             let mut writer = inner.writer.lock().await;
-            if let Err(e) = writer.write_all(&framed).await {
-                inner
-                    .shared
-                    .in_flight
-                    .lock()
-                    .unwrap()
-                    .remove(&correlation_id);
+            let mut writing = WriteGuard {
+                shared: &inner.shared,
+                armed: true,
+            };
+            let result = writer.write_all(&framed).await;
+            writing.armed = false;
+            if let Err(e) = result {
                 return Err(e.into());
             }
         }
 
-        reply_rx.await.map_err(|_| ClientError::ConnectionClosed)?
+        let response = reply_rx.await.map_err(|_| ClientError::ConnectionClosed)?;
+        registered.armed = false;
+        response
+    }
+}
+
+/// Removes a request's in-flight entry if its future is dropped before
+/// the response arrives.
+///
+/// Without this the entry outlives the caller: correlation ids are
+/// never reused, so nothing is misrouted, but a long-lived connection
+/// whose callers give up in a loop accumulates one entry and one
+/// oneshot sender per attempt, for as long as the connection lives.
+struct InFlightGuard<'a> {
+    shared: &'a Shared,
+    correlation_id: i32,
+    armed: bool,
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.shared.in_flight().remove(&self.correlation_id);
+        }
+    }
+}
+
+/// Fails the connection if a frame write is abandoned part-way.
+///
+/// `write_all` is not cancellation-safe and cannot be: it loops over
+/// `write`, so a future dropped in the middle has already put some
+/// bytes on the socket. Those bytes are a truncated frame, and the peer
+/// will read whatever is written next as its continuation — every later
+/// request on this connection is then parsed against the wrong
+/// boundary. Nothing about the connection looks wrong from the outside,
+/// which is what makes it worth failing loudly: the alternative is a
+/// connection that stays in a cache and quietly corrupts everything
+/// sent through it.
+///
+/// This mirrors what the request timeout already does, and for the same
+/// reason.
+struct WriteGuard<'a> {
+    shared: &'a Shared,
+    armed: bool,
+}
+
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.shared.fail_all();
+        }
     }
 }
 
@@ -405,7 +492,7 @@ async fn read_response(read_half: &mut ReadHalf, shared: &Shared) -> Result<(), 
     // decode the header at the version recorded for that request.
     let correlation_id = frame::peek_correlation_id(&frame)
         .map_err(|e| ClientError::ProtocolViolation(format!("short response header: {e}")))?;
-    let pending = shared.in_flight.lock().unwrap().remove(&correlation_id);
+    let pending = shared.in_flight().remove(&correlation_id);
     let Some(pending) = pending else {
         return Err(ClientError::ProtocolViolation(format!(
             "response with unknown correlation id {correlation_id}"
@@ -461,5 +548,83 @@ mod tests {
         writer.await.unwrap();
         assert_eq!(body.len(), len);
         assert!(body.iter().all(|b| *b == 7));
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+    use crate::ClientConfig;
+
+    /// A listener that accepts and then does nothing, so a request sent
+    /// to it is never answered.
+    async fn silent_broker() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream); // keep it open, never reply
+            }
+        });
+        (addr, handle)
+    }
+
+    /// Dropping a request future must not leave its correlation id in
+    /// the in-flight table: the entry would outlive the caller, and a
+    /// connection whose callers time out in a loop would grow one
+    /// entry per attempt for as long as it lives.
+    #[tokio::test]
+    async fn a_dropped_request_leaves_no_in_flight_entry() {
+        let (addr, server) = silent_broker().await;
+        let conn = Connection::connect(&addr, &ClientConfig::default())
+            .await
+            .unwrap();
+
+        for _ in 0..5 {
+            let pending = conn.request(18, 0, b"body");
+            tokio::pin!(pending);
+            // Let it register and write, then give up on it.
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(50), &mut pending).await;
+            // Leaving the loop body is what drops the future; calling
+            // `drop` on the name would only drop the `Pin<&mut _>` that
+            // `tokio::pin!` rebound it to.
+        }
+
+        let left = conn.inner.shared.in_flight().len();
+        assert_eq!(left, 0, "{left} cancelled request(s) still registered");
+        server.abort();
+    }
+
+    /// A request cancelled *while writing* has put part of a frame on
+    /// the wire. The peer will read whatever is written next as the
+    /// rest of that frame, so the connection is no longer usable — and
+    /// nothing about it looks wrong from the outside. It has to fail
+    /// closed.
+    #[tokio::test]
+    async fn a_request_cancelled_mid_write_poisons_the_connection() {
+        let (addr, server) = silent_broker().await;
+        let conn = Connection::connect(&addr, &ClientConfig::default())
+            .await
+            .unwrap();
+
+        // Far more than loopback socket buffers absorb, against a peer
+        // that never reads: write_all is guaranteed to be mid-frame.
+        let body = vec![0u8; 16 << 20];
+        {
+            let pending = conn.request(18, 0, &body);
+            tokio::pin!(pending);
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(200), &mut pending).await;
+            // The future is dropped by leaving this scope, not by
+            // `drop(pending)` -- `tokio::pin!` rebinds the name to a
+            // `Pin<&mut _>`, so dropping that drops the borrow and
+            // leaves the future itself alive on the stack.
+        }
+
+        assert!(
+            conn.inner.shared.closed.load(Ordering::SeqCst),
+            "connection still accepting requests after a truncated frame"
+        );
+        server.abort();
     }
 }
