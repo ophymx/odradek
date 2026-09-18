@@ -6,7 +6,7 @@
 //!
 //! The wire path is [`event_json_bytes`]: it serializes an event
 //! straight into a byte buffer, with no `serde_json::Value` in between.
-//! Transports do not call it directly — [`SharedEvent::json`] renders
+//! Transports do not call it directly — [`crate::event::SharedEvent::json`] renders
 //! once per *event* and every subscriber reuses that buffer.
 //! [`event_json`] builds the same object as a `serde_json::Value`, for
 //! callers that want to inspect or reshape it.
@@ -24,7 +24,7 @@ pub fn event_json(event: &Event) -> serde_json::Value {
 }
 
 /// One event as the JSON bytes a web client receives — the rendering
-/// [`SharedEvent::json`] caches.
+/// [`crate::event::SharedEvent::json`] caches.
 pub fn event_json_bytes(event: &Event) -> Bytes {
     Bytes::from(serde_json::to_vec(&EventJson(event)).expect("event json is representable"))
 }
