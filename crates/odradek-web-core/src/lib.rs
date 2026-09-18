@@ -22,6 +22,15 @@
 //!   itself past the ring) and rejoins as it drains. Delivery is in
 //!   offset order with no gaps and no duplicates, at every speed.
 //!
+//! - **Bounded by default**: a [`Hub`] serves no topic until its gate
+//!   says which ([`Hub::with_topic_gate`] or the explicit
+//!   [`Hub::allow_all_topics`]), a subscribe to a topic or partition
+//!   the source does not have is refused before anything is allocated
+//!   for it, pumps whose task has exited are evicted rather than
+//!   retained, and [`Hub::with_max_pumps`] caps how many can run at
+//!   once. See the [`hub`] module docs for what that bounds and what
+//!   it costs.
+//!
 //! The engine reads through the [`RecordSource`] trait, so it tests
 //! against an in-memory log; [`KafkaSource`] adapts
 //! [`odradek_client::Consumer`] for production.
@@ -41,7 +50,7 @@ pub mod pump;
 pub mod source;
 
 pub use event::{Event, Filter, Position, SharedEvent, TopicPosition};
-pub use hub::{Hub, Rejection, SharedHub, TopicSubscription};
+pub use hub::{DEFAULT_MAX_PUMPS, Hub, Rejection, SharedHub, TopicSubscription};
 pub use json::{event_json, event_json_bytes};
 pub use memory::{MemoryFactory, MemoryLog};
 pub use params::StreamParams;

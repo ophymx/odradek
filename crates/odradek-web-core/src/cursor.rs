@@ -7,15 +7,24 @@
 //! as `from=` (WebSocket), so a reconnecting client resumes loss-free.
 
 use std::collections::BTreeMap;
+use std::fmt::Write;
+
+/// The bytes one `partition:next_offset` pair can take: two decimal
+/// i64s, a colon, and the separator.
+const PAIR_BYTES: usize = 44;
 
 /// Render a cursor (deterministic order: sorted by partition).
+///
+/// A topic stream re-renders this per event, so it writes the pairs
+/// into one buffer rather than allocating a `String` per pair.
 pub fn encode(cursor: &BTreeMap<i32, i64>) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(cursor.len() * PAIR_BYTES);
     for (partition, next_offset) in cursor {
         if !out.is_empty() {
             out.push(',');
         }
-        out.push_str(&format!("{partition}:{next_offset}"));
+        // Writing to a String cannot fail.
+        let _ = write!(out, "{partition}:{next_offset}");
     }
     out
 }

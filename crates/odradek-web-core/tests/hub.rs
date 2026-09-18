@@ -259,8 +259,9 @@ async fn several_slow_subscribers_all_catch_up() {
 
 #[tokio::test]
 async fn hub_runs_one_pump_per_partition() {
-    let log = MemoryLog::new();
-    let mut hub = Hub::new(MemoryFactory::new(log.clone()), PumpConfig::default());
+    let log = MemoryLog::with_partitions(2);
+    let mut hub =
+        Hub::new(MemoryFactory::new(log.clone()), PumpConfig::default()).allow_all_topics();
 
     let mut a = hub
         .subscribe(TOPIC, 0, Position::Latest, Filter::default())
@@ -289,7 +290,8 @@ async fn topic_subscribe_merges_partitions_in_partition_order() {
     for i in 0..4 {
         log.append(TOPIC, i % 3, None, format!("v{i}").as_bytes(), Vec::new());
     }
-    let mut hub = Hub::new(MemoryFactory::new(log.clone()), PumpConfig::default());
+    let mut hub =
+        Hub::new(MemoryFactory::new(log.clone()), PumpConfig::default()).allow_all_topics();
     let mut sub = hub
         .subscribe_topic(TOPIC, TopicPosition::Earliest, Filter::default())
         .await
@@ -334,7 +336,8 @@ async fn topic_cursor_resumes_seen_partitions_and_replays_unseen() {
         log.append(TOPIC, 0, None, format!("p0-{i}").as_bytes(), Vec::new());
         log.append(TOPIC, 1, None, format!("p1-{i}").as_bytes(), Vec::new());
     }
-    let mut hub = Hub::new(MemoryFactory::new(log.clone()), PumpConfig::default());
+    let mut hub =
+        Hub::new(MemoryFactory::new(log.clone()), PumpConfig::default()).allow_all_topics();
 
     // The cursor names partition 0 only: resume it at 2, replay
     // partition 1 from the start (absent = never seen).
@@ -441,7 +444,7 @@ async fn hub_respawns_idle_exited_pumps() {
     let log = MemoryLog::new();
     let mut config = PumpConfig::default();
     config.idle_shutdown = Some(Duration::from_millis(50));
-    let mut hub = Hub::new(MemoryFactory::new(log.clone()), config);
+    let mut hub = Hub::new(MemoryFactory::new(log.clone()), config).allow_all_topics();
 
     let sub = hub
         .subscribe(TOPIC, 0, Position::Latest, Filter::default())
@@ -469,7 +472,8 @@ async fn hub_respawns_idle_exited_pumps() {
 #[tokio::test]
 async fn hub_shutdown_closes_streams_and_refuses_new_subscribes() {
     let log = MemoryLog::new();
-    let mut hub = Hub::new(MemoryFactory::new(log.clone()), PumpConfig::default());
+    let mut hub =
+        Hub::new(MemoryFactory::new(log.clone()), PumpConfig::default()).allow_all_topics();
     let mut sub = hub
         .subscribe(TOPIC, 0, Position::Latest, Filter::default())
         .await
@@ -496,7 +500,9 @@ async fn hub_shutdown_closes_streams_and_refuses_new_subscribes() {
 #[tokio::test]
 async fn concurrent_subscribes_do_not_queue_behind_a_slow_pump() {
     let poll = Duration::from_millis(200);
-    let hub = std::sync::Arc::new(SharedHub::new(SlowFactory { poll }, PumpConfig::default()));
+    let hub = std::sync::Arc::new(SharedHub::from_hub(
+        Hub::new(SlowFactory { poll }, PumpConfig::default()).allow_all_topics(),
+    ));
     // The pump exists and is now inside a fetch.
     let _first = hub
         .subscribe(TOPIC, 0, Position::Latest, Filter::default())
@@ -531,7 +537,9 @@ async fn topic_subscribe_runs_partition_round_trips_concurrently() {
     use odradek_web_core::TopicPosition;
 
     let poll = Duration::from_millis(200);
-    let hub = SharedHub::new(SlowFactory { poll }, PumpConfig::default());
+    let hub = SharedHub::from_hub(
+        Hub::new(SlowFactory { poll }, PumpConfig::default()).allow_all_topics(),
+    );
     // Warm the pumps so the measured call is round trips, not spawns.
     let _warm = hub
         .subscribe_topic(TOPIC, TopicPosition::Latest, Filter::default())
@@ -591,7 +599,7 @@ async fn topic_gate_denies_before_any_pump_is_created() {
 async fn unknown_topic_fails_not_found_without_leaking_a_pump_entry() {
     let log = MemoryLog::new();
     let factory = MemoryFactory::new(log.clone()).known_topics([TOPIC]);
-    let mut hub = Hub::new(factory, PumpConfig::default());
+    let mut hub = Hub::new(factory, PumpConfig::default()).allow_all_topics();
 
     let result = hub
         .subscribe("ghost", 0, Position::Latest, Filter::default())
@@ -620,4 +628,170 @@ async fn unknown_topic_fails_not_found_without_leaking_a_pump_entry() {
         .unwrap();
     log.append(TOPIC, 0, None, b"real", Vec::new());
     assert_eq!(collect(&mut sub, 1).await, vec![(0, "real".into())]);
+}
+
+/// The pump map is not a place anonymous requests can put things.
+///
+/// `Position::Latest` — the default — needs no source call, and the
+/// partition index is a free `i32` from the request path, so a hub that
+/// inserted before validating would retain one entry per made-up
+/// partition *of an allowed topic*, forever: the gate cannot see this
+/// dimension at all. 1000 such requests here; the ceiling is the
+/// topic's real partition count, which is 2.
+#[tokio::test]
+async fn unknown_partitions_never_reach_the_pump_map() {
+    let log = MemoryLog::with_partitions(2);
+    let factory = MemoryFactory::new(log.clone()).known_topics([TOPIC]);
+    let mut hub = Hub::new(factory, PumpConfig::default()).allow_all_topics();
+
+    for partition in 2..502 {
+        let result = hub
+            .subscribe(TOPIC, partition, Position::Latest, Filter::default())
+            .await;
+        match result {
+            Err(HubError::Source(e)) => assert_eq!(e.kind, SourceErrorKind::NotFound),
+            other => panic!("partition {partition} should be NotFound, got {other:?}"),
+        }
+    }
+    // The same for a topic that does not exist at all, on the default
+    // position — the path that used to answer 200 and then die.
+    for partition in 0..500 {
+        let result = hub
+            .subscribe("ghost", partition, Position::Latest, Filter::default())
+            .await;
+        assert!(result.is_err(), "unknown topic should not subscribe");
+    }
+    assert_eq!(
+        hub.active_partitions().count(),
+        0,
+        "1000 requests for partitions that do not exist retained pump entries"
+    );
+
+    // Real partitions of the same topic still work.
+    let mut sub = hub
+        .subscribe(TOPIC, 1, Position::Latest, Filter::default())
+        .await
+        .unwrap();
+    log.append(TOPIC, 1, None, b"real", Vec::new());
+    assert_eq!(collect(&mut sub, 1).await, vec![(0, "real".into())]);
+    assert_eq!(hub.active_partitions().count(), 1);
+}
+
+/// A pump that dies does not keep its slot: the entry is evicted, not
+/// retained until something happens to subscribe to that partition
+/// again.
+#[tokio::test]
+async fn exited_pumps_are_evicted_from_the_map() {
+    #[derive(Debug, Clone, Copy)]
+    struct DyingFactory;
+
+    impl SourceFactory for DyingFactory {
+        type Source = FailingSource;
+
+        async fn create(
+            &self,
+            _topic: &str,
+            _partition: i32,
+        ) -> Result<FailingSource, SourceError> {
+            Ok(FailingSource {
+                error: SourceError::not_found("the topic went away"),
+            })
+        }
+
+        async fn partitions(&self, _topic: &str) -> Result<Vec<i32>, SourceError> {
+            Ok(vec![0, 1])
+        }
+    }
+
+    let mut hub = Hub::new(DyingFactory, PumpConfig::default()).allow_all_topics();
+    // `Latest` subscribes without a source call, so this succeeds and
+    // the pump then dies on its first fetch.
+    let mut sub = hub
+        .subscribe(TOPIC, 0, Position::Latest, Filter::default())
+        .await
+        .unwrap();
+    assert_eq!(hub.active_partitions().count(), 1);
+    let item = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+        .await
+        .expect("timed out")
+        .expect("expected a terminal error");
+    assert!(item.is_err());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Reaping is what a subscribe does before it creates anything, but
+    // it is also callable on its own.
+    assert_eq!(hub.reap_exited_pumps(), 1);
+    assert_eq!(hub.active_partitions().count(), 0);
+}
+
+/// Past the ceiling, new partitions are refused while established ones
+/// keep streaming — the bound that holds even when the gate is wide and
+/// every partition asked for is real.
+#[tokio::test]
+async fn pump_ceiling_refuses_new_partitions() {
+    let log = MemoryLog::with_partitions(4);
+    let mut hub = Hub::new(MemoryFactory::new(log.clone()), PumpConfig::default())
+        .allow_all_topics()
+        .with_max_pumps(2);
+
+    let mut first = hub
+        .subscribe(TOPIC, 0, Position::Latest, Filter::default())
+        .await
+        .unwrap();
+    let _second = hub
+        .subscribe(TOPIC, 1, Position::Latest, Filter::default())
+        .await
+        .unwrap();
+    let refused = hub
+        .subscribe(TOPIC, 2, Position::Latest, Filter::default())
+        .await;
+    assert!(matches!(refused, Err(HubError::AtCapacity)), "{refused:?}");
+    assert_eq!(hub.active_partitions().count(), 2);
+
+    // Another subscriber to a partition already pumping is fine: the
+    // ceiling counts pumps, not connections.
+    let _also_first = hub
+        .subscribe(TOPIC, 0, Position::Latest, Filter::default())
+        .await
+        .unwrap();
+    log.append(TOPIC, 0, None, b"still streaming", Vec::new());
+    assert_eq!(
+        collect(&mut first, 1).await,
+        vec![(0, "still streaming".into())]
+    );
+}
+
+/// A hub is born serving nothing: the gate is a decision the embedder
+/// has to make, not one that defaults to "every topic on the cluster".
+#[tokio::test]
+async fn a_hub_without_a_gate_denies_everything() {
+    let log = MemoryLog::new();
+    let mut hub = Hub::new(MemoryFactory::new(log.clone()), PumpConfig::default());
+
+    let denied = hub
+        .subscribe(TOPIC, 0, Position::Latest, Filter::default())
+        .await;
+    assert!(matches!(denied, Err(HubError::Denied(_))), "{denied:?}");
+    let denied_topic = hub
+        .subscribe_topic(
+            TOPIC,
+            odradek_web_core::TopicPosition::Latest,
+            Filter::default(),
+        )
+        .await;
+    assert!(
+        matches!(denied_topic, Err(HubError::Denied(_))),
+        "{denied_topic:?}"
+    );
+    assert_eq!(hub.active_partitions().count(), 0);
+
+    // Saying so explicitly is what opens it.
+    let mut open =
+        Hub::new(MemoryFactory::new(log.clone()), PumpConfig::default()).allow_all_topics();
+    let mut sub = open
+        .subscribe(TOPIC, 0, Position::Latest, Filter::default())
+        .await
+        .unwrap();
+    log.append(TOPIC, 0, None, b"opened", Vec::new());
+    assert_eq!(collect(&mut sub, 1).await, vec![(0, "opened".into())]);
 }

@@ -46,8 +46,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     producer.flush().await?;
     println!("produced 5 historical records to {topic}");
 
-    // A web-facing subscriber replays history, then rides the live tail.
-    let mut hub = Hub::new(KafkaSourceFactory::new(config), PumpConfig::default());
+    // A web-facing subscriber replays history, then rides the live
+    // tail. The gate names the one topic this hub exists to serve —
+    // a hub without one serves nothing at all, on purpose.
+    let mut hub =
+        Hub::new(KafkaSourceFactory::new(config), PumpConfig::default()).with_topic_gate({
+            let allowed = topic.clone();
+            move |topic| topic == allowed
+        });
     let mut sub = hub
         .subscribe(&topic, 0, Position::Earliest, Filter::default())
         .await?;

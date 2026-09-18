@@ -27,10 +27,14 @@ async fn serve_state<F: SourceFactory>(state: Arc<SseState<F>>) -> SocketAddr {
     addr
 }
 
+/// A server over the whole in-memory log. The gate is an argument to
+/// `SseState::new`, so even a test has to say what it serves; these
+/// tests serve everything the memory factory knows.
 async fn serve(log: MemoryLog) -> SocketAddr {
     serve_state(SseState::new(
         MemoryFactory::new(log),
         PumpConfig::default(),
+        |_| true,
     ))
     .await
 }
@@ -107,17 +111,22 @@ impl SseClient {
         self.buffer.extend_from_slice(&chunk[..n]);
     }
 
-    /// The response status line (reads until headers are complete).
-    async fn status(&mut self) -> String {
+    /// The whole response head (reads until the headers are complete).
+    async fn head(&mut self) -> String {
         loop {
             if let Some(pos) = find(&self.buffer, b"\r\n\r\n") {
                 self.body_at = Some(pos + 4);
                 self.consumed = pos + 4;
-                let head = String::from_utf8_lossy(&self.buffer[..pos]);
-                return head.lines().next().unwrap().to_owned();
+                return String::from_utf8_lossy(&self.buffer[..pos]).into_owned();
             }
             self.fill().await;
         }
+    }
+
+    /// The response status line (reads until headers are complete).
+    async fn status(&mut self) -> String {
+        let head = self.head().await;
+        head.lines().next().unwrap().to_owned()
     }
 
     /// The next SSE data event as (id, json), skipping keep-alive
@@ -390,6 +399,64 @@ async fn topic_stream_merges_partitions_with_cursor_ids() {
     assert_eq!(cursor, "0:2,1:2");
 }
 
+/// The event id of a topic stream is bounded by the topic's own
+/// partitions, not by what the client put in `Last-Event-ID`.
+///
+/// The id is re-encoded per event, so an unpruned cursor is an
+/// amplifier whose factor is the number of records in the topic: a
+/// 20 KB resume token against a 200-record topic used to come back as
+/// megabytes. Here the seed names 2000 partitions, two of which exist.
+#[tokio::test]
+async fn topic_cursor_ids_are_bounded_by_the_topics_partitions() {
+    let log = MemoryLog::with_partitions(2);
+    for i in 0..100 {
+        log.append(TOPIC, 0, None, format!("p0-{i}").as_bytes(), Vec::new());
+        log.append(TOPIC, 1, None, format!("p1-{i}").as_bytes(), Vec::new());
+    }
+    let addr = serve(log.clone()).await;
+
+    // Two real positions, and 2000 partitions that do not exist.
+    let mut seed = String::from("0:98,1:99");
+    for partition in 1000..3000 {
+        seed.push_str(&format!(",{partition}:{}", i64::MAX));
+    }
+    assert!(
+        seed.len() > 20_000,
+        "the seed should be big: {}",
+        seed.len()
+    );
+
+    let mut client = SseClient::get(
+        addr,
+        &format!("/topics/{TOPIC}/events"),
+        &[("Last-Event-ID", &seed)],
+    )
+    .await;
+
+    // Resume is still exact: partition 0 replays from 98, partition 1
+    // from 99, and nothing else appears.
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        let (cursor, json) = client.next_cursor_event().await;
+        assert!(
+            cursor.len() < 64,
+            "cursor id grew with the client's seed: {} bytes",
+            cursor.len()
+        );
+        assert_eq!(
+            cursor.split(',').count(),
+            2,
+            "cursor names partitions this stream does not cover: {cursor}"
+        );
+        seen.push((
+            json["partition"].as_i64().unwrap(),
+            json["offset"].as_i64().unwrap(),
+        ));
+    }
+    seen.sort_unstable();
+    assert_eq!(seen, vec![(0, 98), (0, 99), (1, 99)]);
+}
+
 #[tokio::test]
 async fn gated_topics_return_403_and_allowed_topics_still_stream() {
     use odradek_web_sse::web_core::Hub;
@@ -422,25 +489,62 @@ async fn gated_topics_return_403_and_allowed_topics_still_stream() {
     assert_eq!(value_of(&json), "through-the-gate");
 }
 
+/// Both stream shapes answer `404` for a topic the source does not
+/// have — and, crucially, on the *default* position as well as
+/// `from=earliest`. `latest` needs no source call, so this path used to
+/// answer `200` and then die mid-stream, which is both a broken
+/// contract and how a pump-map entry got created for a topic that does
+/// not exist.
 #[tokio::test]
-async fn unknown_topics_return_404() {
+async fn unknown_topics_and_partitions_return_404() {
     let log = MemoryLog::new();
     let factory = MemoryFactory::new(log).known_topics([TOPIC]);
-    let addr = serve_state(SseState::new(factory, PumpConfig::default())).await;
+    let addr = serve_state(SseState::new(factory, PumpConfig::default(), |_| true)).await;
 
-    let mut client =
-        SseClient::get(addr, "/topics/ghost/partitions/0/events?from=earliest", &[]).await;
-    let status = client.status().await;
-    assert!(status.contains("404"), "{status}");
+    for path in [
+        "/topics/ghost/partitions/0/events?from=earliest",
+        "/topics/ghost/partitions/0/events",
+        "/topics/ghost/events",
+        // The topic exists; the partition does not. Nothing but the
+        // source's partition list can tell the difference.
+        &format!("/topics/{TOPIC}/partitions/7/events"),
+        &format!("/topics/{TOPIC}/partitions/2147483647/events"),
+    ] {
+        let mut client = SseClient::get(addr, path, &[]).await;
+        let status = client.status().await;
+        assert!(status.contains("404"), "{path}: {status}");
+    }
+}
 
-    let mut topic_client = SseClient::get(addr, "/topics/ghost/events", &[]).await;
-    let status = topic_client.status().await;
-    assert!(status.contains("404"), "{status}");
+/// Responses carry `X-Content-Type-Options: nosniff` — the streaming
+/// one and the error one alike.
+#[tokio::test]
+async fn responses_are_not_sniffable() {
+    let addr = serve(MemoryLog::new()).await;
+
+    let mut streaming =
+        SseClient::get(addr, &format!("/topics/{TOPIC}/partitions/0/events"), &[]).await;
+    let head = streaming.head().await.to_ascii_lowercase();
+    assert!(head.contains("200"), "{head}");
+    assert!(head.contains("x-content-type-options: nosniff"), "{head}");
+
+    let mut bad = SseClient::get(
+        addr,
+        &format!("/topics/{TOPIC}/partitions/0/events?from=yesterday"),
+        &[],
+    )
+    .await;
+    let head = bad.head().await.to_ascii_lowercase();
+    assert!(head.contains("400"), "{head}");
+    assert!(head.contains("x-content-type-options: nosniff"), "{head}");
 }
 
 #[tokio::test]
 async fn failed_stream_ends_with_an_error_event() {
-    let addr = serve_state(SseState::new(RevokedFactory, PumpConfig::default())).await;
+    let addr = serve_state(SseState::new(RevokedFactory, PumpConfig::default(), |_| {
+        true
+    }))
+    .await;
 
     // Latest subscribes without touching the source, so the stream
     // opens — then the pump hits the permanent auth failure.
@@ -449,14 +553,24 @@ async fn failed_stream_ends_with_an_error_event() {
     let (event, json) = client.next_named().await;
     assert_eq!(event, "error");
     assert_eq!(json["kind"], "auth");
-    assert_eq!(json["message"], "TOPIC_AUTHORIZATION_FAILED");
+    // The kind is the contract; the upstream's own words ("TOPIC_
+    // AUTHORIZATION_FAILED", and on a real cluster broker hostnames and
+    // ports) stay in the operator's logs.
+    assert_eq!(json["message"], "not authorized for this topic");
+    assert!(
+        !json["message"]
+            .as_str()
+            .unwrap()
+            .contains("TOPIC_AUTHORIZATION_FAILED"),
+        "upstream error text leaked to the client: {json}"
+    );
     client.wait_close().await;
 }
 
 #[tokio::test]
 async fn shutdown_ends_streams_cleanly_and_refuses_new_subscribes() {
     let log = MemoryLog::new();
-    let state = SseState::new(MemoryFactory::new(log), PumpConfig::default());
+    let state = SseState::new(MemoryFactory::new(log), PumpConfig::default(), |_| true);
     let addr = serve_state(state.clone()).await;
 
     let mut client =

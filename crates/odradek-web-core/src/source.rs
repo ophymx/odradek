@@ -51,6 +51,22 @@ impl SourceErrorKind {
             _ => "other",
         }
     }
+
+    /// The fixed, source-independent sentence a *client* is told.
+    ///
+    /// [`SourceError::message`] is for operators: it is the upstream's
+    /// own text, and a real cluster puts broker hostnames, ports,
+    /// protocol error codes, and ACL state in it. Transports send this
+    /// instead — the kind is the whole contract — and leave the detail
+    /// to `tracing`.
+    pub fn public_message(&self) -> &'static str {
+        match self {
+            SourceErrorKind::NotFound => "topic or partition not found",
+            SourceErrorKind::Auth => "not authorized for this topic",
+            SourceErrorKind::Unavailable => "upstream unavailable",
+            _ => "upstream error",
+        }
+    }
 }
 
 impl std::fmt::Display for SourceErrorKind {
@@ -152,13 +168,30 @@ pub trait RecordSource: Send + 'static {
 pub trait SourceFactory: Send + Sync + 'static {
     type Source: RecordSource;
 
+    /// A source for one (topic, partition).
+    ///
+    /// Returning an error here is the factory's veto: the hub creates
+    /// no pump and caches nothing. An implementation *may* rely on the
+    /// hub having already checked the pair against
+    /// [`partitions`](SourceFactory::partitions) — the hub does that
+    /// before every create, so that a request naming a topic or
+    /// partition the source does not have can never cost a pump task —
+    /// but a factory that can reject more cheaply, or that knows more
+    /// than the metadata does, should still reject.
     fn create(
         &self,
         topic: &str,
         partition: i32,
     ) -> impl Future<Output = Result<Self::Source, SourceError>> + Send;
 
-    /// The partitions `topic` currently has, for topic-level subscribes.
+    /// The partitions `topic` currently has.
+    ///
+    /// This is the hub's existence check for *both* stream shapes: a
+    /// topic-level subscribe fans out over the result, and a
+    /// partition-level subscribe is refused with
+    /// [`SourceErrorKind::NotFound`] unless the partition is in it. It
+    /// is cached per topic, so it costs one round trip per topic, not
+    /// one per request.
     fn partitions(&self, topic: &str)
     -> impl Future<Output = Result<Vec<i32>, SourceError>> + Send;
 }

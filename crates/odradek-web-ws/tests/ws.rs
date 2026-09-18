@@ -24,8 +24,17 @@ async fn serve_state<F: SourceFactory>(state: Arc<WsState<F>>) -> SocketAddr {
     addr
 }
 
+/// A server over the whole in-memory log. The gate is an argument to
+/// `WsState::new`, so even a test has to say what it serves; these
+/// tests serve everything the memory factory knows, and (by default)
+/// deny cross-origin handshakes.
 async fn serve(log: MemoryLog) -> SocketAddr {
-    serve_state(WsState::new(MemoryFactory::new(log), PumpConfig::default())).await
+    serve_state(WsState::new(
+        MemoryFactory::new(log),
+        PumpConfig::default(),
+        |_| true,
+    ))
+    .await
 }
 
 /// A source whose partition metadata resolves but whose reads fail
@@ -75,30 +84,45 @@ impl WsClient {
     /// Open the connection and send the upgrade request; returns the
     /// HTTP status line without asserting on it.
     async fn connect(addr: SocketAddr, path: &str) -> (WsClient, String) {
+        let (client, head) = WsClient::handshake(addr, path, &[]).await;
+        (client, head.lines().next().unwrap().to_owned())
+    }
+
+    /// Like [`WsClient::connect`], with extra request headers (an
+    /// `Origin`, say); returns the whole response head.
+    async fn handshake(
+        addr: SocketAddr,
+        path: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> (WsClient, String) {
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        let request = format!(
+        let mut request = format!(
             "GET {path} HTTP/1.1\r\n\
              Host: localhost\r\n\
              Upgrade: websocket\r\n\
              Connection: Upgrade\r\n\
              Sec-WebSocket-Key: MDEyMzQ1Njc4OWFiY2RlZg==\r\n\
-             Sec-WebSocket-Version: 13\r\n\r\n"
+             Sec-WebSocket-Version: 13\r\n"
         );
+        for (name, value) in extra_headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
         stream.write_all(request.as_bytes()).await.unwrap();
 
         let mut client = WsClient {
             stream,
             buffer: Vec::new(),
         };
-        let status = loop {
+        let head = loop {
             if let Some(pos) = find(&client.buffer, b"\r\n\r\n") {
                 let head = String::from_utf8_lossy(&client.buffer[..pos]).into_owned();
                 client.buffer.drain(..pos + 4);
-                break head.lines().next().unwrap().to_owned();
+                break head;
             }
             client.fill().await;
         };
-        (client, status)
+        (client, head)
     }
 
     async fn fill(&mut self) {
@@ -324,21 +348,151 @@ async fn gated_topics_fail_403_before_the_upgrade() {
     assert_eq!(value_of(&json), "through-the-gate");
 }
 
+/// Topics *and* partitions the source does not have are `404`s before
+/// the upgrade — including on the default position, which needs no
+/// source call and so used to upgrade happily and die later.
 #[tokio::test]
-async fn unknown_topics_fail_404_before_the_upgrade() {
+async fn unknown_topics_and_partitions_fail_404_before_the_upgrade() {
     let log = MemoryLog::new();
     let factory = MemoryFactory::new(log).known_topics([TOPIC]);
-    let addr = serve_state(WsState::new(factory, PumpConfig::default())).await;
+    let addr = serve_state(WsState::new(factory, PumpConfig::default(), |_| true)).await;
 
-    let (_client, status) = WsClient::connect(addr, "/topics/ghost/partitions/0/ws").await;
-    assert!(status.contains("404"), "{status}");
-    let (_topic_client, status) = WsClient::connect(addr, "/topics/ghost/ws").await;
-    assert!(status.contains("404"), "{status}");
+    for path in [
+        "/topics/ghost/partitions/0/ws".to_owned(),
+        "/topics/ghost/ws".to_owned(),
+        format!("/topics/{TOPIC}/partitions/7/ws"),
+        format!("/topics/{TOPIC}/partitions/2147483647/ws"),
+    ] {
+        let (_client, status) = WsClient::connect(addr, &path).await;
+        assert!(status.contains("404"), "{path}: {status}");
+    }
+}
+
+/// CORS does not apply to WebSockets, so `Origin` is the only thing
+/// between a victim's browser and a cross-origin socket carrying their
+/// cookies. The default policy refuses every browser origin.
+#[tokio::test]
+async fn cross_origin_handshakes_are_refused() {
+    let addr = serve(MemoryLog::new()).await;
+
+    for origin in [
+        "https://evil.example",
+        "http://evil.example",
+        "null",
+        // Not a prefix game: a suffix of an allowed origin is not it.
+        "https://app.example.com.evil.example",
+    ] {
+        let (_client, head) = WsClient::handshake(
+            addr,
+            &format!("/topics/{TOPIC}/partitions/0/ws"),
+            &[("Origin", origin)],
+        )
+        .await;
+        let status = head.lines().next().unwrap();
+        assert!(status.contains("403"), "origin {origin}: {status}");
+    }
+
+    // Both routes, not just the partition one.
+    let (_client, head) = WsClient::handshake(
+        addr,
+        "/topics/bridge/ws",
+        &[("Origin", "https://evil.example")],
+    )
+    .await;
+    assert!(head.lines().next().unwrap().contains("403"), "{head}");
+}
+
+/// A named origin connects and streams; the refusal is a policy, not a
+/// wall.
+#[tokio::test]
+async fn allowed_origins_connect_and_stream() {
+    use odradek_web_ws::{OriginPolicy, web_core::Hub};
+
+    let log = MemoryLog::new();
+    let hub = Hub::new(MemoryFactory::new(log.clone()), PumpConfig::default()).allow_all_topics();
+    let addr = serve_state(WsState::from_hub_with_origins(
+        hub,
+        OriginPolicy::allow(["https://app.example.com"]),
+    ))
+    .await;
+
+    // Case-insensitive on the scheme and host, as origins are.
+    let (mut client, head) = WsClient::handshake(
+        addr,
+        &format!("/topics/{TOPIC}/partitions/0/ws"),
+        &[("Origin", "https://APP.example.com")],
+    )
+    .await;
+    assert!(head.lines().next().unwrap().contains("101"), "{head}");
+    log.append(TOPIC, 0, None, b"same-origin", Vec::new());
+    assert_eq!(value_of(&client.next_json().await), "same-origin");
+
+    // Anything else still gets nothing.
+    let (_denied, head) = WsClient::handshake(
+        addr,
+        &format!("/topics/{TOPIC}/partitions/0/ws"),
+        &[("Origin", "https://evil.example")],
+    )
+    .await;
+    assert!(head.lines().next().unwrap().contains("403"), "{head}");
+}
+
+/// A handshake with no `Origin` at all is not a browser, so it is not
+/// the attack this defends against: allowed by default, refusable with
+/// `require_origin` for embedders whose ambient credentials make an
+/// anonymous handshake privileged.
+#[tokio::test]
+async fn missing_origin_is_allowed_by_default_and_refusable() {
+    use odradek_web_ws::{OriginPolicy, web_core::Hub};
+
+    let log = MemoryLog::new();
+    let addr = serve(log.clone()).await;
+    let (mut client, status) =
+        WsClient::connect(addr, &format!("/topics/{TOPIC}/partitions/0/ws")).await;
+    assert!(status.contains("101"), "{status}");
+    log.append(TOPIC, 0, None, b"not-a-browser", Vec::new());
+    assert_eq!(value_of(&client.next_json().await), "not-a-browser");
+
+    let strict = Hub::new(MemoryFactory::new(log), PumpConfig::default()).allow_all_topics();
+    let strict_addr = serve_state(WsState::from_hub_with_origins(
+        strict,
+        OriginPolicy::allow(["https://app.example.com"]).require_origin(),
+    ))
+    .await;
+    let (_client, status) =
+        WsClient::connect(strict_addr, &format!("/topics/{TOPIC}/partitions/0/ws")).await;
+    assert!(status.contains("403"), "{status}");
+}
+
+/// The handshake response carries the same hardening header the error
+/// responses do.
+#[tokio::test]
+async fn responses_are_not_sniffable() {
+    let addr = serve(MemoryLog::new()).await;
+
+    let (_client, head) =
+        WsClient::handshake(addr, &format!("/topics/{TOPIC}/partitions/0/ws"), &[]).await;
+    let head = head.to_ascii_lowercase();
+    assert!(head.contains("101"), "{head}");
+    assert!(head.contains("x-content-type-options: nosniff"), "{head}");
+
+    let (_client, head) = WsClient::handshake(
+        addr,
+        &format!("/topics/{TOPIC}/partitions/0/ws?from=yesterday"),
+        &[],
+    )
+    .await;
+    let head = head.to_ascii_lowercase();
+    assert!(head.contains("400"), "{head}");
+    assert!(head.contains("x-content-type-options: nosniff"), "{head}");
 }
 
 #[tokio::test]
 async fn failed_stream_closes_with_a_reasoned_close_frame() {
-    let addr = serve_state(WsState::new(RevokedFactory, PumpConfig::default())).await;
+    let addr = serve_state(WsState::new(RevokedFactory, PumpConfig::default(), |_| {
+        true
+    }))
+    .await;
 
     // Latest subscribes without touching the source, so the upgrade
     // succeeds — then the pump hits the permanent auth failure.
@@ -348,13 +502,19 @@ async fn failed_stream_closes_with_a_reasoned_close_frame() {
 
     let (code, reason) = client.next_close().await;
     assert_eq!(code, 1008, "auth failures use policy-violation");
-    assert_eq!(reason, "auth: TOPIC_AUTHORIZATION_FAILED");
+    // The kind is the contract; the upstream's own words stay in the
+    // operator's logs.
+    assert_eq!(reason, "auth: not authorized for this topic");
+    assert!(
+        !reason.contains("TOPIC_AUTHORIZATION_FAILED"),
+        "upstream error text leaked into the close reason: {reason}"
+    );
 }
 
 #[tokio::test]
 async fn shutdown_closes_sockets_going_away_and_refuses_new_upgrades() {
     let log = MemoryLog::new();
-    let state = WsState::new(MemoryFactory::new(log), PumpConfig::default());
+    let state = WsState::new(MemoryFactory::new(log), PumpConfig::default(), |_| true);
     let addr = serve_state(state.clone()).await;
 
     let (mut client, status) =

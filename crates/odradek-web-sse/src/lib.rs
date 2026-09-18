@@ -32,12 +32,32 @@
 //! cursor, so each stream writes its own.
 //!
 //! Subscribe failures are plain HTTP errors before the stream starts:
-//! `403` for a topic the hub's gate denies, `404` for a topic the
-//! source does not have, `503` after shutdown, `502` for other source
-//! trouble. If the stream fails *later* (topic deleted, auth revoked,
-//! error budget exhausted), the client receives one final
-//! `event: error` frame whose data is `{"kind": "...", "message":
-//! "..."}` and the stream ends; a clean shutdown just ends the stream.
+//! `403` for a topic the hub's gate denies, `404` for a topic or
+//! partition the source does not have, `503` after shutdown or at pump
+//! capacity, `502` for other source trouble. If the stream fails
+//! *later* (topic deleted, auth revoked, error budget exhausted), the
+//! client receives one final `event: error` frame whose data is
+//! `{"kind": "...", "message": "..."}` and the stream ends; a clean
+//! shutdown just ends the stream. Both the status body and that frame
+//! carry the *classified* reason only — the upstream's own error text
+//! goes to `tracing`, because on a real cluster it names brokers,
+//! ports, and ACL state.
+//!
+//! # Security
+//!
+//! These routes serve Kafka data to whoever reaches them. Two things
+//! are yours to set, and this crate will not guess:
+//!
+//! - **Which topics** — [`SseState::new`] takes the hub's topic gate
+//!   as an argument for that reason; there is no ungated shortcut.
+//! - **Who** — mount the router under your own authentication, and do
+//!   not put a permissive CORS layer over it: the response bodies are
+//!   your Kafka records, and `Access-Control-Allow-Origin: *` hands
+//!   them to every page in the world. `EventSource` is same-origin by
+//!   default, which is the protection you would be removing.
+//!
+//! See the crate README for the rest (connection limits, the memory
+//! formula).
 //!
 //! Graceful shutdown: keep the [`SseState`] `Arc` you built the router
 //! from and call [`SseState::shutdown`] when your server begins to
@@ -45,12 +65,15 @@
 //! `with_graceful_shutdown`) — every pump stops, open streams end
 //! cleanly, and new subscribes are refused with `503`.
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{Path, Query, State};
+use axum::http::header::{HeaderName, X_CONTENT_TYPE_OPTIONS};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::routing::get;
 use tokio_stream::StreamExt;
@@ -76,12 +99,38 @@ pub struct SseState<F: SourceFactory> {
 }
 
 impl<F: SourceFactory> SseState<F> {
-    pub fn new(factory: F, config: PumpConfig) -> Arc<SseState<F>> {
-        SseState::from_hub(Hub::new(factory, config))
+    /// State over a hub serving exactly the topics `gate` approves.
+    ///
+    /// The gate is an argument, not an option, because these routes are
+    /// reachable by whoever can reach the port: the default
+    /// configuration should not be one that serves every topic on the
+    /// cluster (`__consumer_offsets` included). `|_| true` is
+    /// available, but you have to write it.
+    ///
+    /// ```no_run
+    /// # use odradek_web_sse::{PumpConfig, SseState, router};
+    /// # fn demo<F: odradek_web_sse::SourceFactory>(factory: F) {
+    /// let state = SseState::new(factory, PumpConfig::default(), |topic| {
+    ///     topic.starts_with("public.")
+    /// });
+    /// let app = router(state);
+    /// # }
+    /// ```
+    ///
+    /// For hub-level options — [`Hub::with_max_pumps`],
+    /// [`Hub::allow_all_topics`] — build the [`Hub`] yourself and use
+    /// [`SseState::from_hub`].
+    pub fn new(
+        factory: F,
+        config: PumpConfig,
+        gate: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> Arc<SseState<F>> {
+        SseState::from_hub(Hub::new(factory, config).with_topic_gate(gate))
     }
 
     /// Wrap a pre-built hub — the way in for hub-level options such as
-    /// [`Hub::with_topic_gate`].
+    /// [`Hub::with_max_pumps`]. A hub with no gate denies every topic,
+    /// so this path still requires a decision.
     pub fn from_hub(hub: Hub<F>) -> Arc<SseState<F>> {
         Arc::new(SseState {
             hub: SharedHub::from_hub(hub),
@@ -96,39 +145,61 @@ impl<F: SourceFactory> SseState<F> {
     }
 }
 
+/// An error response: a status, the hardening headers, and a body.
+type HttpError = (StatusCode, Headers, String);
+
+/// The response headers every route sets.
+type Headers = [(HeaderName, &'static str); 1];
+
+/// `X-Content-Type-Options: nosniff`.
+///
+/// Defense in depth: error bodies are `text/plain` and can echo the
+/// client's own parameters back, so nothing should be left to a
+/// browser's content sniffing.
+fn headers() -> Headers {
+    [(X_CONTENT_TYPE_OPTIONS, "nosniff")]
+}
+
 /// A refused subscribe as the plain HTTP error it becomes: `400` for
-/// bad parameters, `403` for gated topics, `404` for missing ones,
-/// `503` after shutdown, `502` for the rest.
-fn reject(rejection: Rejection) -> (StatusCode, String) {
+/// bad parameters, `403` for gated topics, `404` for missing topics and
+/// partitions, `503` after shutdown or at pump capacity, `502` for the
+/// rest. The body is [`Rejection::message`], which is classified rather
+/// than narrated — see [`odradek_web_core::RejectionKind`].
+fn reject(rejection: Rejection) -> HttpError {
     let status = match rejection.kind {
         RejectionKind::BadRequest => StatusCode::BAD_REQUEST,
         RejectionKind::Denied => StatusCode::FORBIDDEN,
         RejectionKind::NotFound => StatusCode::NOT_FOUND,
-        RejectionKind::ShutDown => StatusCode::SERVICE_UNAVAILABLE,
+        RejectionKind::ShutDown | RejectionKind::AtCapacity => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::BAD_GATEWAY,
     };
-    (status, rejection.message)
+    (status, headers(), rejection.message)
 }
 
 /// One channel item as an SSE frame; errors become a final
 /// `event: error` frame right before the stream ends.
+///
+/// The frame carries the kind and its fixed message, never the
+/// upstream's own text: the pump has already logged that, and a stream
+/// that anyone can open is not the place to publish broker hostnames.
 fn error_frame(err: &odradek_web_core::StreamError) -> SseEvent {
     SseEvent::default().event("error").data(
         serde_json::json!({
             "kind": err.kind.as_str(),
-            "message": err.message,
+            "message": err.public_message(),
         })
         .to_string(),
     )
 }
 
 /// The raw `Last-Event-ID` header value, if any; non-UTF-8 is a 400.
-fn last_event_id(headers: &HeaderMap) -> Result<Option<String>, (StatusCode, String)> {
-    match headers.get("last-event-id") {
+fn last_event_id(headers_in: &HeaderMap) -> Result<Option<String>, HttpError> {
+    match headers_in.get("last-event-id") {
         None => Ok(None),
         Some(v) => v.to_str().map(|s| Some(s.to_owned())).map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
+                headers(),
                 "Last-Event-ID must be UTF-8".to_owned(),
             )
         }),
@@ -150,10 +221,9 @@ async fn stream_partition<F: SourceFactory>(
     State(state): State<Arc<SseState<F>>>,
     Path((topic, partition)): Path<(String, i32)>,
     Query(params): Query<StreamParams>,
-    headers: HeaderMap,
-) -> Result<Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>>, (StatusCode, String)>
-{
-    let resume = last_event_id(&headers)?;
+    headers_in: HeaderMap,
+) -> Result<impl IntoResponse, HttpError> {
+    let resume = last_event_id(&headers_in)?;
     let subscription = state
         .hub
         .stream(&topic, partition, &params, resume.as_deref())
@@ -161,7 +231,7 @@ async fn stream_partition<F: SourceFactory>(
         .map_err(reject)?;
 
     let stream = ReceiverStream::new(subscription.into_receiver()).map(|item: StreamItem| {
-        Ok(match item {
+        Ok::<_, Infallible>(match item {
             // `event.json()` is rendered by whichever subscriber of this
             // partition reaches it first; the rest copy the finished
             // bytes into their own frame.
@@ -174,7 +244,7 @@ async fn stream_partition<F: SourceFactory>(
             Err(err) => error_frame(&err),
         })
     });
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    Ok((headers(), Sse::new(stream).keep_alive(KeepAlive::default())))
 }
 
 /// The whole topic, all partitions merged. The event id is the
@@ -185,10 +255,9 @@ async fn stream_topic<F: SourceFactory>(
     State(state): State<Arc<SseState<F>>>,
     Path(topic): Path<String>,
     Query(params): Query<StreamParams>,
-    headers: HeaderMap,
-) -> Result<Sse<impl tokio_stream::Stream<Item = Result<SseEvent, Infallible>>>, (StatusCode, String)>
-{
-    let resume = last_event_id(&headers)?;
+    headers_in: HeaderMap,
+) -> Result<impl IntoResponse, HttpError> {
+    let resume = last_event_id(&headers_in)?;
     let (subscription, position) = state
         .hub
         .stream_topic(&topic, &params, resume.as_deref())
@@ -196,14 +265,23 @@ async fn stream_topic<F: SourceFactory>(
         .map_err(reject)?;
 
     // Seed the running cursor from the resume point, so an id always
-    // carries every partition the client has a position for.
+    // carries every partition the client has a position for — but only
+    // the partitions this subscription actually covers.
+    //
+    // The seed is client-supplied and this cursor is re-encoded into
+    // *every* event's id, so an unpruned seed is an amplifier: the
+    // client sends one oversized `Last-Event-ID` and gets it back once
+    // per record in the topic. Pruned, an id is bounded by the topic's
+    // real partition count, whatever the client sent.
+    let covered = subscription.partitions().to_vec();
     let mut running = match position {
         TopicPosition::Offsets(cursor) => cursor,
-        _ => std::collections::BTreeMap::new(),
+        _ => BTreeMap::new(),
     };
+    running.retain(|partition, _| covered.contains(partition));
 
     let stream = ReceiverStream::new(subscription.into_receiver()).map(move |item: StreamItem| {
-        Ok(match item {
+        Ok::<_, Infallible>(match item {
             Ok(event) => {
                 running.insert(event.partition, event.offset + 1);
                 SseEvent::default()
@@ -216,5 +294,5 @@ async fn stream_topic<F: SourceFactory>(
             Err(err) => error_frame(&err),
         })
     });
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    Ok((headers(), Sse::new(stream).keep_alive(KeepAlive::default())))
 }

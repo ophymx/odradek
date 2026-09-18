@@ -9,6 +9,43 @@
 //! streams cleanly, and fails later subscribes with
 //! [`HubError::ShutDown`].
 //!
+//! # What an anonymous request can cost
+//!
+//! The pump map is keyed by (topic, partition), both of which come
+//! from the request path, so its growth is the hub's exposure. Three
+//! bounds, each covering a dimension the others do not:
+//!
+//! 1. **The gate** ([`Hub::with_topic_gate`], deny-all until you
+//!    choose) bounds the topic dimension, and refuses before any
+//!    source call at all.
+//! 2. **Existence** — every subscribe checks the pair against the
+//!    source's own partition list (cached per topic) *before* the map
+//!    grows, so a request naming a topic or partition that does not
+//!    exist creates no entry, spawns no task, and makes no broker
+//!    round trip beyond the one cached metadata lookup per topic. This
+//!    bounds the partition dimension, which the gate cannot see.
+//! 3. **Capacity** ([`Hub::with_max_pumps`], 1024 by default) bounds
+//!    what is left — real partitions of allowed topics — and dead
+//!    entries are evicted ([`PumpHandle::is_dead`]) before the limit is
+//!    applied, so a pump that has exited never holds a slot.
+//!
+//! So `pumps.len()` is bounded by `max_pumps`, and an entry exists
+//! only for a partition that exists, is allowed, and has a live task.
+//! Memory follows from [`PumpConfig`]: worst case
+//! `max_pumps x ring_capacity x <source's max fetch bytes>`, because a
+//! ring is bounded by event *count* and an event can pin the buffer it
+//! was read from.
+//!
+//! What is *not* bounded, and the reason to keep the gate narrow: the
+//! partition cache only remembers topics that exist, so each request
+//! naming a fresh unknown topic the gate allows costs one metadata
+//! lookup. A gate written as an exact set bounds that to its size; a
+//! prefix gate (`public.*`) leaves a request able to ask about a name
+//! nobody has ever used. Those lookups are serialized behind the hub's
+//! lock — which caps the concurrent load on the source, at the cost of
+//! making a flood of unknown names slow down legitimate first
+//! subscribes to other topics. Nothing is retained either way.
+//!
 //! [`SharedHub`] is the concurrent front door, and it is careful about
 //! what it holds its lock across: the map lookup (and, the first time a
 //! partition is asked for, the pump spawn) — never the subscribe round
@@ -26,20 +63,60 @@ use tokio::sync::mpsc;
 use crate::event::{Filter, Position, TopicPosition};
 use crate::params::StreamParams;
 use crate::pump::{HubError, PumpConfig, PumpHandle, RejectionKind, StreamItem, Subscription};
-use crate::source::SourceFactory;
+use crate::source::{SourceError, SourceFactory};
 
-type TopicGate = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+type TopicPredicate = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// How many pumps a hub runs before refusing new partitions. Each one
+/// is a task, a source connection, and a ring of up to
+/// [`PumpConfig::ring_capacity`] events, so this is the hub's memory
+/// ceiling; raise it past the partition count of the largest topic you
+/// serve, and see [`Hub::with_max_pumps`].
+pub const DEFAULT_MAX_PUMPS: usize = 1024;
+
+/// Which topics a hub will serve.
+enum Gate {
+    /// None at all — the state a hub is born in. Every subscribe is
+    /// refused until the embedder chooses
+    /// [`Hub::with_topic_gate`] or [`Hub::allow_all_topics`].
+    DenyAll,
+    /// Every topic the source knows, including the cluster's internal
+    /// ones. Chosen explicitly by [`Hub::allow_all_topics`].
+    Any,
+    Predicate(TopicPredicate),
+}
+
+impl Gate {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Gate::DenyAll => "deny-all",
+            Gate::Any => "any",
+            Gate::Predicate(_) => "predicate",
+        }
+    }
+}
 
 /// Fans partitions out to any number of subscribers, creating a
 /// [`PumpHandle`] per (topic, partition) lazily via the factory.
+///
+/// A new hub serves *nothing*: pick [`Hub::with_topic_gate`] (the
+/// answer for anything internet-facing) or [`Hub::allow_all_topics`]
+/// before it is useful. See the [module docs](self) for the bounds on
+/// what an anonymous request can make one of these allocate.
 pub struct Hub<F: SourceFactory> {
     factory: F,
     config: PumpConfig,
     pumps: HashMap<(String, i32), PumpHandle>,
-    /// Discovered partitions per topic (first topic-level subscribe).
+    /// Discovered partitions per topic; also the existence check for
+    /// partition-level subscribes.
     topics: HashMap<String, Vec<i32>>,
-    /// Topics this hub will serve at all; `None` allows everything.
-    gate: Option<TopicGate>,
+    /// Topics this hub will serve at all.
+    gate: Gate,
+    /// The ceiling on `pumps.len()`.
+    max_pumps: usize,
+    /// So an unconfigured hub says so once, rather than once per
+    /// refused request (which an anonymous client could drive).
+    ungated_warning: std::sync::Once,
     shut_down: bool,
 }
 
@@ -50,7 +127,8 @@ impl<F: SourceFactory + std::fmt::Debug> std::fmt::Debug for Hub<F> {
             .field("config", &self.config)
             .field("pumps", &self.pumps)
             .field("topics", &self.topics)
-            .field("gated", &self.gate.is_some())
+            .field("gate", &self.gate.as_str())
+            .field("max_pumps", &self.max_pumps)
             .field("shut_down", &self.shut_down)
             .finish()
     }
@@ -84,24 +162,82 @@ impl TopicSubscription {
 }
 
 impl<F: SourceFactory> Hub<F> {
+    /// A hub that serves **no topics yet**: every subscribe is denied
+    /// until you call [`Hub::with_topic_gate`] (name what this process
+    /// may read) or [`Hub::allow_all_topics`] (say you mean all of it).
+    ///
+    /// The default is deny rather than allow because the failure modes
+    /// are not comparable: a missing gate you notice is a `403` in
+    /// development, and a missing gate you do not notice is every
+    /// topic on the cluster — `__consumer_offsets` included — readable
+    /// by anyone who can reach the port, plus topic enumeration by
+    /// probing for which names answer `404`.
     pub fn new(factory: F, config: PumpConfig) -> Hub<F> {
         Hub {
             factory,
             config,
             pumps: HashMap::new(),
             topics: HashMap::new(),
-            gate: None,
+            gate: Gate::DenyAll,
+            max_pumps: DEFAULT_MAX_PUMPS,
+            ungated_warning: std::sync::Once::new(),
             shut_down: false,
         }
     }
 
     /// Serve only topics `gate` approves; everything else fails
-    /// subscribe with [`HubError::Denied`] *before* any pump or source
-    /// connection is created. Without a gate, every topic the source
-    /// knows is reachable through the hub.
+    /// subscribe with [`HubError::Denied`] *before* any pump, source
+    /// connection, or metadata lookup happens.
+    ///
+    /// The gate is a property of the process, not of the request: it
+    /// answers "which topics does this bridge exist to serve", and it
+    /// is the only authorization the hub itself performs. Per-user
+    /// rules ("this reader may see topic X") belong in a middleware
+    /// layer over the transport's router, which can see the whole
+    /// request; the gate is the floor under it.
+    ///
+    /// ```
+    /// # use odradek_web_core::{Hub, PumpConfig, memory::{MemoryFactory, MemoryLog}};
+    /// let hub = Hub::new(MemoryFactory::new(MemoryLog::new()), PumpConfig::default())
+    ///     .with_topic_gate(|topic| topic.starts_with("public."));
+    /// ```
     #[must_use]
     pub fn with_topic_gate(mut self, gate: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
-        self.gate = Some(Arc::new(gate));
+        self.gate = Gate::Predicate(Arc::new(gate));
+        self
+    }
+
+    /// Serve every topic the source knows — the explicit opt-out of
+    /// [`Hub::with_topic_gate`].
+    ///
+    /// Reasonable for a hub behind an authenticating proxy that does
+    /// its own per-topic authorization, or for tests. Anywhere else,
+    /// remember what "every topic" includes: the cluster's internal
+    /// topics (`__consumer_offsets` and friends), every topic created
+    /// after this code was written, and — because a name that exists
+    /// answers differently from one that does not — the topic list
+    /// itself.
+    #[must_use]
+    pub fn allow_all_topics(mut self) -> Self {
+        self.gate = Gate::Any;
+        self
+    }
+
+    /// The ceiling on concurrently running pumps; past it, subscribes
+    /// to *new* partitions fail with [`HubError::AtCapacity`] while
+    /// established ones keep streaming. Defaults to
+    /// [`DEFAULT_MAX_PUMPS`].
+    ///
+    /// This is the last bound on an anonymous request's memory cost,
+    /// and the one that holds even when the gate is wide and the
+    /// partitions are real. Set it above the partition count of the
+    /// largest topic you serve (a topic-level subscribe needs one pump
+    /// per partition at once), and budget
+    /// `max_pumps x ring_capacity x <max fetch bytes>` for the worst
+    /// case.
+    #[must_use]
+    pub fn with_max_pumps(mut self, max_pumps: usize) -> Self {
+        self.max_pumps = max_pumps.max(1);
         self
     }
 
@@ -109,12 +245,26 @@ impl<F: SourceFactory> Hub<F> {
         if self.shut_down {
             return Err(HubError::ShutDown);
         }
-        // No let-chain: the crate's MSRV (1.85) predates their
-        // stabilization in 1.88.
-        if self.gate.as_ref().is_some_and(|gate| !gate(topic)) {
-            return Err(HubError::Denied(topic.to_owned()));
+        match &self.gate {
+            Gate::Any => Ok(()),
+            // No let-chain: the crate's MSRV (1.85) predates their
+            // stabilization in 1.88.
+            Gate::Predicate(gate) if gate(topic) => Ok(()),
+            Gate::Predicate(_) => Err(HubError::Denied(topic.to_owned())),
+            Gate::DenyAll => {
+                // Once, not per request: the refusal itself is the
+                // request's answer, and an anonymous client should not
+                // be able to drive the log.
+                self.ungated_warning.call_once(|| {
+                    tracing::warn!(
+                        "this hub has no topic gate, so every subscribe is denied; \
+                         call Hub::with_topic_gate to name the topics it serves, \
+                         or Hub::allow_all_topics to serve all of them"
+                    );
+                });
+                Err(HubError::Denied(topic.to_owned()))
+            }
         }
-        Ok(())
     }
 
     /// Subscribe to every partition of `topic` as one merged stream.
@@ -182,20 +332,73 @@ impl<F: SourceFactory> Hub<F> {
 
     /// The partitions of `topic`, discovered once and cached.
     async fn partitions_of(&mut self, topic: &str) -> Result<Vec<i32>, HubError> {
+        self.known_partitions(topic).await.cloned()
+    }
+
+    /// The cached partition list for `topic`, fetching it the first
+    /// time. The cache is what keeps the existence check from being a
+    /// broker round trip per request; it is refreshed only by
+    /// [`Hub::forget_topics`] (or a restart), so a topic that *gains*
+    /// partitions while the hub runs needs one of those before the new
+    /// ones are reachable.
+    async fn known_partitions(&mut self, topic: &str) -> Result<&Vec<i32>, HubError> {
         self.check_topic(topic)?;
-        if let Some(partitions) = self.topics.get(topic) {
-            return Ok(partitions.clone());
+        if !self.topics.contains_key(topic) {
+            let partitions = self.factory.partitions(topic).await?;
+            self.topics.insert(topic.to_owned(), partitions);
         }
-        let partitions = self.factory.partitions(topic).await?;
-        self.topics.insert(topic.to_owned(), partitions.clone());
-        Ok(partitions)
+        Ok(self
+            .topics
+            .get(topic)
+            .expect("the partition list was just inserted"))
+    }
+
+    /// Fail unless the source actually has this (topic, partition).
+    ///
+    /// This is what stands between the pump map and the request path.
+    /// `partition` is a free `i32` out of the URL and `Position::Latest`
+    /// (the default) needs no source call, so without this check a
+    /// subscribe to a partition that does not exist would spawn a pump,
+    /// insert a map entry, and only then die on its first fetch —
+    /// leaving the entry behind, 2^31 times over, for one allowed topic.
+    async fn check_partition(&mut self, topic: &str, partition: i32) -> Result<(), HubError> {
+        if self.known_partitions(topic).await?.contains(&partition) {
+            return Ok(());
+        }
+        Err(HubError::Source(SourceError::not_found(format!(
+            "topic {topic:?} has no partition {partition}"
+        ))))
+    }
+
+    /// Drop the map entries of pumps whose task has exited — died on a
+    /// permanent error, spent its error budget, or exited idle — and
+    /// return how many went. Subscribes do this before creating a pump,
+    /// so entries are reclaimed without a background sweeper; call it
+    /// directly if you want the count for a metric.
+    pub fn reap_exited_pumps(&mut self) -> usize {
+        let before = self.pumps.len();
+        self.pumps.retain(|_, handle| !handle.is_dead());
+        before - self.pumps.len()
+    }
+
+    /// Forget the cached partition lists, so the next subscribe asks
+    /// the source again. For topics that were repartitioned (or
+    /// created) since this hub started.
+    pub fn forget_topics(&mut self) {
+        self.topics.clear();
     }
 
     /// The handle for one partition, spawning its pump on first use;
     /// the flag says whether *this* call created it (and so owns
     /// cleaning up after a pump that refuses its first subscriber).
     ///
-    /// This is all a [`SharedHub`] subscribe holds the lock for.
+    /// Nothing reaches the map that has not passed the gate, been found
+    /// in the source's partition list, and fit under the pump ceiling.
+    ///
+    /// This is all a [`SharedHub`] subscribe holds the lock for. It
+    /// spans the first metadata lookup for a topic and the pump spawn —
+    /// both once per topic/partition — but never a subscribe round trip
+    /// to a running pump.
     async fn acquire(
         &mut self,
         topic: &str,
@@ -203,8 +406,23 @@ impl<F: SourceFactory> Hub<F> {
     ) -> Result<(PumpHandle, bool), HubError> {
         self.check_topic(topic)?;
         let key = (topic.to_owned(), partition);
-        if let Some(handle) = self.pumps.get(&key) {
-            return Ok((handle.clone(), false));
+        match self.pumps.get(&key) {
+            // A dead entry is replaced below rather than handed out:
+            // the subscribe to it could only fail.
+            Some(handle) if !handle.is_dead() => return Ok((handle.clone(), false)),
+            _ => {}
+        }
+        self.check_partition(topic, partition).await?;
+        // Exited pumps must not hold slots against the ceiling.
+        self.reap_exited_pumps();
+        if self.pumps.len() >= self.max_pumps && !self.pumps.contains_key(&key) {
+            tracing::warn!(
+                topic,
+                partition,
+                max_pumps = self.max_pumps,
+                "refusing a new pump: the hub is at capacity"
+            );
+            return Err(HubError::AtCapacity);
         }
         let handle = self.spawn_pump(topic, partition).await?;
         self.pumps.insert(key, handle.clone());
@@ -325,6 +543,14 @@ fn merge(
 /// A refused subscribe from the [`SharedHub`] front door: the
 /// [`RejectionKind`] a transport maps to its status code, plus the
 /// message for the response body.
+///
+/// The message is safe to send to an anonymous client. For everything
+/// except [`RejectionKind::BadRequest`] — whose text describes the
+/// client's own parameters — it is
+/// [`RejectionKind::public_message`], and the underlying error is
+/// logged at `warn` instead: a real cluster's error text carries
+/// bootstrap hostnames and ports, leader and ACL state, and TLS/SASL
+/// detail, none of which belongs in a response body.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Rejection {
@@ -344,9 +570,11 @@ impl Rejection {
 
 impl From<HubError> for Rejection {
     fn from(e: HubError) -> Rejection {
+        let kind = e.rejection_kind();
+        tracing::warn!(error = %e, kind = ?kind, "subscribe refused");
         Rejection {
-            kind: e.rejection_kind(),
-            message: e.to_string(),
+            kind,
+            message: kind.public_message().to_owned(),
         }
     }
 }
@@ -481,6 +709,19 @@ impl<F: SourceFactory> SharedHub<F> {
     /// subscribes. Call this from your server's graceful shutdown.
     pub async fn shutdown(&self) {
         self.hub.lock().await.shutdown().await;
+    }
+
+    /// How many pumps the hub is holding — the number
+    /// [`Hub::with_max_pumps`] bounds. Worth a gauge.
+    pub async fn active_pumps(&self) -> usize {
+        self.hub.lock().await.active_partitions().count()
+    }
+
+    /// [`Hub::reap_exited_pumps`]. Subscribes already reap, so this is
+    /// for metrics or for an idle process that wants its memory back
+    /// without waiting for the next request.
+    pub async fn reap_exited_pumps(&self) -> usize {
+        self.hub.lock().await.reap_exited_pumps()
     }
 
     /// The whole front door for one partition's stream: parse `params`

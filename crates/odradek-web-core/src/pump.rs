@@ -100,6 +100,8 @@ pub enum HubError {
     ShutDown,
     #[error("access to topic {0:?} denied")]
     Denied(String),
+    #[error("the hub is already running its maximum number of pumps")]
+    AtCapacity,
 }
 
 /// The transport-facing classification of a refused subscribe — what
@@ -120,8 +122,33 @@ pub enum RejectionKind {
     NotFound,
     /// The hub has shut down and refuses new subscribes (HTTP `503`).
     ShutDown,
+    /// The hub is already running as many pumps as it is configured to
+    /// ([`Hub::with_max_pumps`](crate::hub::Hub::with_max_pumps)), so
+    /// this partition would be one too many (HTTP `503`).
+    AtCapacity,
     /// The source failed in some other way (HTTP `502`).
     Upstream,
+}
+
+impl RejectionKind {
+    /// The fixed sentence a client is told for this kind.
+    ///
+    /// Refusals are classified, not narrated: the upstream's own error
+    /// text names brokers, ports, and ACLs, so it stays in `tracing`
+    /// and the client gets this. (Parameter errors are the exception —
+    /// they describe the *client's* own input, and
+    /// [`BadRequest`](RejectionKind::BadRequest) rejections carry that
+    /// text instead.)
+    pub fn public_message(&self) -> &'static str {
+        match self {
+            RejectionKind::BadRequest => "bad request",
+            RejectionKind::Denied => "access to this topic is denied",
+            RejectionKind::NotFound => "no such topic or partition",
+            RejectionKind::ShutDown => "the bridge is shutting down",
+            RejectionKind::AtCapacity => "the bridge is at capacity; try again later",
+            _ => "upstream error",
+        }
+    }
 }
 
 impl HubError {
@@ -130,6 +157,7 @@ impl HubError {
         match self {
             HubError::Denied(_) => RejectionKind::Denied,
             HubError::ShutDown => RejectionKind::ShutDown,
+            HubError::AtCapacity => RejectionKind::AtCapacity,
             HubError::Source(source) if source.kind == SourceErrorKind::NotFound => {
                 RejectionKind::NotFound
             }
@@ -147,6 +175,16 @@ impl HubError {
 pub struct StreamError {
     pub kind: SourceErrorKind,
     pub message: String,
+}
+
+impl StreamError {
+    /// The fixed sentence a client is told: see
+    /// [`SourceErrorKind::public_message`]. [`message`](Self::message)
+    /// is the upstream's own text and belongs in operator logs, not in
+    /// an anonymous response body.
+    pub fn public_message(&self) -> &'static str {
+        self.kind.public_message()
+    }
 }
 
 impl From<SourceError> for StreamError {
@@ -260,6 +298,16 @@ impl PumpHandle {
     /// installed while I was unlocked".
     pub fn same_pump(&self, other: &PumpHandle) -> bool {
         self.commands.same_channel(&other.commands)
+    }
+
+    /// True once the pump task has returned — it died on a permanent
+    /// source error, exhausted its error budget, exited idle, or was
+    /// shut down. The task owns the command receiver, so its exit is
+    /// visible here without a reaper task per pump: this is how the hub
+    /// evicts entries for pumps that are no longer running instead of
+    /// retaining them forever.
+    pub fn is_dead(&self) -> bool {
+        self.commands.is_closed()
     }
 
     pub fn topic(&self) -> &str {
