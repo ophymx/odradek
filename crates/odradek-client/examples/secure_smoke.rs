@@ -3,9 +3,16 @@
 //!
 //! ```sh
 //! cargo run -p odradek-client --example secure_smoke -- <bootstrap> \
-//!     [--ca cert.pem] [--mechanism plain|scram256|scram512 --user u --pass p] \
+//!     [--ca cert.pem] [--client-cert c.pem --client-key k.pem] \
+//!     [--mechanism plain|scram256|scram512 --user u --pass p] \
 //!     [--allow-plaintext-credentials]
 //! ```
+//!
+//! `--client-cert`/`--client-key` turn on mutual TLS, for a cluster with
+//! `ssl.client.auth=required`: the connection itself is authenticated by
+//! the certificate, so SASL is optional alongside it rather than the only
+//! way to say who you are. Both flags are needed together, and `--ca` is
+//! what the broker's own certificate is checked against.
 //!
 //! `--mechanism plain` without `--ca` would put the password on an
 //! unencrypted socket, so it is refused unless
@@ -20,7 +27,9 @@ use odradek_client::{ClientConfig, Cluster, Consumer, Mechanism, Producer, SaslC
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let bootstrap = args.next().ok_or("usage: secure_smoke <bootstrap> ...")?;
-    let mut tls = Tls::None;
+    let mut ca = None;
+    let mut client_cert = None;
+    let mut client_key = None;
     let mut mechanism = None;
     let mut user = String::new();
     let mut pass = String::new();
@@ -28,7 +37,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
-            "--ca" => tls = Tls::with_ca_pem(&std::fs::read(value()?)?)?,
+            "--ca" => ca = Some(std::fs::read(value()?)?),
+            "--client-cert" => client_cert = Some(std::fs::read(value()?)?),
+            "--client-key" => client_key = Some(std::fs::read(value()?)?),
             "--allow-plaintext-credentials" => allow_plaintext_credentials = true,
             "--mechanism" => {
                 mechanism = Some(match value()?.as_str() {
@@ -43,6 +54,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             other => return Err(format!("unknown flag {other}").into()),
         }
     }
+    // Trust and identity are separate choices; combine whichever were
+    // given. A client certificate without a CA would mean presenting an
+    // identity to a broker whose own identity is unverified.
+    let tls = match (&ca, &client_cert, &client_key) {
+        (None, None, None) => Tls::None,
+        (Some(ca), None, None) => Tls::with_ca_pem(ca)?,
+        (Some(ca), Some(cert), Some(key)) => Tls::with_ca_and_client_auth(ca, cert, key)?,
+        (None, Some(cert), Some(key)) => Tls::system_with_client_auth(cert, key)?,
+        _ => return Err("--client-cert and --client-key go together".into()),
+    };
+
     let mut config = ClientConfig::default();
     config.bootstrap_servers = vec![bootstrap];
     config.client_id = "odradek-secure-smoke".into();

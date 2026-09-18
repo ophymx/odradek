@@ -8,9 +8,11 @@ one exception).
 
 - **Connections**: framed, correlation-id pipelined, ApiVersions
   negotiation with the `UNSUPPORTED_VERSION` downgrade path; plaintext
-  or TLS (Mozilla roots, custom CA, or caller-built config); optional
-  SASL — PLAIN and SCRAM-SHA-256/512 with server-signature
-  verification — authenticated on every connection; client-side
+  or TLS (Mozilla roots, custom CA, or caller-built config), with
+  optional mutual TLS — a client certificate and key for a cluster
+  running `ssl.client.auth=required`; optional SASL — PLAIN and
+  SCRAM-SHA-256/512 with server-signature verification — authenticated
+  on every connection; client-side
   connect and per-request timeouts, so a hung broker cannot hang the
   caller.
 - **Cluster layer**: metadata discovery, per-broker connection pool and

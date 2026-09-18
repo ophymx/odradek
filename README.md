@@ -54,7 +54,10 @@ Early but functional end to end:
 - `odradek-client`: framed connection with correlation-id pipelining and
   ApiVersions negotiation (including the `UNSUPPORTED_VERSION` downgrade
   path), over plaintext or TLS (rustls; Mozilla roots, custom CA, or a
-  caller-built config), with optional SASL — PLAIN and
+  caller-built config), optionally mutual — a client certificate
+  authenticates the connection itself against a cluster running
+  `ssl.client.auth=required`, verified live against one — with optional
+  SASL — PLAIN and
   SCRAM-SHA-256/512 per RFC 5802, server signature verified, checked
   against the RFC 7677 vector — authenticated on every connection; the cluster layer: metadata discovery, a per-broker connection
   pool with per-broker version ranges, and partition-leader routing; and
