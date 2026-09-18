@@ -1,10 +1,11 @@
 //! Record batch (v2) round-trips, crc verification, and hostile input.
 
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use odradek_protocol::DecodeError;
 use odradek_protocol::records::{
     Compression, MAGIC, Record, RecordBatch, RecordHeader, Records, crc32c, decode_set, encode_set,
 };
+use odradek_protocol::wire;
 
 fn sample_batch() -> RecordBatch {
     RecordBatch {
@@ -55,6 +56,52 @@ fn crc32c_known_vectors() {
     // The standard CRC-32C check value, plus the empty string.
     assert_eq!(crc32c(b"123456789"), 0xe306_9283);
     assert_eq!(crc32c(b""), 0);
+}
+
+/// The textbook byte-at-a-time CRC-32C, which the shipped slicing-by-8
+/// implementation must agree with on every input.
+fn reference_crc32c(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0x82f6_3b78
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+#[test]
+fn crc32c_agrees_with_the_bitwise_reference() {
+    // Lengths on and around every eight-byte boundary the wide loop
+    // cares about, so a mishandled remainder cannot hide.
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        u8::try_from((state >> 33) & 0xff).expect("masked to a byte")
+    };
+    for len in [
+        0, 1, 2, 7, 8, 9, 15, 16, 17, 31, 63, 64, 65, 127, 1000, 1023, 1024, 1025, 4097,
+    ] {
+        let data: Vec<u8> = (0..len).map(|_| next()).collect();
+        assert_eq!(
+            crc32c(&data),
+            reference_crc32c(&data),
+            "crc mismatch at {len} bytes"
+        );
+        // All-zero and all-one runs of the same length too: the tables
+        // are indexed by byte value, not just by position.
+        let zeros = vec![0u8; len];
+        assert_eq!(crc32c(&zeros), reference_crc32c(&zeros), "zeros at {len}");
+        let ones = vec![0xffu8; len];
+        assert_eq!(crc32c(&ones), reference_crc32c(&ones), "ones at {len}");
+    }
 }
 
 #[test]
@@ -247,4 +294,163 @@ fn hostile_prefixes_error_cleanly() {
     let mut lying = BytesMut::from(&wire[..]);
     lying[60] ^= 0x40; // somewhere inside the first record's bytes
     assert!(RecordBatch::decode(&mut lying.freeze()).is_err());
+}
+
+/// A batch whose records exercise every field shape the encoder has to
+/// size analytically: absent, empty and present key/value, multi-byte
+/// zigzag varints of both signs, a value long enough to need a two-byte
+/// length varint, and headers with and without values.
+fn wide_batch() -> RecordBatch {
+    RecordBatch {
+        base_offset: 9_000_000_000,
+        partition_leader_epoch: 17,
+        attributes: 1 << 3, // log-append time
+        last_offset_delta: 4,
+        base_timestamp: 1_726_000_000_000,
+        max_timestamp: 1_726_000_009_999,
+        producer_id: 77,
+        producer_epoch: 2,
+        base_sequence: 13,
+        records: Records::Plain(vec![
+            Record::default(),
+            Record {
+                attributes: -1,
+                timestamp_delta: -1_000_000,
+                offset_delta: 1,
+                key: Some(Bytes::from_static(b"")),
+                value: Some(Bytes::from_static(b"")),
+                headers: Vec::new(),
+            },
+            Record {
+                attributes: 0,
+                timestamp_delta: 9_999,
+                offset_delta: 2,
+                key: Some(Bytes::from_static(b"k")),
+                value: Some(Bytes::from(vec![0x5au8; 300])),
+                headers: vec![
+                    RecordHeader {
+                        key: String::new(),
+                        value: None,
+                    },
+                    RecordHeader {
+                        key: "h".into(),
+                        value: Some(Bytes::from_static(b"v")),
+                    },
+                ],
+            },
+            Record {
+                attributes: 0,
+                timestamp_delta: i64::MAX,
+                offset_delta: 3,
+                key: None,
+                value: Some(Bytes::from_static(b"tail")),
+                // 64 headers: one past the point where the zigzag header
+                // count itself needs a second varint byte.
+                headers: (0..64)
+                    .map(|i| RecordHeader {
+                        key: format!("h{i}"),
+                        value: (i % 2 == 0).then(|| Bytes::from(vec![u8::try_from(i).unwrap(); 3])),
+                    })
+                    .collect(),
+            },
+            Record {
+                attributes: 0,
+                timestamp_delta: i64::MIN,
+                offset_delta: 4,
+                key: Some(Bytes::from_static(b"last")),
+                value: None,
+                headers: Vec::new(),
+            },
+        ]),
+    }
+}
+
+/// The record encoder as it was before it sized bodies analytically:
+/// build the body in a side buffer, then prefix its measured length.
+/// Kept here as the reference the fast path must match byte for byte.
+fn reference_encode_record(record: &Record, buf: &mut BytesMut) {
+    fn put_bytes(buf: &mut BytesMut, value: Option<&[u8]>) {
+        match value {
+            Some(v) => {
+                wire::put_varint(buf, v.len() as i64);
+                buf.put_slice(v);
+            }
+            None => wire::put_varint(buf, -1),
+        }
+    }
+
+    let mut body = BytesMut::new();
+    body.put_i8(record.attributes);
+    wire::put_varint(&mut body, record.timestamp_delta);
+    wire::put_varint(&mut body, i64::from(record.offset_delta));
+    put_bytes(&mut body, record.key.as_deref());
+    put_bytes(&mut body, record.value.as_deref());
+    wire::put_varint(&mut body, record.headers.len() as i64);
+    for header in &record.headers {
+        put_bytes(&mut body, Some(header.key.as_bytes()));
+        put_bytes(&mut body, header.value.as_deref());
+    }
+    wire::put_varint(buf, body.len() as i64);
+    buf.put_slice(&body);
+}
+
+/// The same for a whole batch: body first, then the prefix whose crc
+/// covers it.
+fn reference_encode_batch(batch: &RecordBatch, buf: &mut BytesMut) {
+    let mut tail = BytesMut::new();
+    tail.put_i16(batch.attributes);
+    tail.put_i32(batch.last_offset_delta);
+    tail.put_i64(batch.base_timestamp);
+    tail.put_i64(batch.max_timestamp);
+    tail.put_i64(batch.producer_id);
+    tail.put_i16(batch.producer_epoch);
+    tail.put_i32(batch.base_sequence);
+    tail.put_i32(batch.record_count().unwrap());
+    match &batch.records {
+        Records::Plain(records) => {
+            for record in records {
+                reference_encode_record(record, &mut tail);
+            }
+        }
+        Records::Compressed { payload, .. } => tail.extend_from_slice(payload),
+    }
+    buf.put_i64(batch.base_offset);
+    buf.put_i32(i32::try_from(4 + 1 + 4 + tail.len()).unwrap());
+    buf.put_i32(batch.partition_leader_epoch);
+    buf.put_i8(MAGIC);
+    buf.put_u32(crc32c(&tail));
+    buf.put_slice(&tail);
+}
+
+#[test]
+fn encoding_is_byte_identical_to_the_side_buffer_reference() {
+    // Analytic body lengths are only correct if they agree with the
+    // measured ones for every field shape, in every record of a batch.
+    for batch in [
+        wide_batch(),
+        sample_batch(),
+        RecordBatch::default(),
+        RecordBatch {
+            attributes: 2, // snappy: the payload stays opaque
+            records: Records::Compressed {
+                count: 3,
+                payload: Bytes::from_static(b"opaque"),
+            },
+            ..RecordBatch::default()
+        },
+    ] {
+        let mut expected = BytesMut::new();
+        reference_encode_batch(&batch, &mut expected);
+        assert_eq!(encode(&batch), expected.clone().freeze(), "generic encode");
+
+        // The in-place encoder must agree too, including when it is
+        // appending after bytes that are already in the buffer.
+        let mut in_place = BytesMut::from(&b"prefix"[..]);
+        batch.encode_to(&mut in_place).unwrap();
+        assert_eq!(&in_place[6..], &expected[..], "encode_to");
+
+        // And the round trip still closes.
+        let decoded = RecordBatch::decode(&mut expected.freeze()).unwrap();
+        assert_eq!(decoded, batch);
+    }
 }

@@ -156,38 +156,71 @@ impl RecordBatch {
         }
     }
 
+    /// Encode into any [`BufMut`].
+    ///
+    /// The crc covers everything after itself, so a destination that
+    /// cannot be read back forces the batch body through a scratch
+    /// buffer first. Callers that already hold a `BytesMut` should use
+    /// [`RecordBatch::encode_to`], which writes in place and skips both
+    /// the allocation and the copy.
     pub fn encode(&self, buf: &mut impl BufMut) -> Result<(), EncodeError> {
-        // The crc covers attributes through the end of the batch, so the
-        // tail must exist before the prefix can be written.
-        let mut tail = BytesMut::new();
-        tail.put_i16(self.attributes);
-        tail.put_i32(self.last_offset_delta);
-        tail.put_i64(self.base_timestamp);
-        tail.put_i64(self.max_timestamp);
-        tail.put_i64(self.producer_id);
-        tail.put_i16(self.producer_epoch);
-        tail.put_i32(self.base_sequence);
-        tail.put_i32(self.record_count()?);
+        let mut scratch = BytesMut::new();
+        self.encode_to(&mut scratch)?;
+        buf.put_slice(&scratch);
+        Ok(())
+    }
+
+    /// Append this batch to `buf`, computing the crc over the bytes just
+    /// written rather than over a side buffer.
+    ///
+    /// The batch length and crc are back-patched once the body is in
+    /// place. On error `buf` is truncated back to the length it had on
+    /// entry, so a failed batch leaves no partial bytes behind.
+    pub fn encode_to(&self, buf: &mut BytesMut) -> Result<(), EncodeError> {
+        let start = buf.len();
+        match self.encode_in_place(buf, start) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                buf.truncate(start);
+                Err(error)
+            }
+        }
+    }
+
+    fn encode_in_place(&self, buf: &mut BytesMut, start: usize) -> Result<(), EncodeError> {
+        let record_count = self.record_count()?;
+        buf.put_i64(self.base_offset);
+        buf.put_i32(0); // batch_length, back-patched below
+        buf.put_i32(self.partition_leader_epoch);
+        buf.put_i8(MAGIC);
+        buf.put_u32(0); // crc, back-patched below
+        let body = buf.len();
+
+        buf.put_i16(self.attributes);
+        buf.put_i32(self.last_offset_delta);
+        buf.put_i64(self.base_timestamp);
+        buf.put_i64(self.max_timestamp);
+        buf.put_i64(self.producer_id);
+        buf.put_i16(self.producer_epoch);
+        buf.put_i32(self.base_sequence);
+        buf.put_i32(record_count);
         match &self.records {
             Records::Plain(records) => {
                 for record in records {
-                    record.encode(&mut tail)?;
+                    record.encode(buf)?;
                 }
             }
-            Records::Compressed { payload, .. } => tail.extend_from_slice(payload),
+            Records::Compressed { payload, .. } => buf.extend_from_slice(payload),
         }
 
-        let batch_length = 4 + 1 + 4 + tail.len(); // epoch + magic + crc + tail
+        let batch_length = 4 + 1 + 4 + (buf.len() - body); // epoch + magic + crc + body
         let batch_length = i32::try_from(batch_length).map_err(|_| EncodeError::TooLong {
             len: batch_length,
             max: i32::MAX as usize,
         })?;
-        buf.put_i64(self.base_offset);
-        buf.put_i32(batch_length);
-        buf.put_i32(self.partition_leader_epoch);
-        buf.put_i8(MAGIC);
-        buf.put_u32(crc32c(&tail));
-        buf.put_slice(&tail);
+        let crc = crc32c(&buf[body..]);
+        buf[start + 8..start + 12].copy_from_slice(&batch_length.to_be_bytes());
+        buf[body - 4..body].copy_from_slice(&crc.to_be_bytes());
         Ok(())
     }
 
@@ -275,24 +308,55 @@ impl RecordBatch {
 }
 
 impl Record {
+    /// Encoded length of everything after this record's length prefix.
+    ///
+    /// Computed rather than measured: the length prefix comes first on
+    /// the wire, and sizing the body analytically is what lets the
+    /// fields go straight to the destination instead of through a
+    /// per-record side buffer.
+    fn body_len(&self, header_count: i64) -> usize {
+        fn bytes_len(value: Option<&[u8]>) -> usize {
+            match value {
+                Some(v) => wire::varint_len(v.len() as i64) + v.len(),
+                None => wire::varint_len(-1),
+            }
+        }
+
+        let mut len = 1; // attributes
+        len += wire::varint_len(self.timestamp_delta);
+        len += wire::varint_len(i64::from(self.offset_delta));
+        len += bytes_len(self.key.as_deref());
+        len += bytes_len(self.value.as_deref());
+        len += wire::varint_len(header_count);
+        for header in &self.headers {
+            len += bytes_len(Some(header.key.as_bytes()));
+            len += bytes_len(header.value.as_deref());
+        }
+        len
+    }
+
     pub fn encode(&self, buf: &mut impl BufMut) -> Result<(), EncodeError> {
-        let mut body = BytesMut::new();
-        body.put_i8(self.attributes);
-        wire::put_varint(&mut body, self.timestamp_delta);
-        wire::put_varint(&mut body, i64::from(self.offset_delta));
-        put_varint_bytes(&mut body, self.key.as_deref());
-        put_varint_bytes(&mut body, self.value.as_deref());
         let header_count = i64::try_from(self.headers.len()).map_err(|_| EncodeError::TooLong {
             len: self.headers.len(),
             max: usize::try_from(i64::MAX).unwrap_or(usize::MAX),
         })?;
-        wire::put_varint(&mut body, header_count);
+        let body_len = self.body_len(header_count);
+        let body_len = i64::try_from(body_len).map_err(|_| EncodeError::TooLong {
+            len: body_len,
+            max: usize::try_from(i64::MAX).unwrap_or(usize::MAX),
+        })?;
+
+        wire::put_varint(buf, body_len);
+        buf.put_i8(self.attributes);
+        wire::put_varint(buf, self.timestamp_delta);
+        wire::put_varint(buf, i64::from(self.offset_delta));
+        put_varint_bytes(buf, self.key.as_deref());
+        put_varint_bytes(buf, self.value.as_deref());
+        wire::put_varint(buf, header_count);
         for header in &self.headers {
-            put_varint_bytes(&mut body, Some(header.key.as_bytes()));
-            put_varint_bytes(&mut body, header.value.as_deref());
+            put_varint_bytes(buf, Some(header.key.as_bytes()));
+            put_varint_bytes(buf, header.value.as_deref());
         }
-        wire::put_varint(buf, body.len() as i64);
-        buf.put_slice(&body);
         Ok(())
     }
 
@@ -369,8 +433,14 @@ pub fn decode_set(buf: &mut Bytes) -> Result<Vec<RecordBatch>, DecodeError> {
 
 /// Encode a record set: batches back to back.
 pub fn encode_set(buf: &mut impl BufMut, batches: &[RecordBatch]) -> Result<(), EncodeError> {
+    // One scratch buffer for the whole set, reused batch to batch: a
+    // generic BufMut cannot be read back, and the crc must be written
+    // before the body it covers.
+    let mut scratch = BytesMut::new();
     for batch in batches {
-        batch.encode(buf)?;
+        scratch.clear();
+        batch.encode_to(&mut scratch)?;
+        buf.put_slice(&scratch);
     }
     Ok(())
 }
@@ -403,19 +473,43 @@ fn get_varint_bytes(buf: &mut Bytes) -> Result<Option<Bytes>, DecodeError> {
 
 /// CRC-32C (Castagnoli), the checksum record batches use. Distinct from
 /// the CRC-32 that magic 0/1 message sets used.
+///
+/// Slicing-by-8: each iteration folds eight input bytes at once through
+/// eight tables, breaking the serial dependency that makes the classic
+/// one-byte loop wait a table lookup per byte. Pure safe Rust, so it
+/// needs no runtime feature detection — a machine with the SSE4.2 `crc32`
+/// instruction would still be faster, but that needs `unsafe`.
 pub fn crc32c(data: &[u8]) -> u32 {
     let mut crc = !0u32;
-    for &byte in data {
-        crc = (crc >> 8) ^ CRC32C_TABLE[((crc ^ u32::from(byte)) & 0xff) as usize];
+    let mut chunks = data.chunks_exact(8);
+    for chunk in &mut chunks {
+        // The reflected algorithm consumes bytes little-endian first.
+        let low = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) ^ crc;
+        let high = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        crc = CRC32C_TABLES[7][(low & 0xff) as usize]
+            ^ CRC32C_TABLES[6][((low >> 8) & 0xff) as usize]
+            ^ CRC32C_TABLES[5][((low >> 16) & 0xff) as usize]
+            ^ CRC32C_TABLES[4][(low >> 24) as usize]
+            ^ CRC32C_TABLES[3][(high & 0xff) as usize]
+            ^ CRC32C_TABLES[2][((high >> 8) & 0xff) as usize]
+            ^ CRC32C_TABLES[1][((high >> 16) & 0xff) as usize]
+            ^ CRC32C_TABLES[0][(high >> 24) as usize];
+    }
+    // Up to seven bytes the wide loop could not take, a byte at a time.
+    for &byte in chunks.remainder() {
+        crc = (crc >> 8) ^ CRC32C_TABLES[0][((crc ^ u32::from(byte)) & 0xff) as usize];
     }
     !crc
 }
 
-static CRC32C_TABLE: [u32; 256] = crc32c_table();
+static CRC32C_TABLES: [[u32; 256]; 8] = crc32c_tables();
 
+/// Table `n` holds the residue of a byte shifted `n` places further into
+/// the message, so table 0 is the classic byte-at-a-time table and each
+/// later one advances it by another byte.
 #[expect(clippy::cast_possible_truncation)] // i < 256
-const fn crc32c_table() -> [u32; 256] {
-    let mut table = [0u32; 256];
+const fn crc32c_tables() -> [[u32; 256]; 8] {
+    let mut tables = [[0u32; 256]; 8];
     let mut i = 0;
     while i < 256 {
         let mut crc = i as u32;
@@ -428,8 +522,18 @@ const fn crc32c_table() -> [u32; 256] {
             };
             bit += 1;
         }
-        table[i] = crc;
+        tables[0][i] = crc;
         i += 1;
     }
-    table
+    let mut slice = 1;
+    while slice < 8 {
+        let mut i = 0;
+        while i < 256 {
+            let previous = tables[slice - 1][i];
+            tables[slice][i] = (previous >> 8) ^ tables[0][(previous & 0xff) as usize];
+            i += 1;
+        }
+        slice += 1;
+    }
+    tables
 }

@@ -21,5 +21,18 @@ pub trait Message: Sized {
     const MAX_VERSION: i16;
 
     fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError>;
+
+    /// Decode one message of `version`.
+    ///
+    /// Decoding costs O(fields), not O(payload bytes), but only when
+    /// `buf` is a [`Bytes`](bytes::Bytes): payload fields (a fetch
+    /// response's `records`, and the keys and values inside them) are
+    /// then refcounted slices of the caller's buffer rather than copies.
+    /// That comes from `Bytes`'s override of `Buf::copy_to_bytes`; other
+    /// `Buf` implementations — slices, `Cursor`, `Chain` — get the
+    /// default, which allocates and copies every payload, measured ~370x
+    /// slower for a 1 MiB fetch response. Decode from a `Bytes` on any
+    /// path that carries records. `tests/zero_copy.rs` holds the
+    /// property to it.
     fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError>;
 }

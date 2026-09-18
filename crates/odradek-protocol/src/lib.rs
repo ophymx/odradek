@@ -27,6 +27,20 @@
 //!   byte-identically (the proxy guarantee).
 //! - [`error_code`]: the open-world Kafka error code registry.
 //! - [`error`]: encode/decode error types.
+//!
+//! # Zero-copy decoding
+//!
+//! Decoding a message costs O(fields) rather than O(payload bytes) —
+//! but only when the source is a [`Bytes`](bytes::Bytes). Payload fields
+//! (a fetch response's `records`, and the keys and values inside them)
+//! are then refcounted slices of the caller's buffer, never copies.
+//! The property comes from `Bytes`'s override of `Buf::copy_to_bytes`;
+//! every other `Buf` implementation — slices, `Cursor`, `Chain` — falls
+//! back to the default, which allocates and copies each payload,
+//! measured ~370x slower for a 1 MiB fetch response. Decode from a
+//! `Bytes` on any path that carries records. `tests/zero_copy.rs` holds
+//! the guarantee to it, down to asserting the decoded payloads alias the
+//! input buffer.
 
 pub mod api_key;
 pub mod consumer_protocol;

@@ -137,6 +137,12 @@ fn zigzag_decode(value: u64) -> i64 {
     ((value >> 1) as i64) ^ -((value & 1) as i64)
 }
 
+/// Number of bytes [`put_varint`] emits for `value`. Lets an encoder
+/// size a body before writing it instead of measuring a side buffer.
+pub(crate) fn varint_len(value: i64) -> usize {
+    unsigned_varint_len(zigzag_encode(value))
+}
+
 /// Number of bytes [`put_unsigned_varint`] emits for `value`.
 pub fn unsigned_varint_len(value: u64) -> usize {
     // 1 byte per started 7-bit group; value 0 still takes one byte.
