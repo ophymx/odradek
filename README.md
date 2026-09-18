@@ -87,7 +87,8 @@ Early but functional end to end:
 - `odradek-acceptance`: conformance checks for **both roles** over raw
   connections independent of the client crate — `api-versions/*`,
   `metadata/*`, `produce/*`, `fetch/*`, `list-offsets/*`,
-  `find-coordinator/*`, and `offsets/*` server checks, covering
+  `find-coordinator/*`, `offsets/*`, and `create-topics/*` server
+  checks, covering
   everything a consumer needs short of group membership: the log start
   and log end bracket exactly what was produced, a group key names a
   reachable coordinator in whichever shape the negotiated version
@@ -101,7 +102,16 @@ Early but functional end to end:
   `find-coordinator/group` into 7 that straddle the v4 shape change. A
   fault that misbehaves only at the lowest version keeps that honest: it
   is undetectable by a suite that negotiates once, so calibration fails
-  if the sweep is ever removed. Also (including a
+  if the sweep is ever removed. Error paths are checked as deliberately
+  as success ones, because that is where reimplementations diverge: a
+  fetch past the high watermark must answer OFFSET_OUT_OF_RANGE rather
+  than the empty batch set a caught-up consumer sees, an unknown topic
+  must be *named* in the Metadata response with
+  UNKNOWN_TOPIC_OR_PARTITION rather than omitted (a client cannot tell
+  absent from ignored), a duplicate CreateTopics must be refused with
+  TOPIC_ALREADY_EXISTS, and `validate_only` must answer without
+  creating — checked by creating for real afterwards and watching for
+  the give-away. Also (including a
   create → produce → fetch flow that asserts the broker returns the
   produced batch byte-identical in the crc-covered region) and `client/*`
   client checks, where the harness impersonates a three-broker cluster so

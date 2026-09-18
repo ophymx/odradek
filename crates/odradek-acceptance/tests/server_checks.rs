@@ -92,6 +92,16 @@ const SENSITIVITY: &[(Fault, &str)] = &[
     // subject that is correct at its maximum version and wrong below it
     // passes any suite that negotiates once and stops.
     (Fault::FetchCorruptOnOldVersions, "fetch/batch-integrity"),
+    (Fault::FetchPastEndSucceeds, "fetch/offset-out-of-range"),
+    (Fault::MetadataUnknownTopicOmitted, "metadata/unknown-topic"),
+    (
+        Fault::CreateTopicsDuplicateSucceeds,
+        "create-topics/duplicate",
+    ),
+    (
+        Fault::CreateTopicsValidateOnlyCreates,
+        "create-topics/validate-only",
+    ),
 ];
 
 /// The calibration registry is exhaustive in both directions against the

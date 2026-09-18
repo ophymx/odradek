@@ -25,7 +25,7 @@ use odradek_protocol::messages::list_offsets_request::{
     ListOffsetsPartition, ListOffsetsRequest, ListOffsetsTopic,
 };
 use odradek_protocol::messages::list_offsets_response::ListOffsetsResponse;
-use odradek_protocol::messages::metadata_request::MetadataRequest;
+use odradek_protocol::messages::metadata_request::{MetadataRequest, MetadataRequestTopic};
 use odradek_protocol::messages::metadata_response::MetadataResponse;
 use odradek_protocol::messages::offset_commit_request::{
     OffsetCommitRequest, OffsetCommitRequestPartition, OffsetCommitRequestTopic,
@@ -146,6 +146,30 @@ pub static SERVER_CHECKS: &[Check] = &[
         requirement: "reports a partition a group never committed as offset -1 \
                       with no error, rather than as 0 or as a failure",
         runner: Runner::Server(|ctx| Box::pin(offsets_unset_is_sentinel(ctx))),
+    },
+    Check {
+        id: "fetch/offset-out-of-range",
+        requirement: "answers a fetch past the high watermark with \
+                      OFFSET_OUT_OF_RANGE rather than with an empty batch set",
+        runner: Runner::Server(|ctx| Box::pin(fetch_offset_out_of_range(ctx))),
+    },
+    Check {
+        id: "metadata/unknown-topic",
+        requirement: "names a topic it does not have in the response, carrying \
+                      UNKNOWN_TOPIC_OR_PARTITION, rather than omitting it",
+        runner: Runner::Server(|ctx| Box::pin(metadata_unknown_topic(ctx))),
+    },
+    Check {
+        id: "create-topics/duplicate",
+        requirement: "refuses a second CreateTopics for an existing topic with \
+                      TOPIC_ALREADY_EXISTS",
+        runner: Runner::Server(|ctx| Box::pin(create_topics_duplicate(ctx))),
+    },
+    Check {
+        id: "create-topics/validate-only",
+        requirement: "a validate_only request reports what would happen without \
+                      creating the topic",
+        runner: Runner::Server(|ctx| Box::pin(create_topics_validate_only(ctx))),
     },
 ];
 
@@ -1076,6 +1100,278 @@ async fn api_call<T: Message>(
         body,
     )
     .await
+}
+
+/// A fetch past the end of the log is an error, not silence.
+///
+/// The wrong answer is quiet: an empty batch set is what a caught-up
+/// consumer sees, so a server that answers an impossible offset that way
+/// leaves a client polling forever at a position that will never exist.
+async fn fetch_offset_out_of_range(ctx: &ServerCtx) -> Verdict {
+    let fetch_range = match ctx.range(FetchRequest::API_KEY) {
+        Ok(r) => r,
+        Err(v) => return v,
+    };
+    let version = match negotiate(
+        "Fetch",
+        fetch_range,
+        FetchRequest::MIN_VERSION,
+        FETCH_NAME_MAX,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let mut produced = match produce_flow(ctx, "outofrange", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+
+    // Far past anything the probe batch could have written.
+    let beyond = 1_000_000;
+    let mut fetch_partition = FetchPartition::default();
+    fetch_partition.partition = 0;
+    fetch_partition.current_leader_epoch = -1;
+    fetch_partition.fetch_offset = beyond;
+    fetch_partition.last_fetched_epoch = -1;
+    fetch_partition.log_start_offset = -1;
+    fetch_partition.partition_max_bytes = 1 << 20;
+    let mut fetch_topic = FetchTopic::default();
+    fetch_topic.topic = produced.topic.clone();
+    fetch_topic.partitions = vec![fetch_partition];
+    let mut request = FetchRequest::default();
+    request.replica_id = -1;
+    request.max_wait_ms = 500;
+    request.min_bytes = 0;
+    request.max_bytes = 1 << 20;
+    request.session_epoch = -1;
+    request.topics = vec![fetch_topic];
+    let mut body = BytesMut::new();
+    if let Err(e) = request.encode(&mut body, version) {
+        return Verdict::Error {
+            details: format!("encoding Fetch: {e}"),
+        };
+    }
+    let resp: FetchResponse = match api_call(
+        &mut produced.conn,
+        FetchRequest::API_KEY,
+        version,
+        91,
+        &body,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return e.into_verdict(),
+    };
+    let Some(partition) = resp.responses.first().and_then(|t| t.partitions.first()) else {
+        return Verdict::Fail {
+            details: format!("fetch response omits {}[0]", produced.topic),
+        };
+    };
+    let code = ErrorCode(partition.error_code);
+    if code == ErrorCode::OFFSET_OUT_OF_RANGE {
+        return Verdict::Pass;
+    }
+    if code.is_ok() {
+        return Verdict::Fail {
+            details: format!(
+                "fetch at offset {beyond} of a log with high watermark {} answered \
+                 NONE with {} record byte(s) — a consumer cannot tell this from \
+                 being caught up",
+                partition.high_watermark,
+                partition.records.as_ref().map_or(0, |r| r.len())
+            ),
+        };
+    }
+    Verdict::Fail {
+        details: format!("fetch at offset {beyond} answered {code}, expected OFFSET_OUT_OF_RANGE"),
+    }
+}
+
+/// An unknown topic is named in the response, not left out of it.
+async fn metadata_unknown_topic(ctx: &ServerCtx) -> Verdict {
+    let advertised = match ctx.range(MetadataRequest::API_KEY) {
+        Ok(a) => a,
+        Err(v) => return v,
+    };
+    let version = match negotiate("Metadata", advertised, 1, MetadataRequest::MAX_VERSION) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let topic = unique_topic("nosuch");
+    let mut conn = match connect(&ctx.addr).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
+
+    let mut requested = MetadataRequestTopic::default();
+    requested.name = Some(topic.clone());
+    let mut request = MetadataRequest::default();
+    request.topics = Some(vec![requested]);
+    // The flag is the point: without it a broker configured to
+    // auto-create would answer by creating the topic, and the check would
+    // be testing configuration rather than the protocol.
+    request.allow_auto_topic_creation = false;
+    let mut body = BytesMut::new();
+    if let Err(e) = request.encode(&mut body, version) {
+        return Verdict::Error {
+            details: format!("encoding Metadata: {e}"),
+        };
+    }
+    let resp: MetadataResponse =
+        match api_call(&mut conn, MetadataRequest::API_KEY, version, 95, &body).await {
+            Ok(r) => r,
+            Err(e) => return e.into_verdict(),
+        };
+
+    let Some(entry) = resp
+        .topics
+        .iter()
+        .find(|t| t.name.as_deref() == Some(topic.as_str()))
+    else {
+        return Verdict::Fail {
+            details: format!(
+                "asked about {topic:?}, which does not exist; response names {} topic(s) \
+                 and not that one, so a client cannot tell absent from ignored",
+                resp.topics.len()
+            ),
+        };
+    };
+    let code = ErrorCode(entry.error_code);
+    if code == ErrorCode::UNKNOWN_TOPIC_OR_PARTITION {
+        Verdict::Pass
+    } else {
+        Verdict::Fail {
+            details: format!("{topic:?} does not exist but is reported with {code}"),
+        }
+    }
+}
+
+/// One CreateTopics exchange, returning the per-topic result.
+async fn create_topic_call(
+    ctx: &ServerCtx,
+    conn: &mut RawConnection,
+    version: i16,
+    topic: &str,
+    validate_only: bool,
+    correlation_id: i32,
+) -> Result<(ErrorCode, [u8; 16]), CheckError> {
+    let _ = ctx;
+    let mut creatable = CreatableTopic::default();
+    creatable.name = topic.to_owned();
+    creatable.num_partitions = 1;
+    creatable.replication_factor = 1;
+    let mut request = CreateTopicsRequest::default();
+    request.topics = vec![creatable];
+    request.timeout_ms = 30_000;
+    request.validate_only = validate_only;
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding CreateTopics: {e}")))?;
+    let resp: CreateTopicsResponse = api_call(
+        conn,
+        CreateTopicsRequest::API_KEY,
+        version,
+        correlation_id,
+        &body,
+    )
+    .await?;
+    let result = resp
+        .topics
+        .first()
+        .ok_or_else(|| CheckError::Violation("CreateTopics response names no topics".into()))?;
+    Ok((ErrorCode(result.error_code), result.topic_id))
+}
+
+/// Creating a topic that exists is refused, and says why.
+async fn create_topics_duplicate(ctx: &ServerCtx) -> Verdict {
+    let version = match negotiate(
+        "CreateTopics",
+        match ctx.range(CreateTopicsRequest::API_KEY) {
+            Ok(a) => a,
+            Err(v) => return v,
+        },
+        CreateTopicsRequest::MIN_VERSION,
+        CreateTopicsRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let mut conn = match connect(&ctx.addr).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
+    let topic = unique_topic("dup");
+
+    match create_topic_call(ctx, &mut conn, version, &topic, false, 96).await {
+        Ok((code, _)) if code.is_ok() => {}
+        Ok((code, _)) => {
+            return Verdict::Fail {
+                details: format!("creating a fresh topic failed with {code}"),
+            };
+        }
+        Err(e) => return e.into_verdict(),
+    }
+    match create_topic_call(ctx, &mut conn, version, &topic, false, 97).await {
+        Ok((code, _)) if code == ErrorCode::TOPIC_ALREADY_EXISTS => Verdict::Pass,
+        Ok((code, _)) if code.is_ok() => Verdict::Fail {
+            details: "creating the same topic twice succeeded both times".into(),
+        },
+        Ok((code, _)) => Verdict::Fail {
+            details: format!(
+                "recreating an existing topic answered {code}, expected TOPIC_ALREADY_EXISTS"
+            ),
+        },
+        Err(e) => e.into_verdict(),
+    }
+}
+
+/// `validate_only` answers the question without doing the thing.
+///
+/// Checked by asking twice: a validate_only create, then a real one. If
+/// the first actually created the topic, the second reports
+/// TOPIC_ALREADY_EXISTS and gives the game away.
+async fn create_topics_validate_only(ctx: &ServerCtx) -> Verdict {
+    let version = match negotiate(
+        "CreateTopics",
+        match ctx.range(CreateTopicsRequest::API_KEY) {
+            Ok(a) => a,
+            Err(v) => return v,
+        },
+        CreateTopicsRequest::MIN_VERSION,
+        CreateTopicsRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let mut conn = match connect(&ctx.addr).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
+    let topic = unique_topic("validate");
+
+    match create_topic_call(ctx, &mut conn, version, &topic, true, 98).await {
+        Ok((code, _)) if code.is_ok() => {}
+        Ok((code, _)) => {
+            return Verdict::Fail {
+                details: format!("a validate_only create of a fresh topic reported {code}"),
+            };
+        }
+        Err(e) => return e.into_verdict(),
+    }
+    match create_topic_call(ctx, &mut conn, version, &topic, false, 99).await {
+        Ok((code, _)) if code.is_ok() => Verdict::Pass,
+        Ok((code, _)) if code == ErrorCode::TOPIC_ALREADY_EXISTS => Verdict::Fail {
+            details: "validate_only created the topic: the real create that \
+                      followed it reported TOPIC_ALREADY_EXISTS"
+                .into(),
+        },
+        Ok((code, _)) => Verdict::Fail {
+            details: format!("creating the topic after validating it answered {code}"),
+        },
+        Err(e) => e.into_verdict(),
+    }
 }
 
 /// Name the version a swept check was on when it failed.

@@ -119,6 +119,17 @@ pub enum Fault {
     /// Answer a never-committed partition with 0 rather than the -1
     /// sentinel — a plausible offset where "nothing here" was meant.
     OffsetFetchUnsetIsZero,
+    /// Answer a fetch past the high watermark with an empty batch set
+    /// instead of OFFSET_OUT_OF_RANGE.
+    FetchPastEndSucceeds,
+    /// Omit an unknown topic from a Metadata response instead of naming
+    /// it with UNKNOWN_TOPIC_OR_PARTITION — the client cannot tell
+    /// "absent" from "never mentioned".
+    MetadataUnknownTopicOmitted,
+    /// Answer a second CreateTopics for an existing topic with NONE.
+    CreateTopicsDuplicateSucceeds,
+    /// Create the topic even though the request said validate_only.
+    CreateTopicsValidateOnlyCreates,
     /// Corrupt stored batches only when the fetch was made at the
     /// *lowest* version this subject advertises.
     ///
@@ -160,6 +171,10 @@ impl Fault {
         Fault::OffsetFetchLosesCommit,
         Fault::OffsetFetchUnsetIsZero,
         Fault::FetchCorruptOnOldVersions,
+        Fault::FetchPastEndSucceeds,
+        Fault::MetadataUnknownTopicOmitted,
+        Fault::CreateTopicsDuplicateSucceeds,
+        Fault::CreateTopicsValidateOnlyCreates,
     ];
 }
 
@@ -277,6 +292,10 @@ struct ConnState {
     topic_names: HashMap<[u8; 16], String>,
     /// Committed offsets, keyed by (group, topic, partition).
     committed: HashMap<(String, String, i32), i64>,
+    /// Topics CreateTopics actually created. Distinct from `logs`, which
+    /// only gains an entry once something is produced, and from
+    /// `topic_names`, which maps ids: a topic can exist and be empty.
+    created: HashMap<String, [u8; 16]>,
 }
 
 /// A deterministic per-name topic id; never the zero uuid.
@@ -319,8 +338,12 @@ async fn handle_connection(mut stream: TcpStream, faults: Vec<Fault>) {
         let api_version = i16::from_be_bytes([frame[2], frame[3]]);
         let out = match api_key {
             ApiVersionsRequest::API_KEY => api_versions_exchange(frame, api_version, &faults),
-            MetadataRequest::API_KEY => metadata_exchange(frame, api_version, local_port, &faults),
-            CreateTopicsRequest::API_KEY => create_topics_exchange(frame, api_version, &mut state),
+            MetadataRequest::API_KEY => {
+                metadata_exchange(frame, api_version, local_port, &faults, &state)
+            }
+            CreateTopicsRequest::API_KEY => {
+                create_topics_exchange(frame, api_version, &faults, &mut state)
+            }
             ProduceRequest::API_KEY => produce_exchange(frame, api_version, &faults, &mut state),
             FetchRequest::API_KEY => fetch_exchange(frame, api_version, &faults, &state),
             ListOffsetsRequest::API_KEY => {
@@ -734,6 +757,7 @@ fn metadata_exchange(
     api_version: i16,
     local_port: i32,
     faults: &[Fault],
+    state: &ConnState,
 ) -> Option<BytesMut> {
     let has = |f: Fault| faults.contains(&f);
     if !(MetadataRequest::MIN_VERSION..=MetadataRequest::MAX_VERSION).contains(&api_version) {
@@ -753,14 +777,38 @@ fn metadata_exchange(
         broker.port = local_port;
         vec![broker]
     };
-    // The subject hosts no topics: every response names no topics unless
-    // the fault invents one the client never asked for.
-    let topics = if has(Fault::MetadataUnrequestedTopic) && request.topics == Some(Vec::new()) {
+    // A response names exactly the topics the request named: the ones
+    // that exist, and the ones that do not with a code saying so. A
+    // client cannot distinguish "this topic is absent" from "the server
+    // ignored my question" unless the absent one is named.
+    let requested: Vec<String> = request
+        .topics
+        .iter()
+        .flatten()
+        .filter_map(|t| t.name.clone())
+        .collect();
+    let topics = if has(Fault::MetadataUnrequestedTopic) && requested.is_empty() {
         let mut topic = MetadataResponseTopic::default();
         topic.name = Some("phantom".into());
         vec![topic]
-    } else {
+    } else if has(Fault::MetadataUnknownTopicOmitted) {
         Vec::new()
+    } else {
+        requested
+            .iter()
+            .map(|name| {
+                let mut topic = MetadataResponseTopic::default();
+                topic.name = Some(name.clone());
+                match state.created.get(name) {
+                    Some(id) => {
+                        topic.topic_id = *id;
+                        topic.error_code = 0;
+                    }
+                    None => topic.error_code = ErrorCode::UNKNOWN_TOPIC_OR_PARTITION.0,
+                }
+                topic
+            })
+            .collect()
     };
     let mut resp = MetadataResponse::default();
     resp.brokers = brokers;
@@ -785,6 +833,7 @@ fn metadata_exchange(
 fn create_topics_exchange(
     mut frame: Bytes,
     api_version: i16,
+    faults: &[Fault],
     state: &mut ConnState,
 ) -> Option<BytesMut> {
     if !(CreateTopicsRequest::MIN_VERSION..=CreateTopicsRequest::MAX_VERSION).contains(&api_version)
@@ -795,21 +844,34 @@ fn create_topics_exchange(
     let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
     let request = CreateTopicsRequest::decode(&mut frame, api_version).ok()?;
 
-    // Every topic creates successfully (log state itself is lazy) and gets
-    // an id, so id-addressed produce/fetch can resolve it later.
+    // A topic creates once. A second attempt is TOPIC_ALREADY_EXISTS, and
+    // `validate_only` answers the same as a real creation would without
+    // performing one — both are the kind of thing that looks like a
+    // detail until a client's create-if-absent path depends on it.
+    let validate_only =
+        request.validate_only && !faults.contains(&Fault::CreateTopicsValidateOnlyCreates);
     let mut resp = CreateTopicsResponse::default();
     resp.topics = request
         .topics
         .iter()
         .map(|t| {
             let topic_id = mint_topic_id(&t.name);
-            state.topic_names.insert(topic_id, t.name.clone());
+            let exists = state.created.contains_key(&t.name);
             let mut result = CreatableTopicResult::default();
             result.name = t.name.clone();
             result.topic_id = topic_id;
-            result.error_code = 0;
             result.num_partitions = t.num_partitions.max(1);
             result.replication_factor = t.replication_factor.max(1);
+            result.error_code = if exists && !faults.contains(&Fault::CreateTopicsDuplicateSucceeds)
+            {
+                ErrorCode::TOPIC_ALREADY_EXISTS.0
+            } else {
+                0
+            };
+            if !exists && result.error_code == 0 && !validate_only {
+                state.created.insert(t.name.clone(), topic_id);
+                state.topic_names.insert(topic_id, t.name.clone());
+            }
             result
         })
         .collect();
@@ -935,6 +997,22 @@ fn fetch_exchange(
                         .as_ref()
                         .and_then(|name| state.logs.get(&(name.clone(), p.partition)));
                     match log {
+                        // Reading past the end of the log is a client
+                        // mistake the protocol has a code for. Answering
+                        // it with an empty batch set instead would look
+                        // to a consumer exactly like "caught up".
+                        Some(log)
+                            if p.fetch_offset > log.next_offset
+                                && !faults.contains(&Fault::FetchPastEndSucceeds) =>
+                        {
+                            let mut data = PartitionData::default();
+                            data.partition_index = p.partition;
+                            data.error_code = ErrorCode::OFFSET_OUT_OF_RANGE.0;
+                            data.high_watermark = log.next_offset;
+                            data.last_stable_offset = log.next_offset;
+                            data.log_start_offset = 0;
+                            data
+                        }
                         Some(log) => {
                             let mut bytes = log.bytes.clone();
                             let corrupt = faults.contains(&Fault::FetchCorruptBatch)
