@@ -31,6 +31,7 @@ use tokio::net::TcpListener;
 fn usage() -> ExitCode {
     eprintln!(
         "usage: odradek-accept (--server <host:port> | --client-listen <host:port> | --list)\n\
+         \x20 [--sasl-server <host:port>]  a second listener with SASL configured\n\
          \x20                    [--fault leader-move] [--json]\n\
          \x20                    [--baseline <file>] [--write-baseline <file>]"
     );
@@ -39,6 +40,7 @@ fn usage() -> ExitCode {
 
 struct Args {
     server: Option<String>,
+    sasl_server: Option<String>,
     client_listen: Option<String>,
     list: bool,
     fault: Option<checks::client::HarnessFault>,
@@ -50,6 +52,7 @@ struct Args {
 fn parse_args(args: &[String]) -> Option<Args> {
     let mut parsed = Args {
         server: None,
+        sasl_server: None,
         client_listen: None,
         list: false,
         fault: None,
@@ -61,6 +64,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--server" => parsed.server = Some(it.next()?.clone()),
+            "--sasl-server" => parsed.sasl_server = Some(it.next()?.clone()),
             "--client-listen" => parsed.client_listen = Some(it.next()?.clone()),
             "--list" => parsed.list = true,
             "--fault" => {
@@ -116,7 +120,12 @@ async fn main() -> ExitCode {
     }
 
     let report = if let Some(addr) = &args.server {
-        checks::server::run(addr).await
+        checks::server::run_with_sasl(
+            addr,
+            args.sasl_server.as_deref(),
+            &checks::server::ProbeConfig::default(),
+        )
+        .await
     } else {
         let addr = args.client_listen.as_deref().unwrap();
         let listener = match TcpListener::bind(addr).await {

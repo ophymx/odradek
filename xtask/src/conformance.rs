@@ -38,13 +38,22 @@ struct Subject {
     name: &'static str,
     image: &'static str,
     /// Extra `docker run` arguments (env) and trailing command, both given
-    /// the chosen host port via `{port}` substitution.
+    /// the chosen host ports via `{port}` and `{sasl_port}` substitution.
     run_args: &'static [&'static str],
+    /// Whether this subject serves a second, SASL-configured listener on
+    /// 9094. Without one the `sasl/*` checks that need it skip.
+    sasl_listener: bool,
 }
 
-/// The subject matrix. The container must expose its Kafka listener on
-/// 9092; `{port}` in any argument is replaced with the ephemeral host port
-/// the listener is published on.
+/// The subject matrix. The container must expose its plaintext Kafka
+/// listener on 9092 and a SASL one on 9094; `{port}` and `{sasl_port}`
+/// in any argument are replaced with the ephemeral host ports each is
+/// published on.
+///
+/// Two listeners because SASL cannot be asked about from a listener that
+/// has none: such a listener answers ILLEGAL_SASL_STATE to every SASL
+/// request, which is correct, so mechanism negotiation is unobservable
+/// there. The plaintext listener keeps every other check credential-free.
 const SUBJECTS: &[Subject] = &[
     Subject {
         name: "apache-kafka-4.1.0",
@@ -55,18 +64,28 @@ const SUBJECTS: &[Subject] = &[
             "-e",
             "KAFKA_PROCESS_ROLES=broker,controller",
             "-e",
-            "KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093",
+            "KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,SASL://0.0.0.0:9094",
             "-e",
-            "KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:{port}",
+            "KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:{port},SASL://127.0.0.1:{sasl_port}",
             "-e",
             "KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER",
             "-e",
-            "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT",
+            "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,SASL:SASL_PLAINTEXT",
+            "-e",
+            "KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT",
+            "-e",
+            "KAFKA_SASL_ENABLED_MECHANISMS=PLAIN",
+            // The credentials are never used: no check authenticates.
+            // They exist so the listener has a mechanism to name when it
+            // refuses one it does not have.
+            "-e",
+            "KAFKA_LISTENER_NAME_SASL_PLAIN_SASL_JAAS_CONFIG=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"conformance\" password=\"conformance\" user_conformance=\"conformance\";",
             "-e",
             "KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093",
             "-e",
             "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1",
         ],
+        sasl_listener: true,
     },
     Subject {
         name: "redpanda-25.2.1",
@@ -83,7 +102,18 @@ const SUBJECTS: &[Subject] = &[
             "PLAINTEXT://0.0.0.0:9092",
             "--advertise-kafka-addr",
             "PLAINTEXT://127.0.0.1:{port}",
+            // No SASL listener here, deliberately. Redpanda's SASL is
+            // switched on cluster-wide (`enable_sasl`), and once it is,
+            // the listener configured `authentication_method: none`
+            // starts refusing anonymous callers with
+            // TOPIC_AUTHORIZATION_FAILED and GROUP_AUTHORIZATION_FAILED
+            // — 13 of the other checks stop working. Kafka scopes SASL
+            // to the listener and has no such coupling, which is why it
+            // gets one. The `sasl/*` checks that need a SASL listener
+            // skip here and say so, which is a truthful record of what
+            // this configuration can be asked.
         ],
+        sasl_listener: false,
     },
 ];
 
@@ -187,7 +217,8 @@ fn run_subject(
     log: &mut String,
 ) -> Result<()> {
     let port = ephemeral_port()?;
-    let container = Container::start(subject, port)?;
+    let sasl_port = ephemeral_port()?;
+    let container = Container::start(subject, port, sasl_port)?;
     let addr = format!("127.0.0.1:{port}");
 
     if let Err(e) = wait_ready(&addr) {
@@ -198,6 +229,9 @@ fn run_subject(
     let baseline = conf_dir.join(format!("{}.json", subject.name));
     let mut cmd = Command::new(accept);
     cmd.args(["--server", &addr]);
+    if subject.sasl_listener {
+        cmd.args(["--sasl-server", &format!("127.0.0.1:{sasl_port}")]);
+    }
     if record {
         cmd.args(["--write-baseline".as_ref(), baseline.as_os_str()]);
     } else {
@@ -236,7 +270,7 @@ struct Container {
 }
 
 impl Container {
-    fn start(subject: &Subject, port: u16) -> Result<Container> {
+    fn start(subject: &Subject, port: u16, sasl_port: u16) -> Result<Container> {
         let name = format!("odradek-accept-{}-{port}", subject.name);
         let mut args: Vec<String> = vec![
             "run".into(),
@@ -247,6 +281,10 @@ impl Container {
             "-p".into(),
             format!("127.0.0.1:{port}:9092"),
         ];
+        if subject.sasl_listener {
+            args.push("-p".into());
+            args.push(format!("127.0.0.1:{sasl_port}:9094"));
+        }
         let mut trailing = false;
         for a in subject.run_args {
             if *a == "--" {
@@ -254,7 +292,10 @@ impl Container {
                 args.push(subject.image.into());
                 continue;
             }
-            args.push(a.replace("{port}", &port.to_string()));
+            args.push(
+                a.replace("{port}", &port.to_string())
+                    .replace("{sasl_port}", &sasl_port.to_string()),
+            );
         }
         if !trailing {
             args.push(subject.image.into());

@@ -52,6 +52,79 @@ client checks; and real brokers are ground truth — the workspace CI
 runs the suite against Apache Kafka and Redpanda in Docker on every
 push.
 
+The fault registry is exhaustive in both directions, enforced by test:
+a check no fault can trip is unproven, a fault no check detects is dead
+weight, and either fails the build. This is the property that makes the
+catalog worth anything — a check that cannot fail passes everywhere.
+
+## What is covered
+
+`api-versions/*`, `metadata/*`, `produce/*`, `fetch/*`,
+`list-offsets/*`, `find-coordinator/*`, `offsets/*`, `create-topics/*`,
+`groups/*`, `consumer-group/*` (KIP-848), and `sasl/*` — everything a
+consumer needs, plus the group protocols and the SASL handshake
+sequence.
+
+Success paths are the easy half. The checks that earn their keep are
+the ones where the *wrong* answer is plausible:
+
+- A fetch past the high watermark must answer `OFFSET_OUT_OF_RANGE`,
+  not the empty batch set a caught-up consumer sees — the wrong answer
+  is silent, and leaves a client polling a position that will never
+  exist.
+- An unknown topic must be *named* in the Metadata response carrying
+  `UNKNOWN_TOPIC_OR_PARTITION`, not omitted: omitted, a client cannot
+  tell "no such topic" from "you ignored my question".
+- A partition a group never committed reads as offset `-1`, not `0` —
+  `0` is a valid offset, so the wrong answer sends a resuming consumer
+  back to the start of the log.
+- `validate_only` must answer without creating, checked by creating for
+  real afterwards and watching for the give-away.
+- A SASL token arriving before any mechanism was negotiated is
+  `ILLEGAL_SASL_STATE`: "your sequence is wrong", not "your credentials
+  are wrong". A client told the latter retries the same broken sequence
+  forever.
+
+Five checks sweep **every version the subject advertises** rather than
+negotiating one and stopping. Against Kafka 4.1 that is 13 Metadata
+exchanges, 12 fetches of a single produced batch, and 7
+FindCoordinator versions straddling the v4 shape change. A fault that
+misbehaves only at the lowest version keeps it honest: it is
+undetectable by a suite that negotiates once, so calibration fails if a
+sweep is ever removed.
+
+The group and KIP-848 checks came out of *implementing* those protocols
+in the reference subject rather than out of reading the schemas, which
+is where the underspecified parts surface. A join carrying no member id
+must be refused with `MEMBER_ID_REQUIRED` *and* handed an id to rejoin
+with. The assignment bytes a leader supplies must reach their member
+unexamined — the same opacity the record-batch codec promises. In
+KIP-848, an absent assignment means "unchanged" while an empty one
+means "revoked", which is how a steady-state heartbeat is told apart
+from an unsubscribe.
+
+## What the baselines record
+
+Nothing fails today. The differences are capability and version ones,
+recorded rather than scored:
+
+- Redpanda 25.2 advertises Metadata only to v8, Produce to v7, and
+  Fetch to v11, so the flexible-metadata-header and topic-id-addressed
+  produce/fetch checks skip there.
+- Redpanda 25.2 does not implement KIP-848 at all: those four checks
+  skip, which is the one place the two implementations genuinely part
+  company rather than agreeing.
+- Mechanism negotiation cannot be observed from a listener with no SASL
+  configured: every SASL request there is `ILLEGAL_SASL_STATE`, which is
+  correct rather than nonconformant. The harness therefore gives Kafka a
+  second, SASL-configured listener and passes it with `--sasl-server`.
+  Redpanda deliberately gets none: its SASL is switched on cluster-wide,
+  and once it is, the listener configured for no authentication starts
+  refusing anonymous callers, taking 13 unrelated checks down with it.
+  Kafka scopes SASL per listener and has no such coupling. So that check
+  passes on Kafka and skips on Redpanda, and the skip reason says which
+  of the two situations it is.
+
 Part of the [odradek](https://github.com/ophymx/odradek) constellation.
 
 ## License

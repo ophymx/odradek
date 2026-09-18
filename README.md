@@ -85,88 +85,14 @@ Early but functional end to end:
   exercise the pieces on their own (the last one covering live
   incremental reconciliation on Kafka 4.1's new coordinator).
 - `odradek-acceptance`: conformance checks for **both roles** over raw
-  connections independent of the client crate — `api-versions/*`,
-  `metadata/*`, `produce/*`, `fetch/*`, `list-offsets/*`,
-  `find-coordinator/*`, `offsets/*`, `create-topics/*`, `groups/*`, and
-  `consumer-group/*` (KIP-848), and `sasl/*` server checks, covering
-  everything a consumer needs short of group membership: the log start
-  and log end bracket exactly what was produced, a group key names a
-  reachable coordinator in whichever shape the negotiated version
-  defines, an offset read back from OffsetFetch is the one OffsetCommit
-  was given, and a partition a group never committed reads as the -1
-  sentinel rather than as 0 (which would send a resuming consumer back
-  to the start of the log). Five of those checks sweep every version the
-  subject advertises rather than negotiating one and stopping — against
-  Kafka 4.1 that turns `metadata/basic` into 13 exchanges,
-  `fetch/batch-integrity` into 12 fetches of one produced batch, and
-  `find-coordinator/group` into 7 that straddle the v4 shape change. A
-  fault that misbehaves only at the lowest version keeps that honest: it
-  is undetectable by a suite that negotiates once, so calibration fails
-  if the sweep is ever removed. Error paths are checked as deliberately
-  as success ones, because that is where reimplementations diverge: a
-  fetch past the high watermark must answer OFFSET_OUT_OF_RANGE rather
-  than the empty batch set a caught-up consumer sees, an unknown topic
-  must be *named* in the Metadata response with
-  UNKNOWN_TOPIC_OR_PARTITION rather than omitted (a client cannot tell
-  absent from ignored), a duplicate CreateTopics must be refused with
-  TOPIC_ALREADY_EXISTS, and `validate_only` must answer without
-  creating — checked by creating for real afterwards and watching for
-  the give-away. The group checks came out of implementing the protocol
-  in the reference subject rather than out of reading the schemas: a
-  join carrying no member id must be refused with MEMBER_ID_REQUIRED
-  *and* handed an id to rejoin with, the assignment bytes a leader
-  supplies must reach their member unexamined (the same opacity the
-  record-batch codec promises), and a heartbeat from a generation the
-  group has left must be fenced with ILLEGAL_GENERATION. The KIP-848
-  checks came the same way, and cost two wrong guesses that the real
-  broker corrected: a member introducing itself must *state* that it
-  owns nothing rather than stay silent about it, and a response omits
-  the assignment when nothing changed — so an absent assignment means
-  "unchanged" while an empty one means "revoked", which is exactly how a
-  steady-state heartbeat is told apart from an unsubscribe. Redpanda
-  25.2 does not implement KIP-848 at all, so those four checks skip
-  there: the first place the two implementations genuinely part company
-  rather than agreeing. SASL is checked for sequencing rather than
-  secrets: a token arriving before any mechanism was negotiated has to
-  be refused as ILLEGAL_SASL_STATE — "your sequence is wrong", not "your
-  credentials are wrong", the difference between a client that fixes
-  itself and one that retries forever — and that question needs no
-  credentials, so both brokers answer it. The companion check, that a
-  refused mechanism names the ones that would work, skips on a listener
-  with no SASL configured rather than reporting the operator's listener
-  as nonconformance. Also (including a
-  create → produce → fetch flow that asserts the broker returns the
-  produced batch byte-identical in the crc-covered region) and `client/*`
-  client checks, where the harness impersonates a three-broker cluster so
-  partition-leader routing is observable and can stage faults
-  (`--fault leader-move` answers a produce with NOT_LEADER and moves
-  leadership, checking the client re-delivers to the new leader) — with
-  JSON reports and per-implementation baselines:
-
-  ```sh
-  # validate a server
-  odradek-accept --server localhost:9092 [--json]
-  # validate a client: listen, point its bootstrap here
-  odradek-accept --client-listen 127.0.0.1:19092
-  # record / enforce expected results per implementation
-  odradek-accept --server ... --write-baseline conformance/kafka.json
-  odradek-accept --server ... --baseline conformance/kafka.json
-  ```
-
-  The suite is calibrated in three directions: a fault-injectable reference
-  subject (`odradek_acceptance::subject`) proves each check detects exactly
-  the violation it claims to (sensitivity) and that a conformant subject
-  trips nothing (specificity); `odradek-client` itself passes the client
-  checks (dogfooding); and real brokers are ground truth — `cargo xtask
-  conformance` runs the suite against Apache Kafka and Redpanda in Docker
-  and enforces the per-implementation baselines committed in
-  [`conformance/`](conformance/). Nothing fails today, and the baselines
-  already record real behavioral differences: Redpanda 25.2 advertises
-  Metadata only to v8, Produce to v7, and Fetch to v11 — so the flexible
-  metadata header and topic-id-addressed produce/fetch checks (which
-  Kafka 4.1 passes) skip there, on record. The fault ↔ check registry is
-  enforced by test: a check no fault can trip, or a fault no check
-  detects, fails calibration.
+  connections, independent of the client crate. 27 server checks across
+  13 APIs plus 7 client checks, each one proven by an injected fault to
+  detect what it claims — a check nothing can trip fails calibration.
+  `cargo xtask conformance` runs them against Apache Kafka and Redpanda
+  in Docker and enforces the baselines committed in
+  [`conformance/`](conformance/). See the
+  [crate README](crates/odradek-acceptance) for what is covered, how
+  calibration works, and what the baselines currently record.
 
 - `odradek-web-core`: the bridging engine, transport-agnostic — one
   pump per (topic, partition) fans out to any number of subscribers,

@@ -22,7 +22,10 @@ use odradek_acceptance::{SubjectRole, Verdict};
 async fn run(addr: &str) -> Report {
     let mut config = ProbeConfig::default();
     config.settle_budget = Duration::from_millis(300);
-    server::run_with(addr, &config).await
+    // The reference subject speaks SASL on its only listener, so it is
+    // its own SASL address. A real broker needs two, because a listener
+    // without SASL cannot answer a question about mechanisms.
+    server::run_with_sasl(addr, Some(addr), &config).await
 }
 
 fn server_check_ids() -> Vec<&'static str> {

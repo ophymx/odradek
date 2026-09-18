@@ -28,6 +28,6 @@
     "produce/basic": "pass",
     "produce/topic-id": "pass",
     "sasl/authenticate-requires-handshake": "pass",
-    "sasl/refusal-names-mechanisms": "skipped"
+    "sasl/refusal-names-mechanisms": "pass"
   }
 }

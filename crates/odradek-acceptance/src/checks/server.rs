@@ -287,9 +287,26 @@ pub async fn run(addr: &str) -> Report {
     run_with(addr, &ProbeConfig::default()).await
 }
 
+/// Run the Server-role checks, with a second address that has SASL
+/// configured on it.
+///
+/// A listener with no SASL answers ILLEGAL_SASL_STATE to every SASL
+/// request — correctly, since there is no session to negotiate within —
+/// so mechanism negotiation simply cannot be asked about there. Given a
+/// SASL address, the checks that need one use it; without, they skip and
+/// say why.
+pub async fn run_with_sasl(addr: &str, sasl_addr: Option<&str>, config: &ProbeConfig) -> Report {
+    let mut ctx = ServerCtx::discover(addr, config.clone()).await;
+    ctx.sasl_addr = sasl_addr.map(str::to_owned);
+    run_ctx(ctx).await
+}
+
 /// Run the catalogued Server-role checks against `addr` under `config`.
 pub async fn run_with(addr: &str, config: &ProbeConfig) -> Report {
-    let ctx = ServerCtx::discover(addr, config.clone()).await;
+    run_ctx(ServerCtx::discover(addr, config.clone()).await).await
+}
+
+async fn run_ctx(ctx: ServerCtx) -> Report {
     let mut outcomes = Vec::new();
     for check in crate::checks::catalog() {
         if check.role() != SubjectRole::Server {
@@ -304,7 +321,7 @@ pub async fn run_with(addr: &str, config: &ProbeConfig) -> Report {
             runner(&ctx).await,
         ));
     }
-    Report::new(format!("server {addr}"), outcomes)
+    Report::new(format!("server {}", ctx.addr), outcomes)
 }
 
 /// Why an exchange did not yield a validated response: the suite could
@@ -366,6 +383,8 @@ pub(crate) struct ServerCtx {
     /// checks answer with skips exactly as before.
     discovery: Result<Vec<ApiVersion>, String>,
     config: ProbeConfig,
+    /// A second address with SASL configured, when one was supplied.
+    sasl_addr: Option<String>,
 }
 
 impl ServerCtx {
@@ -381,6 +400,7 @@ impl ServerCtx {
             addr: addr.into(),
             discovery,
             config,
+            sasl_addr: None,
         }
     }
 
@@ -1251,6 +1271,14 @@ async fn sasl_authenticate_requires_handshake(ctx: &ServerCtx) -> Verdict {
 /// reporting that as nonconformance would be reporting the operator's
 /// listener configuration.
 async fn sasl_refusal_names_mechanisms(ctx: &ServerCtx) -> Verdict {
+    let Some(sasl_addr) = ctx.sasl_addr.clone() else {
+        return Verdict::Skipped {
+            reason: "no SASL listener given (--sasl-server); a listener without SASL \
+                     answers ILLEGAL_SASL_STATE to every SASL request, so mechanism \
+                     negotiation cannot be observed there"
+                .into(),
+        };
+    };
     let version = match negotiate(
         "SaslHandshake",
         match ctx.range(SaslHandshakeRequest::API_KEY) {
@@ -1263,7 +1291,7 @@ async fn sasl_refusal_names_mechanisms(ctx: &ServerCtx) -> Verdict {
         Ok(v) => v,
         Err(skip) => return skip,
     };
-    let mut conn = match connect(&ctx.addr).await {
+    let mut conn = match connect(&sasl_addr).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
@@ -1292,9 +1320,7 @@ async fn sasl_refusal_names_mechanisms(ctx: &ServerCtx) -> Verdict {
     let code = ErrorCode(resp.error_code);
     if code == ErrorCode::ILLEGAL_SASL_STATE {
         return Verdict::Skipped {
-            reason: "listener has no SASL configured (every SASL request is \
-                     ILLEGAL_SASL_STATE here)"
-                .into(),
+            reason: format!("{sasl_addr} has no SASL configured after all"),
         };
     }
     if code != ErrorCode::UNSUPPORTED_SASL_MECHANISM {
