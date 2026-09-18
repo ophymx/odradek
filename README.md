@@ -94,7 +94,14 @@ Early but functional end to end:
   defines, an offset read back from OffsetFetch is the one OffsetCommit
   was given, and a partition a group never committed reads as the -1
   sentinel rather than as 0 (which would send a resuming consumer back
-  to the start of the log). Also (including a
+  to the start of the log). Five of those checks sweep every version the
+  subject advertises rather than negotiating one and stopping — against
+  Kafka 4.1 that turns `metadata/basic` into 13 exchanges,
+  `fetch/batch-integrity` into 12 fetches of one produced batch, and
+  `find-coordinator/group` into 7 that straddle the v4 shape change. A
+  fault that misbehaves only at the lowest version keeps that honest: it
+  is undetectable by a suite that negotiates once, so calibration fails
+  if the sweep is ever removed. Also (including a
   create → produce → fetch flow that asserts the broker returns the
   produced batch byte-identical in the crc-covered region) and `client/*`
   client checks, where the harness impersonates a three-broker cluster so

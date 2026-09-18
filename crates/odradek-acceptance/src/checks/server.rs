@@ -438,7 +438,7 @@ async fn list_offsets_earliest_latest(ctx: &ServerCtx) -> Verdict {
         Ok(a) => a,
         Err(v) => return v,
     };
-    let version = match negotiate(
+    let versions = match negotiate_all(
         "ListOffsets",
         advertised,
         ListOffsetsRequest::MIN_VERSION,
@@ -460,44 +460,51 @@ async fn list_offsets_earliest_latest(ctx: &ServerCtx) -> Verdict {
         }
     };
 
-    let earliest = match list_offsets_at(
-        &mut produced.conn,
-        version,
-        &produced.topic,
-        EARLIEST_TIMESTAMP,
-        41,
-    )
-    .await
-    {
-        Ok(o) => o,
-        Err(e) => return e.into_verdict(),
-    };
-    let latest = match list_offsets_at(
-        &mut produced.conn,
-        version,
-        &produced.topic,
-        LATEST_TIMESTAMP,
-        42,
-    )
-    .await
-    {
-        Ok(o) => o,
-        Err(e) => return e.into_verdict(),
-    };
+    // The same log, asked at every version the subject serves: the answer
+    // cannot depend on which version was used to ask it.
+    for (i, version) in versions.iter().copied().enumerate() {
+        let base = 41 + i32::try_from(i).unwrap_or(0) * 2;
+        let earliest = match list_offsets_at(
+            &mut produced.conn,
+            version,
+            &produced.topic,
+            EARLIEST_TIMESTAMP,
+            base,
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(e) => return e.into_verdict().at_version(version),
+        };
+        let latest = match list_offsets_at(
+            &mut produced.conn,
+            version,
+            &produced.topic,
+            LATEST_TIMESTAMP,
+            base + 1,
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(e) => return e.into_verdict().at_version(version),
+        };
 
-    if earliest != 0 {
-        return Verdict::Fail {
-            details: format!("log start of a freshly created topic is {earliest}, expected 0"),
-        };
-    }
-    if latest - earliest != sent_records {
-        return Verdict::Fail {
-            details: format!(
-                "log spans {} offset(s) ({earliest}..{latest}) after producing \
-                 {sent_records} record(s)",
-                latest - earliest
-            ),
-        };
+        if earliest != 0 {
+            return Verdict::Fail {
+                details: format!(
+                    "v{version}: log start of a freshly created topic is {earliest}, expected 0"
+                ),
+            };
+        }
+        if latest - earliest != sent_records {
+            return Verdict::Fail {
+                details: format!(
+                    "v{version}: log spans {} offset(s) ({earliest}..{latest}) after producing \
+                     {sent_records} record(s)",
+                    latest - earliest
+                ),
+            };
+        }
     }
     Verdict::Pass
 }
@@ -516,7 +523,7 @@ async fn find_coordinator_group(ctx: &ServerCtx) -> Verdict {
         Ok(a) => a,
         Err(v) => return v,
     };
-    let version = match negotiate(
+    let versions = match negotiate_all(
         "FindCoordinator",
         advertised,
         FindCoordinatorRequest::MIN_VERSION,
@@ -525,18 +532,42 @@ async fn find_coordinator_group(ctx: &ServerCtx) -> Verdict {
         Ok(v) => v,
         Err(skip) => return skip,
     };
+    let group = check_group("find-coordinator");
+    // Sweeping matters more here than almost anywhere: v4 is where the
+    // single key became `coordinator_keys` and the flat endpoint became a
+    // `coordinators` array, so a suite that only ever negotiates the
+    // maximum never exercises the older shape at all.
+    for (i, version) in versions.iter().copied().enumerate() {
+        let correlation = 51 + i32::try_from(i).unwrap_or(0) * 32;
+        if let Verdict::Fail { details } =
+            find_coordinator_at(ctx, version, &group, correlation).await
+        {
+            return Verdict::Fail {
+                details: format!("v{version}: {details}"),
+            };
+        }
+    }
+    Verdict::Pass
+}
+
+/// One FindCoordinator exchange at `version`, checked.
+async fn find_coordinator_at(
+    ctx: &ServerCtx,
+    version: i16,
+    group: &str,
+    correlation_base: i32,
+) -> Verdict {
     let mut conn = match connect(&ctx.addr).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
-    let group = check_group("find-coordinator");
 
     let mut request = FindCoordinatorRequest::default();
     request.key_type = 0; // group
     if version >= FIND_COORDINATOR_BATCHED {
-        request.coordinator_keys = vec![group.clone()];
+        request.coordinator_keys = vec![group.to_owned()];
     } else {
-        request.key = group.clone();
+        request.key = group.to_owned();
     }
     let mut body = BytesMut::new();
     if let Err(e) = request.encode(&mut body, version) {
@@ -544,20 +575,20 @@ async fn find_coordinator_group(ctx: &ServerCtx) -> Verdict {
             details: format!("encoding FindCoordinator: {e}"),
         };
     }
+
     // A cluster that has never hosted a group creates `__consumer_offsets`
     // on the first ask, and says COORDINATOR_NOT_AVAILABLE until its
     // partitions have leaders. That is a retriable error, not a wrong
     // answer, and a client that treated it as final would be the broken
     // one — so the suite waits it out on the same budget the produce flow
     // uses for a freshly created topic.
-    let mut resp: FindCoordinatorResponse = FindCoordinatorResponse::default();
+    let mut resp = FindCoordinatorResponse::default();
     let mut last = ErrorCode(0);
-    let mut correlation = 51;
     for attempt in 0..ctx.config.settle_attempts() {
         if attempt > 0 {
             tokio::time::sleep(ctx.config.settle_delay).await;
         }
-        correlation += 1;
+        let correlation = correlation_base + i32::try_from(attempt).unwrap_or(0);
         resp = match api_call(
             &mut conn,
             FindCoordinatorRequest::API_KEY,
@@ -589,7 +620,7 @@ async fn find_coordinator_group(ctx: &ServerCtx) -> Verdict {
         if resp.coordinators.len() != 1 {
             return Verdict::Fail {
                 details: format!(
-                    "asked about 1 coordinator key, v{version} response carries {}",
+                    "asked about 1 coordinator key, response carries {}",
                     resp.coordinators.len()
                 ),
             };
@@ -855,7 +886,8 @@ async fn fetch_committed(
 /// loses them answers every commit with success, so only reading the
 /// value back distinguishes the two.
 async fn offsets_commit_fetch_roundtrip(ctx: &ServerCtx) -> Verdict {
-    let (commit_version, fetch_version) = match offsets_versions(ctx) {
+    // Commit once at the newest version, read back at every one.
+    let (commit_version, fetch_versions) = match offsets_commit_and_fetch_versions(ctx) {
         Ok(v) => v,
         Err(skip) => return skip,
     };
@@ -863,7 +895,7 @@ async fn offsets_commit_fetch_roundtrip(ctx: &ServerCtx) -> Verdict {
         Ok(p) => p,
         Err(verdict) => return verdict,
     };
-    if let Some(skip) = skip_without_topic_id(&produced, commit_version.max(fetch_version)) {
+    if let Some(skip) = skip_without_topic_id(&produced, commit_version) {
         return skip;
     }
     let group = check_group(&produced.topic);
@@ -887,22 +919,35 @@ async fn offsets_commit_fetch_roundtrip(ctx: &ServerCtx) -> Verdict {
     {
         return e.into_verdict();
     }
-    match fetch_committed(
-        &mut produced.conn,
-        fetch_version,
-        &group,
-        &produced.topic,
-        produced.topic_id,
-        62,
-    )
-    .await
-    {
-        Ok(got) if got == committed => Verdict::Pass,
-        Ok(got) => Verdict::Fail {
-            details: format!("committed offset {committed}, read back {got}"),
-        },
-        Err(e) => e.into_verdict(),
+    // One commit, read back at every OffsetFetch version on offer. A
+    // durable position that only survives being read at one version is
+    // not durable: v8 moved the exchange into a `groups` array and v10
+    // switched to topic ids, and both shapes must see the same number.
+    for (i, version) in fetch_versions.iter().copied().enumerate() {
+        if version >= OFFSETS_BY_TOPIC_ID && produced.topic_id == [0u8; 16] {
+            continue;
+        }
+        let correlation = 62 + i32::try_from(i).unwrap_or(0);
+        match fetch_committed(
+            &mut produced.conn,
+            version,
+            &group,
+            &produced.topic,
+            produced.topic_id,
+            correlation,
+        )
+        .await
+        {
+            Ok(got) if got == committed => {}
+            Ok(got) => {
+                return Verdict::Fail {
+                    details: format!("v{version}: committed offset {committed}, read back {got}"),
+                };
+            }
+            Err(e) => return e.into_verdict().at_version(version),
+        }
     }
+    Verdict::Pass
 }
 
 /// A partition a group never committed reads as -1, not 0 and not an error.
@@ -964,6 +1009,26 @@ fn skip_without_topic_id(produced: &ProducedTopic, version: i16) -> Option<Verdi
     None
 }
 
+/// The newest OffsetCommit, and every OffsetFetch worth reading back at.
+///
+/// Both halves have to be present for the pair to mean anything, so a
+/// subject missing either skips rather than half-running.
+fn offsets_commit_and_fetch_versions(ctx: &ServerCtx) -> Result<(i16, Vec<i16>), Verdict> {
+    let commit = negotiate(
+        "OffsetCommit",
+        ctx.range(OffsetCommitRequest::API_KEY)?,
+        OffsetCommitRequest::MIN_VERSION,
+        OffsetCommitRequest::MAX_VERSION,
+    )?;
+    let fetch = negotiate_all(
+        "OffsetFetch",
+        ctx.range(OffsetFetchRequest::API_KEY)?,
+        OffsetFetchRequest::MIN_VERSION,
+        OffsetFetchRequest::MAX_VERSION,
+    )?;
+    Ok((commit, fetch))
+}
+
 /// Negotiate both halves of the offsets pair, since either can be absent.
 fn offsets_versions(ctx: &ServerCtx) -> Result<(i16, i16), Verdict> {
     let commit = negotiate(
@@ -1011,6 +1076,53 @@ async fn api_call<T: Message>(
         body,
     )
     .await
+}
+
+/// Name the version a swept check was on when it failed.
+///
+/// Without this a sweep reports "the batch came back different" and
+/// leaves the reader to guess which of fifteen versions did it.
+trait AtVersion {
+    fn at_version(self, version: i16) -> Verdict;
+}
+
+impl AtVersion for Verdict {
+    fn at_version(self, version: i16) -> Verdict {
+        match self {
+            Verdict::Fail { details } => Verdict::Fail {
+                details: format!("v{version}: {details}"),
+            },
+            Verdict::Error { details } => Verdict::Error {
+                details: format!("v{version}: {details}"),
+            },
+            other => other,
+        }
+    }
+}
+
+/// Every version a check and a subject both speak, lowest first.
+///
+/// [`negotiate`] answers "can this run?"; this answers "on how many
+/// versions?". A conformance claim about a range the subject advertises
+/// is only as good as the versions actually exercised, and testing one
+/// of them tests one of them — a broker that mishandles v7 while serving
+/// v18 correctly looks perfect to a suite that always negotiates the
+/// maximum.
+///
+/// Skips carry the same reason [`negotiate`] would have given, so a
+/// subject that speaks none of the range reads identically either way.
+fn negotiate_all(
+    api: &'static str,
+    advertised: Option<(i16, i16)>,
+    check_min: i16,
+    check_max: i16,
+) -> Result<Vec<i16>, Verdict> {
+    // Reuse the single-version path for the "can this run at all"
+    // question, so the skip reasons stay one sentence in one place.
+    let highest = negotiate(api, advertised, check_min, check_max)?;
+    let (min, _) = advertised.expect("negotiate succeeded, so a range was advertised");
+    let lowest = min.max(check_min);
+    Ok((lowest..=highest).collect())
 }
 
 /// One ApiVersions exchange on a fresh connection. The response header is
@@ -1220,14 +1332,27 @@ async fn metadata_basic(ctx: &ServerCtx) -> Verdict {
         Ok(a) => a,
         Err(v) => return v,
     };
-    let version = match negotiate("Metadata", advertised, 1, MetadataRequest::MAX_VERSION) {
+    let versions = match negotiate_all("Metadata", advertised, 1, MetadataRequest::MAX_VERSION) {
         Ok(v) => v,
         Err(skip) => return skip,
     };
-    let resp = match metadata_exchange(&ctx.addr, version, 4).await {
-        Ok(resp) => resp,
-        Err(e) => return e.into_verdict(),
-    };
+    for (i, version) in versions.iter().copied().enumerate() {
+        let correlation = 4 + i32::try_from(i).unwrap_or(0);
+        let resp = match metadata_exchange(&ctx.addr, version, correlation).await {
+            Ok(resp) => resp,
+            Err(e) => return e.into_verdict().at_version(version),
+        };
+        if let Verdict::Fail { details } = metadata_shape(&resp) {
+            return Verdict::Fail {
+                details: format!("v{version}: {details}"),
+            };
+        }
+    }
+    Verdict::Pass
+}
+
+/// What a Metadata response must look like, at any version.
+fn metadata_shape(resp: &MetadataResponse) -> Verdict {
     if resp.brokers.is_empty() {
         return Verdict::Fail {
             details: "brokers list is empty".into(),
@@ -1641,7 +1766,7 @@ async fn fetch_batch_integrity(ctx: &ServerCtx) -> Verdict {
         Ok(r) => r,
         Err(v) => return v,
     };
-    let fetch_version = match negotiate(
+    let fetch_versions = match negotiate_all(
         "Fetch",
         fetch_range,
         FetchRequest::MIN_VERSION,
@@ -1656,10 +1781,24 @@ async fn fetch_batch_integrity(ctx: &ServerCtx) -> Verdict {
         Ok(p) => p,
         Err(verdict) => return verdict,
     };
-    match run_fetch(&mut produced, fetch_version, Addressing::Name, &ctx.config).await {
-        Ok(got) => batch_integrity(&produced.sent, &got),
-        Err(e) => e.into_verdict(),
+    // Produce once, fetch at every version the subject offers. The batch
+    // that comes back must be the same bytes each time: a broker that
+    // re-encodes on one older version and not on others is exactly the
+    // bug this check exists for, and it is invisible if only the newest
+    // version is ever asked.
+    for version in fetch_versions {
+        match run_fetch(&mut produced, version, Addressing::Name, &ctx.config).await {
+            Ok(got) => {
+                if let Verdict::Fail { details } = batch_integrity(&produced.sent, &got) {
+                    return Verdict::Fail {
+                        details: format!("v{version}: {details}"),
+                    };
+                }
+            }
+            Err(e) => return e.into_verdict().at_version(version),
+        }
     }
+    Verdict::Pass
 }
 
 async fn fetch_topic_id(ctx: &ServerCtx) -> Verdict {

@@ -88,6 +88,10 @@ const SENSITIVITY: &[(Fault, &str)] = &[
         "offsets/commit-fetch-roundtrip",
     ),
     (Fault::OffsetFetchUnsetIsZero, "offsets/unset-is-sentinel"),
+    // Only detectable if the fetch check sweeps the advertised range: a
+    // subject that is correct at its maximum version and wrong below it
+    // passes any suite that negotiates once and stops.
+    (Fault::FetchCorruptOnOldVersions, "fetch/batch-integrity"),
 ];
 
 /// The calibration registry is exhaustive in both directions against the

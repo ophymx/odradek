@@ -119,6 +119,18 @@ pub enum Fault {
     /// Answer a never-committed partition with 0 rather than the -1
     /// sentinel — a plausible offset where "nothing here" was meant.
     OffsetFetchUnsetIsZero,
+    /// Corrupt stored batches only when the fetch was made at the
+    /// *lowest* version this subject advertises.
+    ///
+    /// This one exists to test the suite rather than a subject. The
+    /// lowest version specifically, rather than "anything below the
+    /// maximum": the fetch check caps itself below the advertised
+    /// maximum for name addressing, so a fault keyed on that cap would
+    /// fire at the check's own top version and prove nothing. Keyed
+    /// here, it is invisible to any check that negotiates one version
+    /// and stops — and calibration fails the moment the fetch check
+    /// stops sweeping the range.
+    FetchCorruptOnOldVersions,
     /// Echo a different topic id than the fetch requested.
     FetchWrongTopicId,
 }
@@ -147,6 +159,7 @@ impl Fault {
         Fault::FindCoordinatorWrongKey,
         Fault::OffsetFetchLosesCommit,
         Fault::OffsetFetchUnsetIsZero,
+        Fault::FetchCorruptOnOldVersions,
     ];
 }
 
@@ -924,7 +937,10 @@ fn fetch_exchange(
                     match log {
                         Some(log) => {
                             let mut bytes = log.bytes.clone();
-                            if faults.contains(&Fault::FetchCorruptBatch) && !bytes.is_empty() {
+                            let corrupt = faults.contains(&Fault::FetchCorruptBatch)
+                                || (faults.contains(&Fault::FetchCorruptOnOldVersions)
+                                    && api_version == FetchRequest::MIN_VERSION);
+                            if corrupt && !bytes.is_empty() {
                                 let last = bytes.len() - 1;
                                 bytes[last] ^= 0x01;
                             }
