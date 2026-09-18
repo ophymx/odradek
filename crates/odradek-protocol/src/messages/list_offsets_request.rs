@@ -13,6 +13,7 @@
 
 use bytes::{Buf, BufMut};
 
+use crate::budget::{Budget, Limits};
 #[allow(unused_imports)]
 use crate::error::{DecodeError, EncodeError};
 use crate::wire::{self, RawTaggedField};
@@ -78,7 +79,28 @@ impl ListOffsetsRequest {
         Ok(())
     }
 
+    /// Decode one `ListOffsetsRequest`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `ListOffsetsRequest` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `ListOffsetsRequest` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         this.replica_id = wire::get_i32(buf)?;
         if version >= 2 {
@@ -95,7 +117,10 @@ impl ListOffsetsRequest {
                 Some(n) => {
                     let mut items = Vec::new();
                     for _ in 0..n {
-                        items.push(ListOffsetsTopic::decode(buf, version)?);
+                        let mark = buf.remaining();
+                        let item = ListOffsetsTopic::decode_with_budget(buf, version, budget)?;
+                        budget.progress(mark, buf.remaining())?;
+                        budget.push(&mut items, item)?;
                     }
                     items
                 }
@@ -105,7 +130,7 @@ impl ListOffsetsRequest {
             this.timeout_ms = wire::get_i32(buf)?;
         }
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -121,6 +146,13 @@ impl crate::Message for ListOffsetsRequest {
     }
     fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
         ListOffsetsRequest::decode(buf, version)
+    }
+    fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        ListOffsetsRequest::decode_with_limits(buf, version, limits)
     }
 }
 
@@ -167,7 +199,28 @@ impl ListOffsetsTopic {
         Ok(())
     }
 
+    /// Decode one `ListOffsetsTopic`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `ListOffsetsTopic` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `ListOffsetsTopic` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         this.name = if is_flexible(version) {
             wire::get_compact_string(buf)?
@@ -185,14 +238,17 @@ impl ListOffsetsTopic {
                 Some(n) => {
                     let mut items = Vec::new();
                     for _ in 0..n {
-                        items.push(ListOffsetsPartition::decode(buf, version)?);
+                        let mark = buf.remaining();
+                        let item = ListOffsetsPartition::decode_with_budget(buf, version, budget)?;
+                        budget.progress(mark, buf.remaining())?;
+                        budget.push(&mut items, item)?;
                     }
                     items
                 }
             }
         };
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -236,7 +292,28 @@ impl ListOffsetsPartition {
         Ok(())
     }
 
+    /// Decode one `ListOffsetsPartition`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `ListOffsetsPartition` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `ListOffsetsPartition` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         this.partition_index = wire::get_i32(buf)?;
         if version >= 4 {
@@ -244,7 +321,7 @@ impl ListOffsetsPartition {
         }
         this.timestamp = wire::get_i64(buf)?;
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }

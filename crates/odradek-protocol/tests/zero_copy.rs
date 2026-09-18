@@ -9,7 +9,7 @@
 //! through a `Buf` that lacks the override (measurably ~370x slower).
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::cell::Cell;
 
 use bytes::{Bytes, BytesMut};
 use odradek_protocol::messages::fetch_response::{
@@ -19,28 +19,40 @@ use odradek_protocol::records::{Record, RecordBatch, Records, decode_set, encode
 
 /// Counts allocations while armed, so a test can measure exactly the
 /// region it cares about.
+///
+/// Per-thread: the harness runs these tests concurrently, and a
+/// process-wide counter armed on one thread also tallies whatever the
+/// other three allocate meanwhile — which shows up as a zero-copy
+/// violation in a decode that copied nothing. `const`-initialized, so
+/// reading the cells inside the allocator cannot itself allocate.
 struct Counting;
 
-static ALLOCS: AtomicUsize = AtomicUsize::new(0);
-static BYTES: AtomicUsize = AtomicUsize::new(0);
-static ARMED: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static ALLOCS: Cell<usize> = const { Cell::new(0) };
+    static BYTES: Cell<usize> = const { Cell::new(0) };
+    static ARMED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn tally(bytes: usize) {
+    // `try_with` because a thread tearing down may have dropped its
+    // locals while its last frees still run through here.
+    if ARMED.try_with(Cell::get) != Ok(true) {
+        return;
+    }
+    ALLOCS.with(|a| a.set(a.get() + 1));
+    BYTES.with(|b| b.set(b.get() + bytes));
+}
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if ARMED.load(Ordering::Relaxed) {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-            BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-        }
+        tally(layout.size());
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if ARMED.load(Ordering::Relaxed) {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-            BYTES.fetch_add(new_size.saturating_sub(layout.size()), Ordering::Relaxed);
-        }
+        tally(new_size.saturating_sub(layout.size()));
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -77,16 +89,16 @@ struct Alloc {
 
 /// Run `f`, returning its value and what it allocated.
 fn allocations_of<T>(f: impl FnOnce() -> T) -> (T, Alloc) {
-    ALLOCS.store(0, Ordering::Relaxed);
-    BYTES.store(0, Ordering::Relaxed);
-    ARMED.store(true, Ordering::Relaxed);
+    ALLOCS.with(|a| a.set(0));
+    BYTES.with(|b| b.set(0));
+    ARMED.with(|a| a.set(true));
     let value = f();
-    ARMED.store(false, Ordering::Relaxed);
+    ARMED.with(|a| a.set(false));
     (
         value,
         Alloc {
-            count: ALLOCS.load(Ordering::Relaxed),
-            bytes: BYTES.load(Ordering::Relaxed),
+            count: ALLOCS.with(Cell::get),
+            bytes: BYTES.with(Cell::get),
         },
     )
 }

@@ -13,6 +13,7 @@
 
 use bytes::{Buf, BufMut};
 
+use crate::budget::{Budget, Limits};
 #[allow(unused_imports)]
 use crate::error::{DecodeError, EncodeError};
 use crate::wire::{self, RawTaggedField};
@@ -61,14 +62,35 @@ impl HeartbeatResponse {
         Ok(())
     }
 
+    /// Decode one `HeartbeatResponse`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `HeartbeatResponse` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `HeartbeatResponse` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         if version >= 1 {
             this.throttle_time_ms = wire::get_i32(buf)?;
         }
         this.error_code = wire::get_i16(buf)?;
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -84,5 +106,12 @@ impl crate::Message for HeartbeatResponse {
     }
     fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
         HeartbeatResponse::decode(buf, version)
+    }
+    fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        HeartbeatResponse::decode_with_limits(buf, version, limits)
     }
 }

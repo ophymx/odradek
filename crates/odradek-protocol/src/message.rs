@@ -8,6 +8,7 @@
 
 use bytes::{Buf, BufMut};
 
+use crate::budget::Limits;
 use crate::error::{DecodeError, EncodeError};
 
 /// A versioned Kafka message: encode/decode plus its identity in the
@@ -34,5 +35,24 @@ pub trait Message: Sized {
     /// slower for a 1 MiB fetch response. Decode from a `Bytes` on any
     /// path that carries records. `tests/zero_copy.rs` holds the
     /// property to it.
+    ///
+    /// Allocation is bounded by the default
+    /// [`Limits`], derived from `buf`'s remaining length; see
+    /// [`Message::decode_with_limits`].
     fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError>;
+
+    /// Decode one message of `version` under `limits`.
+    ///
+    /// Every generated message overrides this. The default is here so
+    /// that adding it broke no hand-written implementation: it ignores
+    /// `limits` and decodes under that type's own default bound, which
+    /// is never *less* safe than [`Message::decode`].
+    fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let _ = limits;
+        Self::decode(buf, version)
+    }
 }

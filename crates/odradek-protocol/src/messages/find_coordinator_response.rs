@@ -13,6 +13,7 @@
 
 use bytes::{Buf, BufMut};
 
+use crate::budget::{Budget, Limits};
 #[allow(unused_imports)]
 use crate::error::{DecodeError, EncodeError};
 use crate::wire::{self, RawTaggedField};
@@ -108,7 +109,28 @@ impl FindCoordinatorResponse {
         Ok(())
     }
 
+    /// Decode one `FindCoordinatorResponse`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `FindCoordinatorResponse` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `FindCoordinatorResponse` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         if version >= 1 {
             this.throttle_time_ms = wire::get_i32(buf)?;
@@ -148,7 +170,10 @@ impl FindCoordinatorResponse {
                     Some(n) => {
                         let mut items = Vec::new();
                         for _ in 0..n {
-                            items.push(Coordinator::decode(buf, version)?);
+                            let mark = buf.remaining();
+                            let item = Coordinator::decode_with_budget(buf, version, budget)?;
+                            budget.progress(mark, buf.remaining())?;
+                            budget.push(&mut items, item)?;
                         }
                         items
                     }
@@ -156,7 +181,7 @@ impl FindCoordinatorResponse {
             };
         }
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -172,6 +197,13 @@ impl crate::Message for FindCoordinatorResponse {
     }
     fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
         FindCoordinatorResponse::decode(buf, version)
+    }
+    fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        FindCoordinatorResponse::decode_with_limits(buf, version, limits)
     }
 }
 
@@ -247,7 +279,28 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Decode one `Coordinator`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `Coordinator` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `Coordinator` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         if version >= 4 {
             this.key = if is_flexible(version) {
@@ -280,7 +333,7 @@ impl Coordinator {
             };
         }
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }

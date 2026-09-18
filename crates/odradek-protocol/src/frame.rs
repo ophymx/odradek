@@ -21,11 +21,32 @@ pub const DEFAULT_MAX_FRAME: usize = 64 << 20;
 
 /// Append one frame to `buf`: an `i32` length prefix backfilled around
 /// whatever `payload` encodes (header then body, by convention).
+///
+/// On error `buf` is truncated back to the length it had on entry, as
+/// [`RecordBatch::encode_to`](crate::records::RecordBatch::encode_to)
+/// does. A caller's send buffer usually outlives the frame being written
+/// into it, so leaving a length prefix and a partial payload behind
+/// after a handled [`EncodeError`] would desynchronize the stream — the
+/// peer would read that debris as the start of the next frame.
 pub fn frame(
     buf: &mut BytesMut,
     payload: impl FnOnce(&mut BytesMut) -> Result<(), EncodeError>,
 ) -> Result<(), EncodeError> {
     let start = buf.len();
+    match frame_in_place(buf, start, payload) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            buf.truncate(start);
+            Err(error)
+        }
+    }
+}
+
+fn frame_in_place(
+    buf: &mut BytesMut,
+    start: usize,
+    payload: impl FnOnce(&mut BytesMut) -> Result<(), EncodeError>,
+) -> Result<(), EncodeError> {
     buf.put_i32(0);
     payload(buf)?;
     let len = buf.len() - start - 4;
@@ -39,6 +60,13 @@ pub fn frame(
 
 /// Validate a frame's length prefix: negative or above `max_len` is a
 /// wire violation, never a value to clamp.
+///
+/// The return is an upper bound to *stream against*, not a size to
+/// allocate. `vec![0u8; check_len(prefix, max)?]` before the body has
+/// arrived lets four attacker-chosen bytes reserve 64 MiB per
+/// connection, and a few hundred idle connections exhaust a host
+/// without either side sending a payload. Accumulate what the socket
+/// actually delivers and let [`try_split`] decide when a frame is whole.
 pub fn check_len(prefix: [u8; 4], max_len: usize) -> Result<usize, DecodeError> {
     let len = i32::from_be_bytes(prefix);
     if len < 0 {
@@ -138,6 +166,33 @@ mod tests {
         assert!(check_len(i32::MAX.to_be_bytes(), DEFAULT_MAX_FRAME).is_err());
         let mut buf = BytesMut::from(&i32::MAX.to_be_bytes()[..]);
         assert!(try_split(&mut buf, DEFAULT_MAX_FRAME).is_err());
+    }
+
+    #[test]
+    fn failed_frame_leaves_no_debris() {
+        // A send buffer with an already-queued frame in it; the second
+        // frame's payload fails halfway through writing.
+        let mut buf = BytesMut::new();
+        frame(&mut buf, |b| {
+            b.put_slice(b"first");
+            Ok(())
+        })
+        .unwrap();
+        let queued = buf.clone();
+
+        let error = frame(&mut buf, |b| {
+            b.put_slice(b"half-written");
+            Err(EncodeError::NullField("boom"))
+        })
+        .unwrap_err();
+        assert_eq!(error, EncodeError::NullField("boom"));
+        assert_eq!(buf, queued, "failed frame left bytes in the send buffer");
+
+        // The buffer is still a valid stream: the queued frame reads
+        // back, and nothing follows it.
+        let first = try_split(&mut buf, DEFAULT_MAX_FRAME).unwrap().unwrap();
+        assert_eq!(&first[..], b"first");
+        assert!(try_split(&mut buf, DEFAULT_MAX_FRAME).unwrap().is_none());
     }
 
     #[test]

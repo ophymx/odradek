@@ -13,6 +13,7 @@
 
 use bytes::{Buf, BufMut};
 
+use crate::budget::{Budget, Limits};
 #[allow(unused_imports)]
 use crate::error::{DecodeError, EncodeError};
 use crate::wire::{self, RawTaggedField};
@@ -95,7 +96,28 @@ impl ConsumerGroupHeartbeatResponse {
         Ok(())
     }
 
+    /// Decode one `ConsumerGroupHeartbeatResponse`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `ConsumerGroupHeartbeatResponse` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `ConsumerGroupHeartbeatResponse` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         this.throttle_time_ms = wire::get_i32(buf)?;
         this.error_code = wire::get_i16(buf)?;
@@ -114,10 +136,10 @@ impl ConsumerGroupHeartbeatResponse {
         this.assignment = if wire::get_i8(buf)? < 0 {
             None
         } else {
-            Some(Assignment::decode(buf, version)?)
+            Some(Assignment::decode_with_budget(buf, version, budget)?)
         };
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -133,6 +155,13 @@ impl crate::Message for ConsumerGroupHeartbeatResponse {
     }
     fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
         ConsumerGroupHeartbeatResponse::decode(buf, version)
+    }
+    fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        ConsumerGroupHeartbeatResponse::decode_with_limits(buf, version, limits)
     }
 }
 
@@ -171,7 +200,28 @@ impl Assignment {
         Ok(())
     }
 
+    /// Decode one `Assignment`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `Assignment` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `Assignment` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         this.topic_partitions = {
             let len = if is_flexible(version) {
@@ -184,14 +234,17 @@ impl Assignment {
                 Some(n) => {
                     let mut items = Vec::new();
                     for _ in 0..n {
-                        items.push(TopicPartitions::decode(buf, version)?);
+                        let mark = buf.remaining();
+                        let item = TopicPartitions::decode_with_budget(buf, version, budget)?;
+                        budget.progress(mark, buf.remaining())?;
+                        budget.push(&mut items, item)?;
                     }
                     items
                 }
             }
         };
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -236,7 +289,28 @@ impl TopicPartitions {
         Ok(())
     }
 
+    /// Decode one `TopicPartitions`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `TopicPartitions` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `TopicPartitions` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         this.topic_id = wire::get_uuid(buf)?;
         this.partitions = {
@@ -250,14 +324,14 @@ impl TopicPartitions {
                 Some(n) => {
                     let mut items = Vec::new();
                     for _ in 0..n {
-                        items.push(wire::get_i32(buf)?);
+                        budget.push(&mut items, wire::get_i32(buf)?)?;
                     }
                     items
                 }
             }
         };
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }

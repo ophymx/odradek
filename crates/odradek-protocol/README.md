@@ -17,11 +17,22 @@ the exact same codec.
 
 - **Unknown data round-trips.** Unrecognized tagged fields are preserved
   as raw bytes; known ones are materialized as typed `Option` fields.
+  Tagged-field sections must be strictly ascending by tag, as the spec
+  requires — a repeated tag would let one occurrence overwrite another
+  and break the round-trip.
 - **The proxy guarantee.** Record batches (v2, CRC-32C validated) carry
   compressed and unknown-codec payloads raw and re-encode
   byte-identically — verified against a golden segment from a real
   Kafka 4.1 broker.
 - **Malformed input never panics.** Decoders return typed errors.
+- **Decoding is bounded.** A wire count is an instruction to allocate
+  and the peer chooses it, so every decoder spends against a budget
+  sized from its input: at most `clamp(16 × n, 64 KiB, 256 MiB)` bytes
+  of decoded collections at any instant, growth transients included,
+  plus the `String` contents it copies 1:1 off the wire. At the 64 MiB
+  frame ceiling a hostile frame peaks at ~5× its bytes instead of the
+  28× measured without it. `decode_with_limits` takes another policy;
+  plain `decode` applies the default, so the bound is not opt-in.
 
 ```rust
 use odradek_protocol::messages::metadata_request::MetadataRequest;

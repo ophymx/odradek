@@ -37,4 +37,21 @@ pub enum DecodeError {
     /// A record batch's stored checksum does not match its contents.
     #[error("crc mismatch: batch stores {stored:#010x}, contents hash to {computed:#010x}")]
     CrcMismatch { stored: u32, computed: u32 },
+    /// Decoding this input would allocate more than its
+    /// [`Budget`](crate::budget::Budget) allows — a count-prefixed array
+    /// asking for far more memory than the bytes that carry it.
+    #[error("decode would allocate {wanted} bytes, over this input's {limit}-byte budget")]
+    AllocationLimit { limit: usize, wanted: usize },
+    /// The allocator refused a request the budget had approved.
+    #[error("allocator refused {bytes} bytes while decoding (budget {limit})")]
+    AllocationFailed { bytes: usize, limit: usize },
+    /// A count-driven loop's element consumed no input. Legal counts
+    /// cannot outrun the bytes that back them; continuing would spin.
+    #[error("array element consumed no input")]
+    NoProgress,
+    /// A tagged-field section was not strictly ascending by tag. The
+    /// spec requires ascending order, and a repeated tag would let one
+    /// occurrence silently overwrite another.
+    #[error("tagged field {tag} does not follow {previous} in ascending order")]
+    TaggedFieldOrder { previous: u32, tag: u32 },
 }

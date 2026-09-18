@@ -13,6 +13,7 @@
 
 use bytes::{Buf, BufMut};
 
+use crate::budget::{Budget, Limits};
 #[allow(unused_imports)]
 use crate::error::{DecodeError, EncodeError};
 use crate::wire::{self, RawTaggedField};
@@ -82,7 +83,28 @@ impl LeaveGroupRequest {
         Ok(())
     }
 
+    /// Decode one `LeaveGroupRequest`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `LeaveGroupRequest` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `LeaveGroupRequest` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         this.group_id = if is_flexible(version) {
             wire::get_compact_string(buf)?
@@ -108,7 +130,10 @@ impl LeaveGroupRequest {
                     Some(n) => {
                         let mut items = Vec::new();
                         for _ in 0..n {
-                            items.push(MemberIdentity::decode(buf, version)?);
+                            let mark = buf.remaining();
+                            let item = MemberIdentity::decode_with_budget(buf, version, budget)?;
+                            budget.progress(mark, buf.remaining())?;
+                            budget.push(&mut items, item)?;
                         }
                         items
                     }
@@ -116,7 +141,7 @@ impl LeaveGroupRequest {
             };
         }
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -132,6 +157,13 @@ impl crate::Message for LeaveGroupRequest {
     }
     fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
         LeaveGroupRequest::decode(buf, version)
+    }
+    fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        LeaveGroupRequest::decode_with_limits(buf, version, limits)
     }
 }
 
@@ -189,7 +221,28 @@ impl MemberIdentity {
         Ok(())
     }
 
+    /// Decode one `MemberIdentity`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `MemberIdentity` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `MemberIdentity` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         if version >= 3 {
             this.member_id = if is_flexible(version) {
@@ -213,7 +266,7 @@ impl MemberIdentity {
             };
         }
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }

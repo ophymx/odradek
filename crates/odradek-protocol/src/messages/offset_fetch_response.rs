@@ -13,6 +13,7 @@
 
 use bytes::{Buf, BufMut};
 
+use crate::budget::{Budget, Limits};
 #[allow(unused_imports)]
 use crate::error::{DecodeError, EncodeError};
 use crate::wire::{self, RawTaggedField};
@@ -89,7 +90,28 @@ impl OffsetFetchResponse {
         Ok(())
     }
 
+    /// Decode one `OffsetFetchResponse`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `OffsetFetchResponse` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `OffsetFetchResponse` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         if version >= 3 {
             this.throttle_time_ms = wire::get_i32(buf)?;
@@ -106,7 +128,11 @@ impl OffsetFetchResponse {
                     Some(n) => {
                         let mut items = Vec::new();
                         for _ in 0..n {
-                            items.push(OffsetFetchResponseTopic::decode(buf, version)?);
+                            let mark = buf.remaining();
+                            let item =
+                                OffsetFetchResponseTopic::decode_with_budget(buf, version, budget)?;
+                            budget.progress(mark, buf.remaining())?;
+                            budget.push(&mut items, item)?;
                         }
                         items
                     }
@@ -128,7 +154,11 @@ impl OffsetFetchResponse {
                     Some(n) => {
                         let mut items = Vec::new();
                         for _ in 0..n {
-                            items.push(OffsetFetchResponseGroup::decode(buf, version)?);
+                            let mark = buf.remaining();
+                            let item =
+                                OffsetFetchResponseGroup::decode_with_budget(buf, version, budget)?;
+                            budget.progress(mark, buf.remaining())?;
+                            budget.push(&mut items, item)?;
                         }
                         items
                     }
@@ -136,7 +166,7 @@ impl OffsetFetchResponse {
             };
         }
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -152,6 +182,13 @@ impl crate::Message for OffsetFetchResponse {
     }
     fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
         OffsetFetchResponse::decode(buf, version)
+    }
+    fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        OffsetFetchResponse::decode_with_limits(buf, version, limits)
     }
 }
 
@@ -202,7 +239,28 @@ impl OffsetFetchResponseTopic {
         Ok(())
     }
 
+    /// Decode one `OffsetFetchResponseTopic`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `OffsetFetchResponseTopic` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `OffsetFetchResponseTopic` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         if version <= 7 {
             this.name = if is_flexible(version) {
@@ -223,7 +281,12 @@ impl OffsetFetchResponseTopic {
                     Some(n) => {
                         let mut items = Vec::new();
                         for _ in 0..n {
-                            items.push(OffsetFetchResponsePartition::decode(buf, version)?);
+                            let mark = buf.remaining();
+                            let item = OffsetFetchResponsePartition::decode_with_budget(
+                                buf, version, budget,
+                            )?;
+                            budget.progress(mark, buf.remaining())?;
+                            budget.push(&mut items, item)?;
                         }
                         items
                     }
@@ -231,7 +294,7 @@ impl OffsetFetchResponseTopic {
             };
         }
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -295,7 +358,28 @@ impl OffsetFetchResponsePartition {
         Ok(())
     }
 
+    /// Decode one `OffsetFetchResponsePartition`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `OffsetFetchResponsePartition` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `OffsetFetchResponsePartition` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         if version <= 7 {
             this.partition_index = wire::get_i32(buf)?;
@@ -317,7 +401,7 @@ impl OffsetFetchResponsePartition {
             this.error_code = wire::get_i16(buf)?;
         }
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -376,7 +460,28 @@ impl OffsetFetchResponseGroup {
         Ok(())
     }
 
+    /// Decode one `OffsetFetchResponseGroup`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `OffsetFetchResponseGroup` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `OffsetFetchResponseGroup` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         if version >= 8 {
             this.group_id = if is_flexible(version) {
@@ -397,7 +502,12 @@ impl OffsetFetchResponseGroup {
                     Some(n) => {
                         let mut items = Vec::new();
                         for _ in 0..n {
-                            items.push(OffsetFetchResponseTopics::decode(buf, version)?);
+                            let mark = buf.remaining();
+                            let item = OffsetFetchResponseTopics::decode_with_budget(
+                                buf, version, budget,
+                            )?;
+                            budget.progress(mark, buf.remaining())?;
+                            budget.push(&mut items, item)?;
                         }
                         items
                     }
@@ -408,7 +518,7 @@ impl OffsetFetchResponseGroup {
             this.error_code = wire::get_i16(buf)?;
         }
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -467,7 +577,28 @@ impl OffsetFetchResponseTopics {
         Ok(())
     }
 
+    /// Decode one `OffsetFetchResponseTopics`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `OffsetFetchResponseTopics` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `OffsetFetchResponseTopics` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         if (8..=9).contains(&version) {
             this.name = if is_flexible(version) {
@@ -491,7 +622,12 @@ impl OffsetFetchResponseTopics {
                     Some(n) => {
                         let mut items = Vec::new();
                         for _ in 0..n {
-                            items.push(OffsetFetchResponsePartitions::decode(buf, version)?);
+                            let mark = buf.remaining();
+                            let item = OffsetFetchResponsePartitions::decode_with_budget(
+                                buf, version, budget,
+                            )?;
+                            budget.progress(mark, buf.remaining())?;
+                            budget.push(&mut items, item)?;
                         }
                         items
                     }
@@ -499,7 +635,7 @@ impl OffsetFetchResponseTopics {
             };
         }
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -563,7 +699,28 @@ impl OffsetFetchResponsePartitions {
         Ok(())
     }
 
+    /// Decode one `OffsetFetchResponsePartitions`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `OffsetFetchResponsePartitions` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `OffsetFetchResponsePartitions` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         if version >= 8 {
             this.partition_index = wire::get_i32(buf)?;
@@ -585,7 +742,7 @@ impl OffsetFetchResponsePartitions {
             this.error_code = wire::get_i16(buf)?;
         }
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }

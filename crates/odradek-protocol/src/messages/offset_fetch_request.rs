@@ -13,6 +13,7 @@
 
 use bytes::{Buf, BufMut};
 
+use crate::budget::{Budget, Limits};
 #[allow(unused_imports)]
 use crate::error::{DecodeError, EncodeError};
 use crate::wire::{self, RawTaggedField};
@@ -107,7 +108,28 @@ impl OffsetFetchRequest {
         Ok(())
     }
 
+    /// Decode one `OffsetFetchRequest`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `OffsetFetchRequest` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `OffsetFetchRequest` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         if version <= 7 {
             this.group_id = if is_flexible(version) {
@@ -133,7 +155,11 @@ impl OffsetFetchRequest {
                     Some(n) => {
                         let mut items = Vec::new();
                         for _ in 0..n {
-                            items.push(OffsetFetchRequestTopic::decode(buf, version)?);
+                            let mark = buf.remaining();
+                            let item =
+                                OffsetFetchRequestTopic::decode_with_budget(buf, version, budget)?;
+                            budget.progress(mark, buf.remaining())?;
+                            budget.push(&mut items, item)?;
                         }
                         Some(items)
                     }
@@ -152,7 +178,11 @@ impl OffsetFetchRequest {
                     Some(n) => {
                         let mut items = Vec::new();
                         for _ in 0..n {
-                            items.push(OffsetFetchRequestGroup::decode(buf, version)?);
+                            let mark = buf.remaining();
+                            let item =
+                                OffsetFetchRequestGroup::decode_with_budget(buf, version, budget)?;
+                            budget.progress(mark, buf.remaining())?;
+                            budget.push(&mut items, item)?;
                         }
                         items
                     }
@@ -163,7 +193,7 @@ impl OffsetFetchRequest {
             this.require_stable = wire::get_bool(buf)?;
         }
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -179,6 +209,13 @@ impl crate::Message for OffsetFetchRequest {
     }
     fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
         OffsetFetchRequest::decode(buf, version)
+    }
+    fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        OffsetFetchRequest::decode_with_limits(buf, version, limits)
     }
 }
 
@@ -229,7 +266,28 @@ impl OffsetFetchRequestTopic {
         Ok(())
     }
 
+    /// Decode one `OffsetFetchRequestTopic`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `OffsetFetchRequestTopic` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `OffsetFetchRequestTopic` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         if version <= 7 {
             this.name = if is_flexible(version) {
@@ -250,7 +308,7 @@ impl OffsetFetchRequestTopic {
                     Some(n) => {
                         let mut items = Vec::new();
                         for _ in 0..n {
-                            items.push(wire::get_i32(buf)?);
+                            budget.push(&mut items, wire::get_i32(buf)?)?;
                         }
                         items
                     }
@@ -258,7 +316,7 @@ impl OffsetFetchRequestTopic {
             };
         }
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -338,7 +396,28 @@ impl OffsetFetchRequestGroup {
         Ok(())
     }
 
+    /// Decode one `OffsetFetchRequestGroup`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `OffsetFetchRequestGroup` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `OffsetFetchRequestGroup` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         if version >= 8 {
             this.group_id = if is_flexible(version) {
@@ -369,7 +448,11 @@ impl OffsetFetchRequestGroup {
                     Some(n) => {
                         let mut items = Vec::new();
                         for _ in 0..n {
-                            items.push(OffsetFetchRequestTopics::decode(buf, version)?);
+                            let mark = buf.remaining();
+                            let item =
+                                OffsetFetchRequestTopics::decode_with_budget(buf, version, budget)?;
+                            budget.progress(mark, buf.remaining())?;
+                            budget.push(&mut items, item)?;
                         }
                         Some(items)
                     }
@@ -377,7 +460,7 @@ impl OffsetFetchRequestGroup {
             };
         }
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -436,7 +519,28 @@ impl OffsetFetchRequestTopics {
         Ok(())
     }
 
+    /// Decode one `OffsetFetchRequestTopics`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `OffsetFetchRequestTopics` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `OffsetFetchRequestTopics` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         if (8..=9).contains(&version) {
             this.name = if is_flexible(version) {
@@ -460,7 +564,7 @@ impl OffsetFetchRequestTopics {
                     Some(n) => {
                         let mut items = Vec::new();
                         for _ in 0..n {
-                            items.push(wire::get_i32(buf)?);
+                            budget.push(&mut items, wire::get_i32(buf)?)?;
                         }
                         items
                     }
@@ -468,7 +572,7 @@ impl OffsetFetchRequestTopics {
             };
         }
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }

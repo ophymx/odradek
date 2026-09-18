@@ -13,6 +13,7 @@
 
 use bytes::{Buf, BufMut};
 
+use crate::budget::{Budget, Limits};
 #[allow(unused_imports)]
 use crate::error::{DecodeError, EncodeError};
 use crate::wire::{self, RawTaggedField};
@@ -78,7 +79,28 @@ impl ProduceRequest {
         Ok(())
     }
 
+    /// Decode one `ProduceRequest`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `ProduceRequest` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `ProduceRequest` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         this.transactional_id = if is_flexible(version) {
             wire::get_compact_nullable_string(buf)?
@@ -98,14 +120,17 @@ impl ProduceRequest {
                 Some(n) => {
                     let mut items = Vec::new();
                     for _ in 0..n {
-                        items.push(TopicProduceData::decode(buf, version)?);
+                        let mark = buf.remaining();
+                        let item = TopicProduceData::decode_with_budget(buf, version, budget)?;
+                        budget.progress(mark, buf.remaining())?;
+                        budget.push(&mut items, item)?;
                     }
                     items
                 }
             }
         };
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -121,6 +146,13 @@ impl crate::Message for ProduceRequest {
     }
     fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
         ProduceRequest::decode(buf, version)
+    }
+    fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        ProduceRequest::decode_with_limits(buf, version, limits)
     }
 }
 
@@ -175,7 +207,28 @@ impl TopicProduceData {
         Ok(())
     }
 
+    /// Decode one `TopicProduceData`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `TopicProduceData` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `TopicProduceData` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         if version <= 12 {
             this.name = if is_flexible(version) {
@@ -198,14 +251,17 @@ impl TopicProduceData {
                 Some(n) => {
                     let mut items = Vec::new();
                     for _ in 0..n {
-                        items.push(PartitionProduceData::decode(buf, version)?);
+                        let mark = buf.remaining();
+                        let item = PartitionProduceData::decode_with_budget(buf, version, budget)?;
+                        budget.progress(mark, buf.remaining())?;
+                        budget.push(&mut items, item)?;
                     }
                     items
                 }
             }
         };
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -247,7 +303,28 @@ impl PartitionProduceData {
         Ok(())
     }
 
+    /// Decode one `PartitionProduceData`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `PartitionProduceData` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `PartitionProduceData` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         this.index = wire::get_i32(buf)?;
         this.records = if is_flexible(version) {
@@ -256,7 +333,7 @@ impl PartitionProduceData {
             wire::get_nullable_bytes(buf)?
         };
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }

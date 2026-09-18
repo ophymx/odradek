@@ -16,6 +16,7 @@
 
 use bytes::{Buf, BufMut};
 
+use crate::budget::{Budget, Limits};
 #[allow(unused_imports)]
 use crate::error::{DecodeError, EncodeError};
 use crate::wire::{self, RawTaggedField};
@@ -69,7 +70,28 @@ impl CreateTopicsResponse {
         Ok(())
     }
 
+    /// Decode one `CreateTopicsResponse`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `CreateTopicsResponse` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `CreateTopicsResponse` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         this.throttle_time_ms = wire::get_i32(buf)?;
         this.topics = {
@@ -83,14 +105,17 @@ impl CreateTopicsResponse {
                 Some(n) => {
                     let mut items = Vec::new();
                     for _ in 0..n {
-                        items.push(CreatableTopicResult::decode(buf, version)?);
+                        let mark = buf.remaining();
+                        let item = CreatableTopicResult::decode_with_budget(buf, version, budget)?;
+                        budget.progress(mark, buf.remaining())?;
+                        budget.push(&mut items, item)?;
                     }
                     items
                 }
             }
         };
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -106,6 +131,13 @@ impl crate::Message for CreateTopicsResponse {
     }
     fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
         CreateTopicsResponse::decode(buf, version)
+    }
+    fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        CreateTopicsResponse::decode_with_limits(buf, version, limits)
     }
 }
 
@@ -214,7 +246,28 @@ impl CreatableTopicResult {
         Ok(())
     }
 
+    /// Decode one `CreatableTopicResult`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `CreatableTopicResult` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `CreatableTopicResult` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         this.name = if is_flexible(version) {
             wire::get_compact_string(buf)?
@@ -248,7 +301,11 @@ impl CreatableTopicResult {
                     Some(n) => {
                         let mut items = Vec::new();
                         for _ in 0..n {
-                            items.push(CreatableTopicConfigs::decode(buf, version)?);
+                            let mark = buf.remaining();
+                            let item =
+                                CreatableTopicConfigs::decode_with_budget(buf, version, budget)?;
+                            budget.progress(mark, buf.remaining())?;
+                            budget.push(&mut items, item)?;
                         }
                         Some(items)
                     }
@@ -256,7 +313,7 @@ impl CreatableTopicResult {
             };
         }
         if is_flexible(version) {
-            for raw in wire::get_tagged_fields(buf)? {
+            for raw in wire::get_tagged_fields_with_budget(buf, budget)? {
                 if raw.tag == 0 && (version >= 5) {
                     let mut tag_data = raw.data;
                     let buf = &mut tag_data;
@@ -267,7 +324,7 @@ impl CreatableTopicResult {
                         ));
                     }
                 } else {
-                    this.unknown_tagged_fields.push(raw);
+                    budget.push(&mut this.unknown_tagged_fields, raw)?;
                 }
             }
         }
@@ -337,7 +394,28 @@ impl CreatableTopicConfigs {
         Ok(())
     }
 
+    /// Decode one `CreatableTopicConfigs`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `CreatableTopicConfigs` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `CreatableTopicConfigs` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         if version >= 5 {
             this.name = if is_flexible(version) {
@@ -363,7 +441,7 @@ impl CreatableTopicConfigs {
             this.is_sensitive = wire::get_bool(buf)?;
         }
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }

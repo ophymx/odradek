@@ -13,6 +13,12 @@
 //! absent on the wire); unknown tags round-trip raw. One shape is not
 //! supported (the generator fails loudly on it): fields that are
 //! wire-encoded in some versions and tagged in others.
+//!
+//! Every emitted array loop grows its vector against a shared
+//! `budget::Budget` and refuses an element that consumed no input. The
+//! bound belongs here rather than in each of the ~36 modules: a wire
+//! count is attacker-controlled everywhere it appears, and a hand-added
+//! `Vec::with_capacity(n)` in one generated file would undo it.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -519,6 +525,7 @@ fn generate_message(msg: &Message) -> Result<String> {
     let _ = writeln!(w);
     let _ = writeln!(w, "use bytes::{{Buf, BufMut}};");
     let _ = writeln!(w);
+    let _ = writeln!(w, "use crate::budget::{{Budget, Limits}};");
     let _ = writeln!(w, "#[allow(unused_imports)]");
     let _ = writeln!(w, "use crate::error::{{DecodeError, EncodeError}};");
     let _ = writeln!(w, "use crate::wire::{{self, RawTaggedField}};");
@@ -699,11 +706,50 @@ fn generate_struct(w: &mut String, msg: &Message, def: &StructDef, is_top: bool)
     let _ = writeln!(w, "        Ok(())");
     let _ = writeln!(w, "    }}");
 
-    // decode
+    // decode: three entry points over one body. `decode` keeps its
+    // signature (and gains the default bound), `decode_with_limits`
+    // takes a policy, `decode_with_budget` joins a bound already in
+    // progress so that nesting cannot multiply it.
     let _ = writeln!(w);
     let _ = writeln!(
         w,
+        "    /// Decode one `{}`, bounding allocation by the default\n    \
+             /// [`Limits`] derived from `buf`'s remaining length.",
+        def.name
+    );
+    let _ = writeln!(
+        w,
         "    pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {{"
+    );
+    let _ = writeln!(
+        w,
+        "        Self::decode_with_limits(buf, version, Limits::default())"
+    );
+    let _ = writeln!(w, "    }}");
+    let _ = writeln!(w);
+    let _ = writeln!(w, "    /// Decode one `{}` under `limits`.", def.name);
+    let _ = writeln!(
+        w,
+        "    pub fn decode_with_limits(buf: &mut impl Buf, version: i16, limits: Limits) -> Result<Self, DecodeError> {{"
+    );
+    let _ = writeln!(
+        w,
+        "        let mut budget = limits.budget(buf.remaining());"
+    );
+    let _ = writeln!(
+        w,
+        "        Self::decode_with_budget(buf, version, &mut budget)"
+    );
+    let _ = writeln!(w, "    }}");
+    let _ = writeln!(w);
+    let _ = writeln!(
+        w,
+        "    /// Decode one `{}` against an existing `budget`.",
+        def.name
+    );
+    let _ = writeln!(
+        w,
+        "    pub fn decode_with_budget(buf: &mut impl Buf, version: i16, budget: &mut Budget) -> Result<Self, DecodeError> {{"
     );
     let _ = writeln!(w, "        let mut this = Self::default();");
     for f in &wire_fields {
@@ -714,12 +760,15 @@ fn generate_struct(w: &mut String, msg: &Message, def: &StructDef, is_top: bool)
         let _ = writeln!(w, "        if is_flexible(version) {{");
         let _ = writeln!(
             w,
-            "            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;"
+            "            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;"
         );
         let _ = writeln!(w, "        }}");
     } else {
         let _ = writeln!(w, "        if is_flexible(version) {{");
-        let _ = writeln!(w, "            for raw in wire::get_tagged_fields(buf)? {{");
+        let _ = writeln!(
+            w,
+            "            for raw in wire::get_tagged_fields_with_budget(buf, budget)? {{"
+        );
         for (i, f) in tagged_fields.iter().enumerate() {
             let name = rust_field_name(&f.name);
             let value = decode_value(msg, f)?;
@@ -746,7 +795,7 @@ fn generate_struct(w: &mut String, msg: &Message, def: &StructDef, is_top: bool)
         let _ = writeln!(w, "                }} else {{");
         let _ = writeln!(
             w,
-            "                    this.unknown_tagged_fields.push(raw);"
+            "                    budget.push(&mut this.unknown_tagged_fields, raw)?;"
         );
         let _ = writeln!(w, "                }}");
         let _ = writeln!(w, "            }}");
@@ -777,6 +826,16 @@ fn generate_struct(w: &mut String, msg: &Message, def: &StructDef, is_top: bool)
                 "    fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {{"
             );
             let _ = writeln!(w, "        {}::decode(buf, version)", def.name);
+            let _ = writeln!(w, "    }}");
+            let _ = writeln!(
+                w,
+                "    fn decode_with_limits(buf: &mut impl Buf, version: i16, limits: Limits) -> Result<Self, DecodeError> {{"
+            );
+            let _ = writeln!(
+                w,
+                "        {}::decode_with_limits(buf, version, limits)",
+                def.name
+            );
             let _ = writeln!(w, "    }}");
             let _ = writeln!(w, "}}");
         }
@@ -1133,7 +1192,7 @@ fn decode_value(msg: &Message, f: &Field) -> Result<String> {
         (FieldType::Int64, None) => "wire::get_i64(buf)?".to_string(),
         (FieldType::Float64, None) => "wire::get_f64(buf)?".to_string(),
         (FieldType::Uuid, None) => "wire::get_uuid(buf)?".to_string(),
-        (FieldType::Struct(n), None) => format!("{n}::decode(buf, version)?"),
+        (FieldType::Struct(n), None) => format!("{n}::decode_with_budget(buf, version, budget)?"),
         (FieldType::Struct(n), Some(nullable)) => {
             let none_val = if nullable == "true" {
                 "None".to_string()
@@ -1143,7 +1202,7 @@ fn decode_value(msg: &Message, f: &Field) -> Result<String> {
                 )
             };
             format!(
-                "if wire::get_i8(buf)? < 0 {{\n    {none_val}\n}} else {{\n    Some({n}::decode(buf, version)?)\n}}"
+                "if wire::get_i8(buf)? < 0 {{\n    {none_val}\n}} else {{\n    Some({n}::decode_with_budget(buf, version, budget)?)\n}}"
             )
         }
         (FieldType::String, None) => flex_switch(
@@ -1183,9 +1242,27 @@ fn decode_value(msg: &Message, f: &Field) -> Result<String> {
                 "wire::get_compact_array_len(buf)?".into(),
                 "wire::get_array_len(buf)?".into(),
             );
-            let elem_code = decode_element(msg, f, elem)?;
+            // `n` is a wire count and never sizes the allocation: the
+            // vector grows from the elements that actually arrive, and
+            // every growth is charged to the shared budget first. A
+            // struct element also has to consume input — a zero-width
+            // element would turn a hostile count into a spin.
+            let push = match &**elem {
+                FieldType::Struct(_) => {
+                    let decode = decode_element(msg, f, elem)?;
+                    format!(
+                        "let mark = buf.remaining();\n                let item = {decode};\n                budget.progress(mark, buf.remaining())?;\n                budget.push(&mut items, item)?;"
+                    )
+                }
+                // Every primitive codec consumes at least one byte, so
+                // progress needs no check here.
+                _ => {
+                    let decode = decode_element(msg, f, elem)?;
+                    format!("budget.push(&mut items, {decode})?;")
+                }
+            };
             let some_arm = format!(
-                "Some(n) => {{\n            let mut items = Vec::new();\n            for _ in 0..n {{\n                items.push({elem_code});\n            }}\n            {}\n        }}",
+                "Some(n) => {{\n            let mut items = Vec::new();\n            for _ in 0..n {{\n                {push}\n            }}\n            {}\n        }}",
                 if nullable.is_some() {
                     "Some(items)"
                 } else {
@@ -1232,7 +1309,7 @@ fn decode_element(msg: &Message, f: &Field, elem: &FieldType) -> Result<String> 
         FieldType::Int64 => "wire::get_i64(buf)?".into(),
         FieldType::Float64 => "wire::get_f64(buf)?".into(),
         FieldType::Uuid => "wire::get_uuid(buf)?".into(),
-        FieldType::Struct(n) => format!("{n}::decode(buf, version)?"),
+        FieldType::Struct(n) => format!("{n}::decode_with_budget(buf, version, budget)?"),
         FieldType::String => flex_switch(
             &flex,
             "wire::get_compact_string(buf)?".into(),

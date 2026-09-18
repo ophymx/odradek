@@ -27,6 +27,23 @@
 //!   byte-identically (the proxy guarantee).
 //! - [`error_code`]: the open-world Kafka error code registry.
 //! - [`error`]: encode/decode error types.
+//! - [`budget`]: the allocation bound every decoder spends against.
+//!
+//! # Bounded decoding
+//!
+//! Wire counts are attacker-controlled and decoded elements are much
+//! larger than the bytes that ask for them, so every decoder here
+//! allocates against a [`budget::Budget`] sized from its input. With
+//! the default [`budget::Limits`], one decode's peak heap is at most
+//! `clamp(16 * n, 64 KiB, 256 MiB)` for the collections it builds, plus
+//! the *n* bytes of `String` contents it copies 1:1 off the wire. At the
+//! 64 MiB [`frame::DEFAULT_MAX_FRAME`] ceiling the absolute cap binds:
+//! **a hostile frame peaks at ~5x its bytes rather than the 28x
+//! measured before.** Pass another policy through the
+//! `decode_with_limits` entry points; the plain `decode` ones apply the
+//! default, so a caller who never hears about any of this is still
+//! bounded. See [`budget`] for why the factor is 16 and what a server
+//! should tighten.
 //!
 //! # Zero-copy decoding
 //!
@@ -41,8 +58,18 @@
 //! `Bytes` on any path that carries records. `tests/zero_copy.rs` holds
 //! the guarantee to it, down to asserting the decoded payloads alias the
 //! input buffer.
+//!
+//! The same aliasing has a cost worth knowing: a decoded payload keeps
+//! its *whole* source buffer alive, because that is what it points into.
+//! Retain one 10-byte record value out of a 64 MiB fetch response and
+//! all 64 MiB stays resident until that value drops. Slices that outlive
+//! the frame they came from — anything going into a cache, a retry
+//! queue, or a channel to another task — want
+//! `Bytes::copy_from_slice(&value)`, which pays one small copy to
+//! release the frame.
 
 pub mod api_key;
+pub mod budget;
 pub mod consumer_protocol;
 pub mod error;
 pub mod error_code;
@@ -54,6 +81,7 @@ pub mod records;
 pub mod wire;
 
 pub use api_key::ApiKey;
+pub use budget::{Budget, Limits};
 pub use error::{DecodeError, EncodeError};
 pub use error_code::ErrorCode;
 pub use message::Message;

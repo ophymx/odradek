@@ -10,9 +10,29 @@
 //! decoding then re-encoding one is byte-identical, which is what proxying
 //! requires, and it keeps this crate free of compression dependencies. The
 //! same applies to unknown compression codecs from the future.
+//!
+//! # Retention pins the source buffer
+//!
+//! A decoded key, value, or compressed payload is a refcounted slice of
+//! the buffer it was decoded from, not a copy — that is the point (see
+//! [`crate`] docs). The consequence is that holding on to *any* of them
+//! holds on to *all* of it: keep one 10-byte value out of a 64 MiB fetch
+//! response and the whole 64 MiB stays resident until it drops. For
+//! anything that outlives the response — a cache, a retry queue, a
+//! channel into another task — copy it out with
+//! `Bytes::copy_from_slice(&value)` and let the frame go.
+//!
+//! # Allocation is bounded
+//!
+//! Record and header counts are attacker-controlled and a decoded
+//! [`Record`] is ~15x the smallest wire form that can ask for one, so
+//! every decode here spends against a [`Budget`]; the `_with_limits`
+//! entry points take the policy, the plain ones apply the default. See
+//! [`crate::budget`].
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+use crate::budget::{Budget, Limits};
 use crate::error::{DecodeError, EncodeError};
 use crate::wire;
 
@@ -101,6 +121,11 @@ impl Default for Records {
 }
 
 /// One record within an uncompressed batch.
+///
+/// `key` and `value` are refcounted slices of the buffer this record was
+/// decoded from, so retaining either retains that entire buffer — a
+/// 10-byte value can pin a 64 MiB fetch response. Past the lifetime of
+/// the response, store `Bytes::copy_from_slice(&value)` instead.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Record {
     pub attributes: i8,
@@ -226,7 +251,26 @@ impl RecordBatch {
 
     /// Decode one batch, verifying magic and crc. Errors leave `buf` in an
     /// unspecified position.
+    ///
+    /// Allocation is bounded by the default [`Limits`], derived from
+    /// `buf`'s length; [`RecordBatch::decode_with_limits`] takes another
+    /// policy.
     pub fn decode(buf: &mut Bytes) -> Result<RecordBatch, DecodeError> {
+        Self::decode_with_limits(buf, Limits::default())
+    }
+
+    /// Decode one batch under `limits`.
+    pub fn decode_with_limits(buf: &mut Bytes, limits: Limits) -> Result<RecordBatch, DecodeError> {
+        let mut budget = limits.budget(buf.len());
+        Self::decode_with_budget(buf, &mut budget)
+    }
+
+    /// Decode one batch against an existing `budget`, so that a set of
+    /// batches — or a whole message carrying them — shares one bound.
+    pub fn decode_with_budget(
+        buf: &mut Bytes,
+        budget: &mut Budget,
+    ) -> Result<RecordBatch, DecodeError> {
         if buf.len() < 12 {
             return Err(DecodeError::Truncated {
                 needed: 12 - buf.len(),
@@ -278,7 +322,10 @@ impl RecordBatch {
         let records = if Compression::from_attributes(attributes) == Compression::None {
             let mut records = Vec::new();
             for _ in 0..count {
-                records.push(Record::decode(&mut body)?);
+                let mark = body.len();
+                let record = Record::decode_with_budget(&mut body, budget)?;
+                budget.progress(mark, body.len())?;
+                budget.push(&mut records, record)?;
             }
             if !body.is_empty() {
                 // Bytes inside the crc-covered region that no record
@@ -360,7 +407,19 @@ impl Record {
         Ok(())
     }
 
+    /// Decode one record, bounding allocation by the default [`Limits`].
     pub fn decode(buf: &mut Bytes) -> Result<Record, DecodeError> {
+        Self::decode_with_limits(buf, Limits::default())
+    }
+
+    /// Decode one record under `limits`.
+    pub fn decode_with_limits(buf: &mut Bytes, limits: Limits) -> Result<Record, DecodeError> {
+        let mut budget = limits.budget(buf.len());
+        Self::decode_with_budget(buf, &mut budget)
+    }
+
+    /// Decode one record against an existing `budget`.
+    pub fn decode_with_budget(buf: &mut Bytes, budget: &mut Budget) -> Result<Record, DecodeError> {
         let length = wire::get_varint(buf)?;
         let Ok(length) = usize::try_from(length) else {
             return Err(DecodeError::InvalidLength(length));
@@ -388,10 +447,12 @@ impl Record {
         }
         let mut headers = Vec::new();
         for _ in 0..header_count {
+            let mark = body.len();
             let key = get_varint_bytes(&mut body)?.ok_or(DecodeError::InvalidLength(-1))?;
             let key = String::from_utf8(key.into()).map_err(|_| DecodeError::InvalidUtf8)?;
             let value = get_varint_bytes(&mut body)?;
-            headers.push(RecordHeader { key, value });
+            budget.progress(mark, body.len())?;
+            budget.push(&mut headers, RecordHeader { key, value })?;
         }
         if !body.is_empty() {
             return Err(DecodeError::InvalidLength(body.len() as i64));
@@ -412,7 +473,28 @@ impl Record {
 /// A fetch response may truncate the final batch mid-bytes (brokers send
 /// whole segments sliced by size); a partial trailing batch is discarded,
 /// not an error. Corruption inside a complete batch is still an error.
+///
+/// Allocation is bounded by the default [`Limits`], derived from `buf`'s
+/// length and shared by every batch in the set.
 pub fn decode_set(buf: &mut Bytes) -> Result<Vec<RecordBatch>, DecodeError> {
+    decode_set_with_limits(buf, Limits::default())
+}
+
+/// Decode a whole record set under `limits`, one budget for the set.
+pub fn decode_set_with_limits(
+    buf: &mut Bytes,
+    limits: Limits,
+) -> Result<Vec<RecordBatch>, DecodeError> {
+    let mut budget = limits.budget(buf.len());
+    decode_set_with_budget(buf, &mut budget)
+}
+
+/// Decode a whole record set against an existing `budget`, so a message
+/// and the records inside it draw on the same bound.
+pub fn decode_set_with_budget(
+    buf: &mut Bytes,
+    budget: &mut Budget,
+) -> Result<Vec<RecordBatch>, DecodeError> {
     let mut batches = Vec::new();
     loop {
         if buf.len() < 12 {
@@ -427,7 +509,10 @@ pub fn decode_set(buf: &mut Bytes) -> Result<Vec<RecordBatch>, DecodeError> {
             buf.clear();
             return Ok(batches);
         }
-        batches.push(RecordBatch::decode(buf)?);
+        // A batch is at least `BATCH_OVERHEAD` bytes, so this loop
+        // cannot spin; the budget still covers what each batch builds.
+        let batch = RecordBatch::decode_with_budget(buf, budget)?;
+        budget.push(&mut batches, batch)?;
     }
 }
 

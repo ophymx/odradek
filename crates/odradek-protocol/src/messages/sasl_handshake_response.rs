@@ -13,6 +13,7 @@
 
 use bytes::{Buf, BufMut};
 
+use crate::budget::{Budget, Limits};
 #[allow(unused_imports)]
 use crate::error::{DecodeError, EncodeError};
 use crate::wire::{self, RawTaggedField};
@@ -70,7 +71,28 @@ impl SaslHandshakeResponse {
         Ok(())
     }
 
+    /// Decode one `SaslHandshakeResponse`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `SaslHandshakeResponse` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `SaslHandshakeResponse` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         this.error_code = wire::get_i16(buf)?;
         this.mechanisms = {
@@ -84,18 +106,21 @@ impl SaslHandshakeResponse {
                 Some(n) => {
                     let mut items = Vec::new();
                     for _ in 0..n {
-                        items.push(if is_flexible(version) {
-                            wire::get_compact_string(buf)?
-                        } else {
-                            wire::get_string(buf)?
-                        });
+                        budget.push(
+                            &mut items,
+                            if is_flexible(version) {
+                                wire::get_compact_string(buf)?
+                            } else {
+                                wire::get_string(buf)?
+                            },
+                        )?;
                     }
                     items
                 }
             }
         };
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -111,5 +136,12 @@ impl crate::Message for SaslHandshakeResponse {
     }
     fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
         SaslHandshakeResponse::decode(buf, version)
+    }
+    fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        SaslHandshakeResponse::decode_with_limits(buf, version, limits)
     }
 }

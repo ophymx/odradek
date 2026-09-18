@@ -16,6 +16,7 @@
 
 use bytes::{Buf, BufMut};
 
+use crate::budget::{Budget, Limits};
 #[allow(unused_imports)]
 use crate::error::{DecodeError, EncodeError};
 use crate::wire::{self, RawTaggedField};
@@ -95,7 +96,28 @@ impl ProduceResponse {
         Ok(())
     }
 
+    /// Decode one `ProduceResponse`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `ProduceResponse` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `ProduceResponse` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         this.responses = {
             let len = if is_flexible(version) {
@@ -108,7 +130,10 @@ impl ProduceResponse {
                 Some(n) => {
                     let mut items = Vec::new();
                     for _ in 0..n {
-                        items.push(TopicProduceResponse::decode(buf, version)?);
+                        let mark = buf.remaining();
+                        let item = TopicProduceResponse::decode_with_budget(buf, version, budget)?;
+                        budget.progress(mark, buf.remaining())?;
+                        budget.push(&mut items, item)?;
                     }
                     items
                 }
@@ -116,7 +141,7 @@ impl ProduceResponse {
         };
         this.throttle_time_ms = wire::get_i32(buf)?;
         if is_flexible(version) {
-            for raw in wire::get_tagged_fields(buf)? {
+            for raw in wire::get_tagged_fields_with_budget(buf, budget)? {
                 if raw.tag == 0 && (version >= 10) {
                     let mut tag_data = raw.data;
                     let buf = &mut tag_data;
@@ -131,7 +156,11 @@ impl ProduceResponse {
                             Some(n) => {
                                 let mut items = Vec::new();
                                 for _ in 0..n {
-                                    items.push(NodeEndpoint::decode(buf, version)?);
+                                    let mark = buf.remaining();
+                                    let item =
+                                        NodeEndpoint::decode_with_budget(buf, version, budget)?;
+                                    budget.progress(mark, buf.remaining())?;
+                                    budget.push(&mut items, item)?;
                                 }
                                 items
                             }
@@ -143,7 +172,7 @@ impl ProduceResponse {
                         ));
                     }
                 } else {
-                    this.unknown_tagged_fields.push(raw);
+                    budget.push(&mut this.unknown_tagged_fields, raw)?;
                 }
             }
         }
@@ -161,6 +190,13 @@ impl crate::Message for ProduceResponse {
     }
     fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
         ProduceResponse::decode(buf, version)
+    }
+    fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        ProduceResponse::decode_with_limits(buf, version, limits)
     }
 }
 
@@ -215,7 +251,28 @@ impl TopicProduceResponse {
         Ok(())
     }
 
+    /// Decode one `TopicProduceResponse`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `TopicProduceResponse` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `TopicProduceResponse` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         if version <= 12 {
             this.name = if is_flexible(version) {
@@ -238,14 +295,18 @@ impl TopicProduceResponse {
                 Some(n) => {
                     let mut items = Vec::new();
                     for _ in 0..n {
-                        items.push(PartitionProduceResponse::decode(buf, version)?);
+                        let mark = buf.remaining();
+                        let item =
+                            PartitionProduceResponse::decode_with_budget(buf, version, budget)?;
+                        budget.progress(mark, buf.remaining())?;
+                        budget.push(&mut items, item)?;
                     }
                     items
                 }
             }
         };
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -339,7 +400,28 @@ impl PartitionProduceResponse {
         Ok(())
     }
 
+    /// Decode one `PartitionProduceResponse`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `PartitionProduceResponse` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `PartitionProduceResponse` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         this.index = wire::get_i32(buf)?;
         this.error_code = wire::get_i16(buf)?;
@@ -360,7 +442,12 @@ impl PartitionProduceResponse {
                     Some(n) => {
                         let mut items = Vec::new();
                         for _ in 0..n {
-                            items.push(BatchIndexAndErrorMessage::decode(buf, version)?);
+                            let mark = buf.remaining();
+                            let item = BatchIndexAndErrorMessage::decode_with_budget(
+                                buf, version, budget,
+                            )?;
+                            budget.progress(mark, buf.remaining())?;
+                            budget.push(&mut items, item)?;
                         }
                         items
                     }
@@ -375,18 +462,19 @@ impl PartitionProduceResponse {
             };
         }
         if is_flexible(version) {
-            for raw in wire::get_tagged_fields(buf)? {
+            for raw in wire::get_tagged_fields_with_budget(buf, budget)? {
                 if raw.tag == 0 && (version >= 10) {
                     let mut tag_data = raw.data;
                     let buf = &mut tag_data;
-                    this.current_leader = Some(LeaderIdAndEpoch::decode(buf, version)?);
+                    this.current_leader =
+                        Some(LeaderIdAndEpoch::decode_with_budget(buf, version, budget)?);
                     if buf.has_remaining() {
                         return Err(DecodeError::InvalidLength(
                             i64::try_from(buf.remaining()).unwrap_or(i64::MAX),
                         ));
                     }
                 } else {
-                    this.unknown_tagged_fields.push(raw);
+                    budget.push(&mut this.unknown_tagged_fields, raw)?;
                 }
             }
         }
@@ -434,7 +522,28 @@ impl BatchIndexAndErrorMessage {
         Ok(())
     }
 
+    /// Decode one `BatchIndexAndErrorMessage`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `BatchIndexAndErrorMessage` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `BatchIndexAndErrorMessage` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         if version >= 8 {
             this.batch_index = wire::get_i32(buf)?;
@@ -447,7 +556,7 @@ impl BatchIndexAndErrorMessage {
             };
         }
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -489,7 +598,28 @@ impl LeaderIdAndEpoch {
         Ok(())
     }
 
+    /// Decode one `LeaderIdAndEpoch`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `LeaderIdAndEpoch` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `LeaderIdAndEpoch` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         if version >= 10 {
             this.leader_id = wire::get_i32(buf)?;
@@ -498,7 +628,7 @@ impl LeaderIdAndEpoch {
             this.leader_epoch = wire::get_i32(buf)?;
         }
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -560,7 +690,28 @@ impl NodeEndpoint {
         Ok(())
     }
 
+    /// Decode one `NodeEndpoint`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `NodeEndpoint` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `NodeEndpoint` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         if version >= 10 {
             this.node_id = wire::get_i32(buf)?;
@@ -583,7 +734,7 @@ impl NodeEndpoint {
             };
         }
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }

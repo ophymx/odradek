@@ -16,6 +16,7 @@
 
 use bytes::{Buf, BufMut};
 
+use crate::budget::{Budget, Limits};
 #[allow(unused_imports)]
 use crate::error::{DecodeError, EncodeError};
 use crate::wire::{self, RawTaggedField};
@@ -159,7 +160,28 @@ impl ApiVersionsResponse {
         Ok(())
     }
 
+    /// Decode one `ApiVersionsResponse`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `ApiVersionsResponse` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `ApiVersionsResponse` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         this.error_code = wire::get_i16(buf)?;
         this.api_keys = {
@@ -173,7 +195,10 @@ impl ApiVersionsResponse {
                 Some(n) => {
                     let mut items = Vec::new();
                     for _ in 0..n {
-                        items.push(ApiVersion::decode(buf, version)?);
+                        let mark = buf.remaining();
+                        let item = ApiVersion::decode_with_budget(buf, version, budget)?;
+                        budget.progress(mark, buf.remaining())?;
+                        budget.push(&mut items, item)?;
                     }
                     items
                 }
@@ -183,7 +208,7 @@ impl ApiVersionsResponse {
             this.throttle_time_ms = wire::get_i32(buf)?;
         }
         if is_flexible(version) {
-            for raw in wire::get_tagged_fields(buf)? {
+            for raw in wire::get_tagged_fields_with_budget(buf, budget)? {
                 if raw.tag == 0 && (version >= 3) {
                     let mut tag_data = raw.data;
                     let buf = &mut tag_data;
@@ -198,7 +223,12 @@ impl ApiVersionsResponse {
                             Some(n) => {
                                 let mut items = Vec::new();
                                 for _ in 0..n {
-                                    items.push(SupportedFeatureKey::decode(buf, version)?);
+                                    let mark = buf.remaining();
+                                    let item = SupportedFeatureKey::decode_with_budget(
+                                        buf, version, budget,
+                                    )?;
+                                    budget.progress(mark, buf.remaining())?;
+                                    budget.push(&mut items, item)?;
                                 }
                                 items
                             }
@@ -232,7 +262,12 @@ impl ApiVersionsResponse {
                             Some(n) => {
                                 let mut items = Vec::new();
                                 for _ in 0..n {
-                                    items.push(FinalizedFeatureKey::decode(buf, version)?);
+                                    let mark = buf.remaining();
+                                    let item = FinalizedFeatureKey::decode_with_budget(
+                                        buf, version, budget,
+                                    )?;
+                                    budget.progress(mark, buf.remaining())?;
+                                    budget.push(&mut items, item)?;
                                 }
                                 items
                             }
@@ -253,7 +288,7 @@ impl ApiVersionsResponse {
                         ));
                     }
                 } else {
-                    this.unknown_tagged_fields.push(raw);
+                    budget.push(&mut this.unknown_tagged_fields, raw)?;
                 }
             }
         }
@@ -271,6 +306,13 @@ impl crate::Message for ApiVersionsResponse {
     }
     fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
         ApiVersionsResponse::decode(buf, version)
+    }
+    fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        ApiVersionsResponse::decode_with_limits(buf, version, limits)
     }
 }
 
@@ -310,13 +352,34 @@ impl ApiVersion {
         Ok(())
     }
 
+    /// Decode one `ApiVersion`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `ApiVersion` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `ApiVersion` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         this.api_key = wire::get_i16(buf)?;
         this.min_version = wire::get_i16(buf)?;
         this.max_version = wire::get_i16(buf)?;
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -368,7 +431,28 @@ impl SupportedFeatureKey {
         Ok(())
     }
 
+    /// Decode one `SupportedFeatureKey`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `SupportedFeatureKey` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `SupportedFeatureKey` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         if version >= 3 {
             this.name = if is_flexible(version) {
@@ -384,7 +468,7 @@ impl SupportedFeatureKey {
             this.max_version = wire::get_i16(buf)?;
         }
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
@@ -436,7 +520,28 @@ impl FinalizedFeatureKey {
         Ok(())
     }
 
+    /// Decode one `FinalizedFeatureKey`, bounding allocation by the default
+    /// [`Limits`] derived from `buf`'s remaining length.
     pub fn decode(buf: &mut impl Buf, version: i16) -> Result<Self, DecodeError> {
+        Self::decode_with_limits(buf, version, Limits::default())
+    }
+
+    /// Decode one `FinalizedFeatureKey` under `limits`.
+    pub fn decode_with_limits(
+        buf: &mut impl Buf,
+        version: i16,
+        limits: Limits,
+    ) -> Result<Self, DecodeError> {
+        let mut budget = limits.budget(buf.remaining());
+        Self::decode_with_budget(buf, version, &mut budget)
+    }
+
+    /// Decode one `FinalizedFeatureKey` against an existing `budget`.
+    pub fn decode_with_budget(
+        buf: &mut impl Buf,
+        version: i16,
+        budget: &mut Budget,
+    ) -> Result<Self, DecodeError> {
         let mut this = Self::default();
         if version >= 3 {
             this.name = if is_flexible(version) {
@@ -452,7 +557,7 @@ impl FinalizedFeatureKey {
             this.min_version_level = wire::get_i16(buf)?;
         }
         if is_flexible(version) {
-            this.unknown_tagged_fields = wire::get_tagged_fields(buf)?;
+            this.unknown_tagged_fields = wire::get_tagged_fields_with_budget(buf, budget)?;
         }
         Ok(this)
     }
