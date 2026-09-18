@@ -19,7 +19,7 @@ pbkdf2 = { workspace = true }
 sha2 = { workspace = true }
 stringprep = { workspace = true }
 subtle = { workspace = true }
-zeroize = { workspace = true }
+zeroize = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 base64 = { workspace = true }

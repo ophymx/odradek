@@ -39,7 +39,7 @@ use hmac::digest::core_api::BlockSizeUser;
 use hmac::{Mac, SimpleHmac};
 use sha2::{Digest, Sha256, Sha512};
 use subtle::ConstantTimeEq;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::prep::saslprep;
 use crate::{Limits, SaslError, b64, mechanism::Mechanism};
@@ -83,16 +83,21 @@ pub(crate) fn attr(message: &str, key: char) -> Option<&str> {
     })
 }
 
-/// The key material both roles derive from a password, and the pieces
-/// each keeps.
+/// The key material both roles derive from a password.
 ///
-/// `salted_password` is zeroized on drop; it is the value from which
-/// every other key here descends.
-pub struct Keys {
-    pub(crate) client_key: [u8; 64],
-    pub(crate) stored_key: [u8; 64],
-    pub(crate) server_key: [u8; 64],
-    pub(crate) len: usize,
+/// Zeroized on drop, all of it. The salted password these descend from
+/// is already wiped, but `client_key` is password-equivalent for
+/// authentication — anyone holding it can compute a proof for any
+/// challenge — and `server_key` can forge the signature that
+/// authenticates the server. A client keeps these for the length of an
+/// exchange, which is long enough to be worth not leaving behind.
+#[derive(Zeroize, ZeroizeOnDrop)]
+struct Keys {
+    client_key: [u8; 64],
+    stored_key: [u8; 64],
+    server_key: [u8; 64],
+    #[zeroize(skip)]
+    len: usize,
 }
 
 impl Keys {
@@ -119,7 +124,7 @@ impl Keys {
 
     /// `v=` — proof that the holder of this key material signed the
     /// exchange.
-    pub(crate) fn server_signature<D>(&self, auth_message: &str) -> String
+    fn server_signature<D>(&self, auth_message: &str) -> String
     where
         D: Digest + BlockSizeUser + FixedOutputReset + Clone + Sync,
     {
@@ -128,7 +133,7 @@ impl Keys {
     }
 
     /// `p=` — proof that the holder of this key material is the client.
-    pub(crate) fn client_proof<D>(&self, auth_message: &str) -> String
+    fn client_proof<D>(&self, auth_message: &str) -> String
     where
         D: Digest + BlockSizeUser + FixedOutputReset + Clone + Sync,
     {
@@ -241,11 +246,14 @@ impl ScramClient {
         })
     }
 
-    /// Override the generated nonce. Tests only: a fixed client nonce
-    /// is what makes the RFC's worked example reproducible, and is a
-    /// replay vulnerability anywhere else.
+    /// Replace the generated nonce with a fixed one. **Tests only.**
+    ///
+    /// A fixed nonce is what makes the RFC's worked example
+    /// reproducible and is a replay vulnerability anywhere else, so the
+    /// name is deliberately one nobody types by accident and nobody
+    /// reads past in review.
     #[doc(hidden)]
-    pub fn with_nonce(mut self, nonce: &str) -> ScramClient {
+    pub fn with_fixed_nonce_for_tests(mut self, nonce: &str) -> ScramClient {
         self.nonce = nonce.to_owned();
         self
     }
@@ -341,6 +349,9 @@ pub struct ScramServer {
 struct ServerPending {
     client_first_bare: String,
     server_first: String,
+    /// The GS2 header this exchange actually began with, base64'd the
+    /// way `c=` will carry it back.
+    expected_binding: String,
 }
 
 impl ScramServer {
@@ -365,21 +376,30 @@ impl ScramServer {
         })
     }
 
-    /// Override the generated nonce. Tests only — a predictable server
-    /// nonce lets a recorded exchange be replayed at a client, which is
-    /// the one attack the client's own nonce cannot detect.
+    /// Replace the generated nonce with a fixed one. **Tests only.**
+    ///
+    /// A predictable *server* nonce lets a recorded exchange be replayed
+    /// at a client, which is the one attack the client's own nonce
+    /// cannot detect. Named to be unmissable for that reason.
     #[doc(hidden)]
-    pub fn with_nonce(mut self, nonce: &str) -> ScramServer {
+    pub fn with_fixed_nonce_for_tests(mut self, nonce: &str) -> ScramServer {
         self.nonce = nonce.to_owned();
         self
     }
 
     /// `server-first`, from the client's first message.
     pub fn server_first(&mut self, client_first: &str) -> Result<String, SaslError> {
-        let bare = client_first
-            .splitn(3, ',')
-            .nth(2)
+        // The GS2 header is everything before the third field, and it
+        // has to come back inside `c=`. RFC 5802 §5.1: the server
+        // compares them, and that comparison is what catches an
+        // attacker rewriting the header in flight — the proof cannot,
+        // because both sides compute it from the client's own `c=`.
+        let (header, bare) = client_first
+            .match_indices(',')
+            .nth(1)
+            .map(|(i, _)| client_first.split_at(i + 1))
             .ok_or(SaslError::Malformed("gs2 header"))?;
+        let expected_binding = b64::encode(header.as_bytes());
         let client_nonce = attr(bare, 'r').ok_or(SaslError::Malformed("nonce"))?;
         let user = attr(bare, 'n')
             .ok_or(SaslError::Malformed("username"))?
@@ -400,6 +420,7 @@ impl ScramServer {
         self.pending = Some(ServerPending {
             client_first_bare: bare.to_owned(),
             server_first: server_first.clone(),
+            expected_binding,
         });
         Ok(server_first)
     }
@@ -407,6 +428,12 @@ impl ScramServer {
     /// Verify `client-final` and produce `server-final`.
     pub fn server_final(&mut self, client_final: &str) -> Result<String, SaslError> {
         let pending = self.pending.as_ref().ok_or(SaslError::OutOfSequence)?;
+        let binding = attr(client_final, 'c').ok_or(SaslError::Malformed("channel binding"))?;
+        if binding != pending.expected_binding {
+            // The client is reporting a different GS2 header than the
+            // one that arrived, so something rewrote it on the way.
+            return Err(SaslError::ChannelBindingMismatch);
+        }
         let proof = attr(client_final, 'p').ok_or(SaslError::Malformed("proof"))?;
         let without_proof = client_final
             .rsplit_once(",p=")

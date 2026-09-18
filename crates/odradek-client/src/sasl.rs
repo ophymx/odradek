@@ -137,33 +137,13 @@ impl std::fmt::Debug for SaslConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Mechanism {
-    Plain,
-    ScramSha256,
-    ScramSha512,
-}
-
-impl Mechanism {
-    fn name(self) -> &'static str {
-        match self {
-            Mechanism::Plain => "PLAIN",
-            Mechanism::ScramSha256 => "SCRAM-SHA-256",
-            Mechanism::ScramSha512 => "SCRAM-SHA-512",
-        }
-    }
-
-    /// True when the mechanism puts the password itself on the wire, so
-    /// the transport has to be encrypted for it to be safe at all.
-    fn sends_password(self) -> bool {
-        match self {
-            Mechanism::Plain => true,
-            // SCRAM sends a proof, never the password.
-            Mechanism::ScramSha256 | Mechanism::ScramSha512 => false,
-        }
-    }
-}
+/// The SASL mechanisms this client speaks.
+///
+/// Re-exported from [`odradek_sasl`] rather than redefined: the
+/// mechanism a caller names and the mechanism the exchange is driven by
+/// have to be the same value, and two enums that must agree are two
+/// enums that will eventually disagree.
+pub use odradek_sasl::Mechanism;
 
 /// Authenticate `conn` with `config.sasl`; must run before any
 /// non-handshake request. A config with no credentials is a no-op.
@@ -239,6 +219,13 @@ pub async fn authenticate(
             )
             .await
         }
+        // A mechanism odradek-sasl has grown and this client has not
+        // wired up yet. Refusing is the only safe answer: the
+        // alternative is a connection that looks authenticated because
+        // nothing was attempted.
+        other => Err(ClientError::Sasl(format!(
+            "this client cannot speak {other} yet"
+        ))),
     }
 }
 
@@ -291,7 +278,7 @@ async fn scram(
     conn: &Connection,
     ranges: &ApiVersionRanges,
     sasl: &SaslConfig,
-    mechanism: odradek_sasl::Mechanism,
+    mechanism: Mechanism,
     limits: odradek_sasl::Limits,
 ) -> Result<(), ClientError> {
     let mut client =

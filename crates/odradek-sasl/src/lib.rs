@@ -157,6 +157,9 @@ pub enum SaslError {
     ServerSignatureMismatch,
     /// The client's proof does not verify.
     BadClientProof,
+    /// The channel-binding field does not match the GS2 header the
+    /// exchange began with: something rewrote it in flight.
+    ChannelBindingMismatch,
     /// The server named an account it does not have.
     UnknownUser,
     /// The server answered with an `e=` error.
@@ -195,6 +198,10 @@ impl std::fmt::Display for SaslError {
                 "server signature mismatch: it does not know this password"
             ),
             SaslError::BadClientProof => write!(f, "client proof does not verify"),
+            SaslError::ChannelBindingMismatch => write!(
+                f,
+                "channel-binding field does not match the header this exchange began with"
+            ),
             SaslError::UnknownUser => write!(f, "no such user"),
             SaslError::ServerRejected(e) => write!(f, "server rejected the exchange: {e}"),
             SaslError::NotScram => write!(f, "not a SCRAM mechanism"),

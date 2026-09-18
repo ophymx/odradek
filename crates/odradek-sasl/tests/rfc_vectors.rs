@@ -32,7 +32,7 @@ fn salt() -> Vec<u8> {
 fn rfc_client() -> ScramClient {
     ScramClient::new(Mechanism::ScramSha256, USER, PASSWORD, Limits::default())
         .expect("rfc credentials are preparable")
-        .with_nonce(CLIENT_NONCE)
+        .with_fixed_nonce_for_tests(CLIENT_NONCE)
 }
 
 fn rfc_server() -> ScramServer {
@@ -45,7 +45,7 @@ fn rfc_server() -> ScramServer {
         Limits::default(),
     )
     .expect("rfc credentials are preparable")
-    .with_nonce(SERVER_NONCE)
+    .with_fixed_nonce_for_tests(SERVER_NONCE)
 }
 
 /// Every message this client produces matches the RFC byte for byte —
@@ -254,4 +254,129 @@ fn plain_verifies_only_the_right_credentials() {
     let mut impersonating = b"admin".to_vec();
     impersonating.extend_from_slice(b"\0admin\0hunter2");
     assert!(!verify_plain_token(&impersonating, "admin", "hunter2").unwrap());
+}
+
+/// A username containing the escape sequences themselves round-trips.
+///
+/// The decode order is load-bearing and silently wrong the other way:
+/// `a=2Cb` encodes to `a=3D2Cb`, and unescaping `=3D` first would turn
+/// that into `a=2Cb` and then into `a,b` — a different account. Doing
+/// `=2C` first leaves the `=3D` intact until its turn.
+#[test]
+fn usernames_containing_escapes_round_trip() {
+    for user in ["a=2Cb", "a,b", "a=b", "=3D", "plain"] {
+        let mut client =
+            ScramClient::new(Mechanism::ScramSha256, user, "pw", Limits::default()).unwrap();
+        let mut server = ScramServer::new(
+            Mechanism::ScramSha256,
+            user,
+            "pw",
+            b"salt".to_vec(),
+            4096,
+            Limits::default(),
+        )
+        .unwrap();
+        let challenge = server
+            .server_first(&client.client_first())
+            .unwrap_or_else(|e| panic!("{user:?} should be recognized: {e}"));
+        let final_message = client.client_final(&challenge).unwrap();
+        server
+            .server_final(&final_message)
+            .unwrap_or_else(|e| panic!("{user:?} should authenticate: {e}"));
+    }
+}
+
+/// An account this server does not have is refused, and the refusal
+/// does not depend on how the name was escaped.
+#[test]
+fn a_different_username_is_refused() {
+    let mut client =
+        ScramClient::new(Mechanism::ScramSha256, "a,b", "pw", Limits::default()).unwrap();
+    let mut server = ScramServer::new(
+        Mechanism::ScramSha256,
+        "a=b",
+        "pw",
+        b"salt".to_vec(),
+        4096,
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        server.server_first(&client.client_first()),
+        Err(SaslError::UnknownUser)
+    );
+}
+
+/// The GS2 header the exchange began with has to be the one reported
+/// back in `c=`. The proof cannot catch a header rewritten in flight,
+/// because both sides compute it from the client's own `c=` value.
+#[test]
+fn a_rewritten_gs2_header_is_caught() {
+    let mut client =
+        ScramClient::new(Mechanism::ScramSha256, "u", "pw", Limits::default()).unwrap();
+    let mut server = ScramServer::new(
+        Mechanism::ScramSha256,
+        "u",
+        "pw",
+        b"salt".to_vec(),
+        4096,
+        Limits::default(),
+    )
+    .unwrap();
+    let challenge = server.server_first(&client.client_first()).unwrap();
+    let final_message = client.client_final(&challenge).unwrap();
+
+    // "eSws" is base64 of "y,," — a client claiming it offered channel
+    // binding, on an exchange that began with "n,,".
+    let tampered = final_message.replace("c=biws", "c=eSws");
+    assert_eq!(
+        server.server_final(&tampered),
+        Err(SaslError::ChannelBindingMismatch)
+    );
+}
+
+/// Malformed input is an error, never a panic. A SASL message is the
+/// first thing an unauthenticated peer gets to send.
+#[test]
+fn hostile_messages_do_not_panic() {
+    let junk = [
+        "",
+        ",",
+        ",,",
+        "=",
+        "r=",
+        "n,,",
+        "n,,n=,r=",
+        "r=x,s=!!!,i=4096",
+        "r=x,s=c2FsdA==,i=abc",
+        "r=x,s=c2FsdA==,i=99999999999999999999",
+        "p=",
+        "c=,p=",
+        "v=",
+        "e=oops",
+        "\u{0}\u{0}\u{0}",
+        "n,,n=u,r=\u{1F600}",
+    ];
+    for message in junk {
+        let mut client =
+            ScramClient::new(Mechanism::ScramSha256, "u", "pw", Limits::default()).unwrap();
+        let _ = client.client_first();
+        let _ = client.client_final(message);
+        let _ = client.verify_server_final(message);
+
+        let mut server = ScramServer::new(
+            Mechanism::ScramSha256,
+            "u",
+            "pw",
+            b"salt".to_vec(),
+            4096,
+            Limits::default(),
+        )
+        .unwrap();
+        let _ = server.server_first(message);
+        let _ = server.server_final(message);
+
+        let _ = odradek_sasl::verify_plain_token(message.as_bytes(), "u", "pw");
+        let _ = odradek_sasl::saslprep(message);
+    }
 }
