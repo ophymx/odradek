@@ -42,8 +42,21 @@ let mut producer = Producer::new(cluster.clone());
 let consumer = Consumer::new(cluster);   // shares the producer's pool
 ```
 
-See [`examples/`](examples/) for produce/consume, consumer groups, and
-TLS/SASL smoke tests against a real broker.
+Group membership and reading are separate halves: `GroupMember` (or
+`ConsumerGroupMember`, for KIP-848) decides *which* partitions are
+yours, and `Consumer` reads one. The loop between them is yours to
+write, because a poll loop encodes application decisions — when to
+commit, what a failed record does, whether a rebalance discards
+in-flight work — that a library would have to guess at. It is about
+forty lines, and
+[`examples/group_consume.rs`](examples/group_consume.rs) is those
+forty lines, assembled and running against a real broker:
+join, resume from the group's committed offsets, read, commit,
+rebalance. [`examples/group848_consume.rs`](examples/group848_consume.rs)
+is the same loop on the newer protocol, with a header on what changes.
+
+See [`examples/`](examples/) for those, plus produce/consume,
+group-membership mechanics on their own, and TLS/SASL smoke tests.
 
 ## Security defaults
 

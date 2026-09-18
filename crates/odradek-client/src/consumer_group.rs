@@ -185,6 +185,35 @@ impl ConsumerGroupMember {
         self.heartbeat_once_with_retries().await
     }
 
+    /// The group this member belongs to.
+    pub fn group_id(&self) -> &str {
+        &self.group_id
+    }
+
+    /// The offset last committed for `topic[partition]` under this
+    /// member's group, or `None` when nothing was ever committed.
+    ///
+    /// Reading committed offsets is unchanged by KIP-848 — the same
+    /// OffsetFetch, the same answer — but a member that can commit and
+    /// cannot read back is an awkward half of an API, and resuming a
+    /// partition is the first thing a consumer does with it.
+    pub async fn committed_offset(
+        &self,
+        topic: &str,
+        partition: i32,
+    ) -> Result<Option<i64>, ClientError> {
+        let (max_attempts, backoff) = (self.config.max_attempts, self.config.retry_backoff);
+        retry_loop(&mut &*self, max_attempts, backoff, |this| {
+            Box::pin(async move {
+                let result =
+                    crate::offsets::committed_once(&this.cluster, &this.group_id, topic, partition)
+                        .await;
+                or_forget_coordinator(&this.cluster, &this.group_id, result)
+            })
+        })
+        .await
+    }
+
     /// Commit `offset` for `topic[partition]` under this group,
     /// fenced by the current member epoch: a stale member's commit
     /// fails with `STALE_MEMBER_EPOCH` instead of clobbering.

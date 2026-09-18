@@ -125,6 +125,11 @@ impl GroupMember {
         &self.assignment
     }
 
+    /// The group this member belongs to.
+    pub fn group_id(&self) -> &str {
+        &self.group_id
+    }
+
     pub fn member_id(&self) -> &str {
         &self.member_id
     }
