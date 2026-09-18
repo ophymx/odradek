@@ -8,11 +8,29 @@
 //! this layer owns is delivery: version selection per broker, leader
 //! routing via the [`Cluster`] cache, and retries that invalidate stale
 //! leadership rather than hammering the same broker.
+//!
+//! # Throughput comes from flushing, not from enqueueing
+//!
+//! [`Producer::flush`] delivers every buffered partition *at once*:
+//! brokers match responses to requests by correlation id, so N
+//! partitions cost one round trip's latency, not N. With `acks = -1` —
+//! where a round trip is a full ISR commit, easily milliseconds — that
+//! is the difference between a per-partition ceiling and a per-flush
+//! one, and it is why adding partitions speeds this producer up rather
+//! than slowing it down.
+//!
+//! [`Producer::enqueue`]'s size trigger, by contrast, delivers inline:
+//! it hands back the [`Delivery`] on the same `.await` the caller made,
+//! which means one round trip in the caller's path. That is the price
+//! of a caller-driven producer with no background task, and it is a
+//! deliberate trade. A throughput-shaped caller buffers with a
+//! `batch_max_bytes` large enough that the trigger rarely fires and
+//! drives the wire from [`Producer::flush`].
 
 use std::collections::HashMap;
 use std::time::Duration;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use odradek_protocol::ErrorCode;
 use odradek_protocol::messages::produce_request::{
     PartitionProduceData, ProduceRequest, TopicProduceData,
@@ -23,6 +41,7 @@ use odradek_protocol::records::{Compression, Record, RecordBatch, Records};
 use crate::cluster::Cluster;
 use crate::compression::compress;
 use crate::error::ClientError;
+use crate::join::join_all;
 use crate::retry::{or_mark_stale, retry_loop};
 
 /// Produce versions this producer speaks: name-addressed (v13+ switches
@@ -141,18 +160,19 @@ impl Producer {
         topic: &str,
         record: Record,
     ) -> Result<Option<Delivery>, ClientError> {
-        if self.cluster.partitions(topic).is_none() {
+        // Per record, so it must stay cheap: a count, not a copy of the
+        // topic's whole partition vector.
+        let mut count = self.cluster.partition_count(topic);
+        if count.is_none() {
             self.cluster.refresh_metadata(&[topic]).await?;
+            count = self.cluster.partition_count(topic);
         }
-        let count = self
-            .cluster
-            .partitions(topic)
-            .filter(|p| !p.is_empty())
+        let count = count
+            .filter(|count| *count > 0)
             .ok_or_else(|| ClientError::UnknownLeader {
                 topic: topic.to_owned(),
                 partition: -1,
-            })?
-            .len();
+            })?;
         let count = i32::try_from(count).unwrap_or(i32::MAX);
         let partition = match &record.key {
             Some(key) => partition_for_key(key, count),
@@ -171,15 +191,60 @@ impl Producer {
         self.pending.values().map(|p| p.records.len()).sum()
     }
 
-    /// Deliver every buffered partition, one batch each. On error,
-    /// undelivered partitions keep their buffers.
+    /// Deliver every buffered partition, one batch each, **all at
+    /// once**: every partition's request goes on the wire before any
+    /// response comes back, so a flush costs one round trip rather than
+    /// one per partition.
+    ///
+    /// Returns the deliveries sorted by `(topic, partition)`, whatever
+    /// order the brokers answered in. On error the partitions that
+    /// failed keep their buffers, so a later flush or a caller-level
+    /// retry does not lose records; partitions that succeeded are
+    /// delivered (their offsets are lost with the error, as before).
+    /// The reported error is the failing partition's lowest by
+    /// `(topic, partition)`, so a repeated failure reports repeatably.
     pub async fn flush(&mut self) -> Result<Vec<Delivery>, ClientError> {
-        let mut keys: Vec<(String, i32)> = self.pending.keys().cloned().collect();
-        keys.sort();
-        let mut deliveries = Vec::new();
-        for (topic, partition) in keys {
-            deliveries.push(self.flush_partition(&topic, partition).await?);
+        let batches: Vec<((String, i32), PendingBatch)> = self.pending.drain().collect();
+        if batches.is_empty() {
+            return Ok(Vec::new());
         }
+
+        let cluster = &self.cluster;
+        let config = &self.config;
+        let attempts: Vec<_> = batches
+            .into_iter()
+            .map(|(key, pending)| async move {
+                // The clone is what lets a failed partition keep its
+                // records: encoding consumes them.
+                let outcome =
+                    deliver(cluster, config, &key.0, key.1, pending.records.clone()).await;
+                (key, pending, outcome)
+            })
+            .collect();
+        let results = join_all(attempts).await;
+
+        let mut deliveries = Vec::with_capacity(results.len());
+        let mut failure: Option<((String, i32), ClientError)> = None;
+        for (key, pending, outcome) in results {
+            match outcome {
+                Ok(base_offset) => deliveries.push(Delivery {
+                    topic: key.0,
+                    partition: key.1,
+                    base_offset,
+                    records: pending.records.len(),
+                }),
+                Err(e) => {
+                    self.restore(key.clone(), pending);
+                    if failure.as_ref().is_none_or(|(worst, _)| key < *worst) {
+                        failure = Some((key, e));
+                    }
+                }
+            }
+        }
+        if let Some((_, e)) = failure {
+            return Err(e);
+        }
+        deliveries.sort_by(|a, b| (&a.topic, a.partition).cmp(&(&b.topic, b.partition)));
         Ok(deliveries)
     }
 
@@ -188,14 +253,17 @@ impl Producer {
         topic: &str,
         partition: i32,
     ) -> Result<Delivery, ClientError> {
-        let pending = self
-            .pending
-            .remove(&(topic.to_owned(), partition))
-            .unwrap_or_default();
+        let key = (topic.to_owned(), partition);
+        let pending = self.pending.remove(&key).unwrap_or_default();
         let count = pending.records.len();
-        match self
-            .produce(topic, partition, pending.records.clone())
-            .await
+        match deliver(
+            &self.cluster,
+            &self.config,
+            topic,
+            partition,
+            pending.records.clone(),
+        )
+        .await
         {
             Ok(base_offset) => Ok(Delivery {
                 topic: topic.to_owned(),
@@ -204,19 +272,21 @@ impl Producer {
                 records: count,
             }),
             Err(e) => {
-                // Put the batch back so a caller-level retry or later
-                // flush does not lose it.
-                let slot = self
-                    .pending
-                    .entry((topic.to_owned(), partition))
-                    .or_default();
-                slot.estimated_bytes += pending.estimated_bytes;
-                let mut records = pending.records;
-                records.append(&mut slot.records);
-                slot.records = records;
+                self.restore(key, pending);
                 Err(e)
             }
         }
+    }
+
+    /// Put an undelivered batch back in front of whatever has been
+    /// buffered for that partition since, so a caller-level retry or a
+    /// later flush does not lose it — or reorder it.
+    fn restore(&mut self, key: (String, i32), pending: PendingBatch) {
+        let slot = self.pending.entry(key).or_default();
+        slot.estimated_bytes += pending.estimated_bytes;
+        let mut records = pending.records;
+        records.append(&mut slot.records);
+        slot.records = records;
     }
 
     /// Produce `records` as one batch to `topic[partition]`, compressed
@@ -227,85 +297,105 @@ impl Producer {
         partition: i32,
         records: Vec<Record>,
     ) -> Result<i64, ClientError> {
-        // Owned per-round captures keep the attempt future free of
-        // outer borrows; the Bytes clone is a refcount bump.
-        let set = bytes::Bytes::from(encode_batch(records, self.config.compression)?);
-        let (max_attempts, backoff) = (self.config.max_attempts, self.config.retry_backoff);
-        // A retriable failure means leadership (or the broker itself)
-        // may have moved on; refetch rather than resend into the wall.
-        retry_loop(&mut *self, max_attempts, backoff, |this| {
-            let set = set.clone();
-            let topic = topic.to_owned();
-            Box::pin(async move {
-                let result = this.try_once(&topic, partition, &set).await;
-                or_mark_stale(&this.cluster, &topic, result)
-            })
-        })
-        .await
+        deliver(&self.cluster, &self.config, topic, partition, records).await
     }
+}
 
-    async fn try_once(
-        &mut self,
-        topic: &str,
-        partition: i32,
-        set: &[u8],
-    ) -> Result<i64, ClientError> {
-        let broker = self.cluster.partition_leader(topic, partition).await?;
-        let leader = self.cluster.leader_id(topic, partition);
-        let version = broker
-            .ranges
-            .pick(ProduceRequest::API_KEY, PRODUCE_SUPPORTED)?;
+/// Deliver one batch to one partition, retrying through leadership
+/// changes.
+///
+/// Free of `&mut Producer` on purpose: what a delivery needs is the
+/// cluster and the config, nothing from the producer's buffers. That is
+/// what lets [`Producer::flush`] have a delivery per partition in
+/// flight at the same time.
+async fn deliver(
+    cluster: &Cluster,
+    config: &ProducerConfig,
+    topic: &str,
+    partition: i32,
+    records: Vec<Record>,
+) -> Result<i64, ClientError> {
+    // Owned per-round captures keep the attempt future free of
+    // outer borrows; the Bytes clone is a refcount bump.
+    let set = encode_batch(records, config.compression)?;
+    // A retriable failure means leadership (or the broker itself)
+    // may have moved on; refetch rather than resend into the wall.
+    retry_loop(
+        &mut &*cluster,
+        config.max_attempts,
+        config.retry_backoff,
+        |cluster| {
+            let cluster: &Cluster = cluster;
+            let set = set.clone();
+            Box::pin(async move {
+                let result = try_once(cluster, config, topic, partition, set).await;
+                or_mark_stale(cluster, topic, partition, result)
+            })
+        },
+    )
+    .await
+}
 
-        let mut partition_data = PartitionProduceData::default();
-        partition_data.index = partition;
-        partition_data.records = Some(bytes::Bytes::copy_from_slice(set));
-        let mut topic_data = TopicProduceData::default();
-        topic_data.name = topic.to_owned();
-        topic_data.partition_data = vec![partition_data];
-        let mut request = ProduceRequest::default();
-        request.transactional_id = None;
-        request.acks = self.config.acks;
-        request.timeout_ms = self.config.request_timeout_ms;
-        request.topic_data = vec![topic_data];
-        let mut body = BytesMut::new();
-        request.encode(&mut body, version)?;
+async fn try_once(
+    cluster: &Cluster,
+    config: &ProducerConfig,
+    topic: &str,
+    partition: i32,
+    set: Bytes,
+) -> Result<i64, ClientError> {
+    let broker = cluster.partition_leader(topic, partition).await?;
+    let leader = cluster.leader_id(topic, partition);
+    let version = broker
+        .ranges
+        .pick(ProduceRequest::API_KEY, PRODUCE_SUPPORTED)?;
 
-        let mut resp = match broker
-            .conn
-            .request(ProduceRequest::API_KEY, version, &body)
-            .await
-        {
-            Ok(resp) => resp,
-            Err(e) => {
-                // A dead pooled connection must not poison later retries.
-                if matches!(
-                    e,
-                    ClientError::ConnectionClosed | ClientError::Io(_) | ClientError::Timeout(_)
-                ) {
-                    if let Some(id) = leader {
-                        self.cluster.forget_broker(id);
-                    }
+    let mut partition_data = PartitionProduceData::default();
+    partition_data.index = partition;
+    partition_data.records = Some(set);
+    let mut topic_data = TopicProduceData::default();
+    topic_data.name = topic.to_owned();
+    topic_data.partition_data = vec![partition_data];
+    let mut request = ProduceRequest::default();
+    request.transactional_id = None;
+    request.acks = config.acks;
+    request.timeout_ms = config.request_timeout_ms;
+    request.topic_data = vec![topic_data];
+    let mut body = BytesMut::new();
+    request.encode(&mut body, version)?;
+
+    let mut resp = match broker
+        .conn
+        .request(ProduceRequest::API_KEY, version, &body)
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            // A dead pooled connection must not poison later retries.
+            if matches!(
+                e,
+                ClientError::ConnectionClosed | ClientError::Io(_) | ClientError::Timeout(_)
+            ) {
+                if let Some(id) = leader {
+                    cluster.forget_broker(id);
                 }
-                return Err(e);
             }
-        };
-        let resp = ProduceResponse::decode(&mut resp, version)?;
-        let entry = resp
-            .responses
-            .iter()
-            .find(|t| t.name == topic)
-            .and_then(|t| t.partition_responses.iter().find(|p| p.index == partition))
-            .ok_or_else(|| {
-                ClientError::ProtocolViolation(format!(
-                    "produce response omits {topic}[{partition}]"
-                ))
-            })?;
-        let code = ErrorCode(entry.error_code);
-        if code.is_ok() {
-            Ok(entry.base_offset)
-        } else {
-            Err(ClientError::Broker(code))
+            return Err(e);
         }
+    };
+    let resp = ProduceResponse::decode(&mut resp, version)?;
+    let entry = resp
+        .responses
+        .iter()
+        .find(|t| t.name == topic)
+        .and_then(|t| t.partition_responses.iter().find(|p| p.index == partition))
+        .ok_or_else(|| {
+            ClientError::ProtocolViolation(format!("produce response omits {topic}[{partition}]"))
+        })?;
+    let code = ErrorCode(entry.error_code);
+    if code.is_ok() {
+        Ok(entry.base_offset)
+    } else {
+        Err(ClientError::Broker(code))
     }
 }
 
@@ -369,7 +459,7 @@ fn estimate_record_size(record: &Record) -> usize {
 /// Assemble one record batch: offset deltas by position, timestamps
 /// anchored at now, producer id -1 (not idempotent), records compressed
 /// with `codec`.
-fn encode_batch(mut records: Vec<Record>, codec: Compression) -> Result<Vec<u8>, ClientError> {
+fn encode_batch(mut records: Vec<Record>, codec: Compression) -> Result<Bytes, ClientError> {
     if records.is_empty() {
         return Err(ClientError::ProtocolViolation(
             "cannot produce an empty record set".into(),
@@ -414,7 +504,8 @@ fn encode_batch(mut records: Vec<Record>, codec: Compression) -> Result<Vec<u8>,
     };
     let mut out = BytesMut::new();
     batch.encode(&mut out)?;
-    Ok(out.to_vec())
+    // freeze() hands the buffer over; to_vec() would copy it.
+    Ok(out.freeze())
 }
 
 #[cfg(test)]

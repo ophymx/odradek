@@ -38,6 +38,7 @@ pub mod consumer;
 pub mod consumer_group;
 pub mod error;
 pub mod group;
+mod join;
 pub mod negotiate;
 mod offsets;
 pub mod producer;
@@ -83,6 +84,20 @@ pub struct ClientConfig {
     /// Long-polling requests must fit under it; see
     /// [`ConsumerConfig::max_wait_ms`].
     pub request_timeout: std::time::Duration,
+    /// Ceiling on idle *blocking* connections kept per broker
+    /// (default: 256).
+    ///
+    /// Blocking requests — long-poll fetches, parked group joins — run
+    /// on leased connections out of a per-broker pool (see [`cluster`]).
+    /// The pool sizes itself to the peak number of leases a broker has
+    /// had out at once, so a workload with 200 concurrent long polls
+    /// against one broker keeps 200 connections warm rather than
+    /// redialing TCP+TLS+ApiVersions+SASL for each one. This is the
+    /// backstop on that: a workload that spikes once will not pin more
+    /// than this many idle sockets per broker afterwards. Lower it for
+    /// fd-tight environments; raise it past your peak fan-out if you
+    /// run more concurrent long polls than this per broker.
+    pub blocking_idle_max: usize,
     /// TLS for every broker connection (default: plaintext).
     #[cfg(feature = "tls")]
     pub tls: Tls,
@@ -99,6 +114,7 @@ impl Default for ClientConfig {
             client_id: "odradek".to_owned(),
             connect_timeout: std::time::Duration::from_secs(10),
             request_timeout: std::time::Duration::from_secs(30),
+            blocking_idle_max: 256,
             #[cfg(feature = "tls")]
             tls: Tls::None,
             #[cfg(feature = "sasl")]

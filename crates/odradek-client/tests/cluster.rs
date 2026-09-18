@@ -42,6 +42,16 @@ const COORDINATOR: i32 = 1;
 /// like a long-poll waiting out max_wait_ms.
 const SLOW_FETCH_OFFSET: i64 = 777_777;
 
+/// Like [`SLOW_FETCH_OFFSET`] but a short park — long enough for many
+/// fetches to overlap, short enough not to drag the suite out.
+const BRIEF_PARK_OFFSET: i64 = 555_555;
+const BRIEF_PARK: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How long the fake sits on each Produce before answering, so a test
+/// can tell a pipelined flush from a serial one. Shared across brokers;
+/// zero (the default) answers immediately.
+type ProduceDelayMs = Arc<std::sync::atomic::AtomicU64>;
+
 /// Stored record sets per (topic, partition), verbatim as produced.
 type Logs = Arc<Mutex<std::collections::HashMap<(String, i32), BytesMut>>>;
 
@@ -98,6 +108,7 @@ struct FakeCluster {
     group: Group,
     group848: Group848,
     accepts: Accepts,
+    produce_delay_ms: ProduceDelayMs,
 }
 
 /// Spawn `n` fake brokers. Every broker answers ApiVersions and full
@@ -119,6 +130,7 @@ async fn spawn_fake_cluster(n: i32, no_leader: &'static [i32]) -> FakeCluster {
     let group848: Group848 = Arc::new(Mutex::new(Group848State::default()));
     let created: Created = Arc::new(Mutex::new(std::collections::HashSet::new()));
     let accepts: Accepts = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let produce_delay_ms: ProduceDelayMs = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let mut brokers = Vec::new();
     for (node_id, listener) in listeners {
@@ -130,6 +142,7 @@ async fn spawn_fake_cluster(n: i32, no_leader: &'static [i32]) -> FakeCluster {
         let group848 = Arc::clone(&group848);
         let created = Arc::clone(&created);
         let accepts = Arc::clone(&accepts);
+        let produce_delay_ms = Arc::clone(&produce_delay_ms);
         let handle = tokio::spawn(async move {
             // The accept loop owns its connections' tasks: aborting the
             // loop drops the JoinSet, which aborts them all — the whole
@@ -150,6 +163,7 @@ async fn spawn_fake_cluster(n: i32, no_leader: &'static [i32]) -> FakeCluster {
                             Arc::clone(&group),
                             Arc::clone(&group848),
                             Arc::clone(&created),
+                            Arc::clone(&produce_delay_ms),
                             no_leader,
                         ));
                     }
@@ -169,6 +183,7 @@ async fn spawn_fake_cluster(n: i32, no_leader: &'static [i32]) -> FakeCluster {
         group,
         group848,
         accepts,
+        produce_delay_ms,
     }
 }
 
@@ -197,6 +212,7 @@ async fn serve_conn(
     group: Group,
     group848: Group848,
     created: Created,
+    produce_delay_ms: ProduceDelayMs,
     no_leader: &'static [i32],
 ) {
     loop {
@@ -337,6 +353,11 @@ async fn serve_conn(
                     PartitionProduceResponse, TopicProduceResponse,
                 };
                 let produce = ProduceRequest::decode(&mut frame, api_version).unwrap();
+                // Stand in for the wait a real acks=-1 commit imposes.
+                let delay = produce_delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+                if delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
                 let mut responses = Vec::new();
                 for topic in &produce.topic_data {
                     assert_eq!(topic.name, TOPIC);
@@ -380,6 +401,8 @@ async fn serve_conn(
                 if topic.partitions[0].fetch_offset == SLOW_FETCH_OFFSET {
                     // Model a long-poll parked on this connection.
                     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                } else if topic.partitions[0].fetch_offset == BRIEF_PARK_OFFSET {
+                    tokio::time::sleep(BRIEF_PARK).await;
                 }
                 // Serve whatever was produced; the canned log otherwise.
                 let stored = logs
@@ -1331,6 +1354,147 @@ async fn released_fetch_leases_are_reused_not_redialed() {
     assert_eq!(
         after_first, after_more,
         "sequential fetches must reuse the released lease"
+    );
+}
+
+#[tokio::test]
+async fn flush_delivers_every_partition_at_once_not_one_after_another() {
+    use odradek_client::Producer;
+    use odradek_protocol::records::Record;
+
+    // Four partitions, each led by its own broker, each answering
+    // Produce only after a delay — the acks=-1 commit wait, in
+    // miniature. Serially that is 4 x 250ms; pipelined it is one.
+    let fake = spawn_fake_cluster(4, &[]).await;
+    fake.produce_delay_ms
+        .store(250, std::sync::atomic::Ordering::SeqCst);
+    let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+    // Warm the metadata and the per-broker connections, so the timing
+    // below measures delivery rather than dialing.
+    for partition in 0..4 {
+        cluster.partition_leader(TOPIC, partition).await.unwrap();
+    }
+
+    let mut producer = Producer::new(cluster);
+    for partition in 0..4 {
+        producer
+            .enqueue(
+                TOPIC,
+                partition,
+                Record {
+                    value: Some(Bytes::from(format!("p{partition}"))),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let started = std::time::Instant::now();
+    let deliveries = producer.flush().await.unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(deliveries.len(), 4);
+    assert!(
+        elapsed < std::time::Duration::from_millis(700),
+        "a flush should cost one round trip, not four (took {elapsed:?})"
+    );
+    // Concurrency must not cost determinism: sorted by (topic, partition).
+    let order: Vec<(&str, i32)> = deliveries
+        .iter()
+        .map(|d| (d.topic.as_str(), d.partition))
+        .collect();
+    assert_eq!(
+        order,
+        vec![(TOPIC, 0), (TOPIC, 1), (TOPIC, 2), (TOPIC, 3)],
+        "deliveries stay in (topic, partition) order"
+    );
+    assert_eq!(producer.buffered(), 0);
+    let mut arrivals = fake.arrivals.lock().unwrap().clone();
+    arrivals.sort_unstable();
+    assert_eq!(arrivals, vec![(0, 0), (1, 1), (2, 2), (3, 3)]);
+}
+
+#[tokio::test]
+async fn a_failed_partition_keeps_its_buffer_while_the_rest_deliver() {
+    use odradek_client::Producer;
+    use odradek_protocol::records::Record;
+
+    // Partition 1 has no leader: its delivery fails while the other two
+    // succeed on the same flush.
+    let fake = spawn_fake_cluster(3, &[1]).await;
+    let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+    let mut producer = Producer::new(cluster);
+    for partition in 0..3 {
+        producer
+            .enqueue(
+                TOPIC,
+                partition,
+                Record {
+                    value: Some(Bytes::from(format!("p{partition}"))),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    match producer.flush().await {
+        Err(ClientError::UnknownLeader { topic, partition }) => {
+            assert_eq!(topic, TOPIC);
+            assert_eq!(partition, 1);
+        }
+        other => panic!("expected UnknownLeader for partition 1, got {other:?}"),
+    }
+
+    // The undelivered partition keeps its record; the delivered ones do
+    // not get resent.
+    assert_eq!(producer.buffered(), 1);
+    let mut arrivals = fake.arrivals.lock().unwrap().clone();
+    arrivals.sort_unstable();
+    assert_eq!(arrivals, vec![(0, 0), (2, 2)]);
+}
+
+#[tokio::test]
+async fn blocking_leases_are_reused_above_the_old_idle_cap() {
+    use odradek_client::Consumer;
+
+    // Twice the eight this pool used to hardcode: at the old cap the
+    // second round would redial every connection past the eighth.
+    const CONCURRENCY: usize = 16;
+
+    async fn parked_round(cluster: &Cluster, n: usize) {
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..n {
+            let consumer = Consumer::new(cluster.clone());
+            tasks.spawn(async move {
+                consumer.fetch(TOPIC, 0, BRIEF_PARK_OFFSET).await.unwrap();
+            });
+        }
+        while let Some(joined) = tasks.join_next().await {
+            joined.unwrap();
+        }
+    }
+
+    let fake = spawn_fake_cluster(1, &[]).await;
+    let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+
+    // Round one: sixteen fetches parked at once, so sixteen leases are
+    // outstanding together and each one has to be dialed.
+    parked_round(&cluster, CONCURRENCY).await;
+    let after_first = *fake.accepts.lock().unwrap().get(&0).unwrap();
+    assert!(
+        after_first >= u32::try_from(CONCURRENCY).unwrap(),
+        "each parked fetch needs its own connection, saw {after_first} accepts"
+    );
+
+    // Round two: the same concurrency, and not one new connection —
+    // the pool sized itself to what the workload actually does.
+    parked_round(&cluster, CONCURRENCY).await;
+    let after_second = *fake.accepts.lock().unwrap().get(&0).unwrap();
+    assert_eq!(
+        after_first, after_second,
+        "{CONCURRENCY} concurrent fetches must reuse their released leases, not redial"
     );
 }
 

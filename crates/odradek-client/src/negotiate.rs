@@ -12,6 +12,7 @@
 //! `UNSUPPORTED_VERSION` re-send at the broker's advertised maximum.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bytes::BytesMut;
 use odradek_protocol::ErrorCode;
@@ -22,19 +23,25 @@ use crate::conn::Connection;
 use crate::error::ClientError;
 
 /// The version ranges a broker advertised, one entry per api key.
+///
+/// Shared rather than copied: a [`crate::cluster::Broker`] is cloned
+/// out of the connection pool on the way to every routed request, and
+/// a per-request copy of a ~70-entry map is a cost with no payer —
+/// the ranges are fixed for the life of the connection.
 #[derive(Debug, Clone, Default)]
 pub struct ApiVersionRanges {
-    ranges: HashMap<i16, (i16, i16)>,
+    ranges: Arc<HashMap<i16, (i16, i16)>>,
 }
 
 impl ApiVersionRanges {
     fn from_response(resp: &ApiVersionsResponse) -> ApiVersionRanges {
         ApiVersionRanges {
-            ranges: resp
-                .api_keys
-                .iter()
-                .map(|v| (v.api_key, (v.min_version, v.max_version)))
-                .collect(),
+            ranges: Arc::new(
+                resp.api_keys
+                    .iter()
+                    .map(|v| (v.api_key, (v.min_version, v.max_version)))
+                    .collect(),
+            ),
         }
     }
 

@@ -129,7 +129,7 @@ impl Consumer {
             |this| {
                 Box::pin(async move {
                     let result = this.fetch_once(topic, partition, offset).await;
-                    or_mark_stale(&this.cluster, topic, result)
+                    or_mark_stale(&this.cluster, topic, partition, result)
                 })
             },
         )
@@ -145,7 +145,7 @@ impl Consumer {
             |this| {
                 Box::pin(async move {
                     let result = this.list_offset_once(topic, partition, EARLIEST).await;
-                    or_mark_stale(&this.cluster, topic, result)
+                    or_mark_stale(&this.cluster, topic, partition, result)
                 })
             },
         )
@@ -161,7 +161,7 @@ impl Consumer {
             |this| {
                 Box::pin(async move {
                     let result = this.list_offset_once(topic, partition, LATEST).await;
-                    or_mark_stale(&this.cluster, topic, result)
+                    or_mark_stale(&this.cluster, topic, partition, result)
                 })
             },
         )

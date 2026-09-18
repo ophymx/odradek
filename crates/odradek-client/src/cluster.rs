@@ -107,13 +107,56 @@ impl BrokerLease {
     }
 
     /// Return the connection to the pool for reuse.
+    ///
+    /// The connection is kept unless the idle pool already holds as
+    /// many as this broker's own peak concurrency ever needed, or as
+    /// [`ClientConfig::blocking_idle_max`] allows — whichever is
+    /// smaller. Sizing by observed concurrency is the point: it is
+    /// exactly when many requests are parked against one broker that
+    /// discarding a released connection is most expensive, since each
+    /// one then pays a full dial on its next round.
     pub fn release(self) {
+        let max = self.cluster.inner.config.blocking_idle_max;
         let mut state = self.cluster.state();
-        let idle = state.blocking.entry(self.node_id).or_default();
-        if idle.len() < BLOCKING_IDLE_CAP {
-            idle.push(self.broker.clone());
+        let pool = state.blocking.entry(self.node_id).or_default();
+        if pool.idle.len() < pool.peak.min(max) {
+            pool.idle.push(self.broker.clone());
+        }
+        // The lease's own Drop settles the outstanding count, and it
+        // takes the same lock.
+        drop(state);
+    }
+}
+
+impl Drop for BrokerLease {
+    fn drop(&mut self) {
+        let mut state = self.cluster.state();
+        if let Some(pool) = state.blocking.get_mut(&self.node_id) {
+            pool.outstanding = pool.outstanding.saturating_sub(1);
         }
     }
+}
+
+/// One broker's blocking connections: those idle, and how many the
+/// workload has ever held at once.
+///
+/// The peak is the pool's sizing signal. A hardcoded idle cap gets the
+/// common case exactly backwards: it is precisely when concurrency is
+/// *high* — 200 bridge pumps parked in long polls against one broker —
+/// that dropping a released connection is most expensive, since every
+/// one of them then pays a full TCP+TLS+ApiVersions+SASL dial on its
+/// next round. Sizing the idle pool by observed peak concurrency
+/// instead means the pool never holds more sockets than the workload
+/// has already proven it wants — a steady workload dials only while
+/// ramping up — and [`ClientConfig::blocking_idle_max`] is the backstop
+/// against a one-off spike pinning that many sockets for good.
+#[derive(Debug, Default)]
+struct BlockingPool {
+    idle: Vec<Broker>,
+    /// Leases checked out right now.
+    outstanding: usize,
+    /// The high-water mark of `outstanding`.
+    peak: usize,
 }
 
 /// The mutable half of a cluster: caches every handle shares.
@@ -129,15 +172,12 @@ struct State {
     /// carries ids; KIP-848 assignments address topics by id).
     topic_ids: HashMap<[u8; 16], String>,
     conns: HashMap<i32, Broker>,
-    /// Idle leased connections for blocking requests, per broker.
-    blocking: HashMap<i32, Vec<Broker>>,
+    /// Blocking-request connections per broker: idle ones plus the
+    /// concurrency that sizes the pool.
+    blocking: HashMap<i32, BlockingPool>,
     /// Group id → coordinator node id, as last discovered.
     coordinators: HashMap<String, i32>,
 }
-
-/// How many idle blocking connections to keep per broker; releases past
-/// this cap drop the connection instead.
-const BLOCKING_IDLE_CAP: usize = 8;
 
 #[derive(Debug)]
 struct Inner {
@@ -330,8 +370,23 @@ impl Cluster {
     }
 
     /// A topic's partitions, as of the last metadata refresh.
+    ///
+    /// Copies the whole partition vector out from under the state lock.
+    /// Callers that only need the count want
+    /// [`Cluster::partition_count`]; callers that only need one
+    /// partition's leader want [`Cluster::leader_id`].
     pub fn partitions(&self, topic: &str) -> Option<Vec<PartitionInfo>> {
         self.state().topics.get(topic).cloned()
+    }
+
+    /// How many partitions `topic` has, as of the last metadata refresh.
+    ///
+    /// The cheap answer for the question the hot path actually asks: a
+    /// keyed producer needs the count for every single record, and
+    /// cloning a 200-entry partition vector to read `.len()` off it is
+    /// a copy — under the shared state lock — per record.
+    pub fn partition_count(&self, topic: &str) -> Option<usize> {
+        self.state().topics.get(topic).map(Vec::len)
     }
 
     /// A topic's partitions, refreshing metadata if the topic is not
@@ -382,18 +437,45 @@ impl Cluster {
         Ok(self.state().conns.entry(node_id).or_insert(broker).clone())
     }
 
-    /// Forget cached leadership for `topic` — e.g. after a
-    /// NOT_LEADER_OR_FOLLOWER — so the next lookup refreshes.
+    /// Forget cached leadership for `topic` — e.g. after a metadata
+    /// answer stopped making sense — so the next lookup refreshes.
+    ///
+    /// Blunt: this costs *every* partition of the topic a refresh. For
+    /// the common "this partition's leader moved" case reach for
+    /// [`Cluster::mark_partition_stale`] instead.
     pub fn mark_stale(&self, topic: &str) {
         self.state().topics.remove(topic);
     }
 
+    /// Forget cached leadership for one partition — e.g. after a
+    /// NOT_LEADER_OR_FOLLOWER — so the next lookup for *that* partition
+    /// refreshes while the rest of the topic keeps routing.
+    pub fn mark_partition_stale(&self, topic: &str, partition: i32) {
+        let mut state = self.state();
+        let Some(partitions) = state.topics.get_mut(topic) else {
+            return;
+        };
+        match partitions.iter_mut().find(|p| p.index == partition) {
+            // -1 is metadata's own "no leader": the next lookup refreshes.
+            Some(info) => info.leader_id = -1,
+            // A partition the cached view does not even know about means
+            // the whole view is behind; refetch it.
+            None => {
+                state.topics.remove(topic);
+            }
+        }
+    }
+
     /// Drop the pooled connections to `node_id` (e.g. after it failed);
-    /// the next use redials. Leases already checked out are unaffected.
+    /// the next use redials. Leases already checked out are unaffected,
+    /// and the pool's record of how much concurrency this broker sees
+    /// survives, so a redial does not re-learn it from scratch.
     pub fn forget_broker(&self, node_id: i32) {
         let mut state = self.state();
         state.conns.remove(&node_id);
-        state.blocking.remove(&node_id);
+        if let Some(pool) = state.blocking.get_mut(&node_id) {
+            pool.idle.clear();
+        }
     }
 
     /// Check a dedicated connection to `node_id` out of the blocking
@@ -403,7 +485,10 @@ impl Cluster {
     pub async fn blocking_broker(&self, node_id: i32) -> Result<BrokerLease, ClientError> {
         let idle = {
             let mut state = self.state();
-            let idle = state.blocking.get_mut(&node_id).and_then(Vec::pop);
+            let idle = state
+                .blocking
+                .get_mut(&node_id)
+                .and_then(|pool| pool.idle.pop());
             if idle.is_none() && !state.brokers.contains_key(&node_id) {
                 return Err(ClientError::UnknownLeader {
                     topic: format!("<broker {node_id}>"),
@@ -424,6 +509,15 @@ impl Cluster {
                 dial(&info.addr(), &self.inner.config).await?
             }
         };
+        {
+            // Count the checkout only once the connection is in hand, so
+            // a failed dial does not inflate the pool's idea of the
+            // workload's concurrency.
+            let mut state = self.state();
+            let pool = state.blocking.entry(node_id).or_default();
+            pool.outstanding += 1;
+            pool.peak = pool.peak.max(pool.outstanding);
+        }
         Ok(BrokerLease {
             broker,
             node_id,
@@ -539,7 +633,9 @@ impl Cluster {
         let mut state = self.state();
         if let Some(node_id) = state.coordinators.remove(group) {
             state.conns.remove(&node_id);
-            state.blocking.remove(&node_id);
+            if let Some(pool) = state.blocking.get_mut(&node_id) {
+                pool.idle.clear();
+            }
         }
     }
 

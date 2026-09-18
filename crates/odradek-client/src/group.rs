@@ -223,8 +223,8 @@ impl GroupMember {
             for topic in &all_topics {
                 let n = self
                     .cluster
-                    .partitions(topic)
-                    .map_or(0, |p| i32::try_from(p.len()).unwrap_or(i32::MAX));
+                    .partition_count(topic)
+                    .map_or(0, |count| i32::try_from(count).unwrap_or(i32::MAX));
                 counts.push((topic.clone(), n));
             }
             range_assign(&counts, &subscriptions)
