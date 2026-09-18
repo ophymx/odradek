@@ -1226,58 +1226,41 @@ fn scram_attr(message: &str, key: char) -> Option<String> {
     })
 }
 
-fn b64_decode(value: &str) -> Option<Vec<u8>> {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD.decode(value).ok()
-}
-
-/// The client-side keys of a SCRAM exchange.
-struct ScramKeys {
-    client_key: [u8; 32],
-    stored_key: [u8; 32],
-    server_key: [u8; 32],
-}
-
-fn scram_hmac(key: &[u8], msg: &[u8]) -> [u8; 32] {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac takes any key length");
-    mac.update(msg);
-    mac.finalize().into_bytes().into()
-}
-
-fn scram_keys(password: &str, salt: &[u8], iterations: u32) -> ScramKeys {
-    use hmac::SimpleHmac;
-    use sha2::{Digest, Sha256};
-    let mut salted = [0u8; 32];
-    pbkdf2::pbkdf2::<SimpleHmac<Sha256>>(password.as_bytes(), salt, iterations, &mut salted)
-        .expect("pbkdf2 accepts any output length");
-    let client_key = scram_hmac(&salted, b"Client Key");
-    ScramKeys {
-        client_key,
-        stored_key: Sha256::digest(client_key).into(),
-        server_key: scram_hmac(&salted, b"Server Key"),
-    }
-}
-
-fn scram_client_proof(keys: &ScramKeys, auth_message: &str) -> String {
-    use base64::Engine as _;
-    let signature = scram_hmac(&keys.stored_key, auth_message.as_bytes());
-    let mut proof = [0u8; 32];
-    for (i, byte) in proof.iter_mut().enumerate() {
-        *byte = keys.client_key[i] ^ signature[i];
-    }
-    base64::engine::general_purpose::STANDARD.encode(proof)
-}
-
-fn scram_server_signature(keys: &ScramKeys, auth_message: &str) -> String {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD
-        .encode(scram_hmac(&keys.server_key, auth_message.as_bytes()))
-}
-
 /// The SCRAM mechanism these checks speak.
 const SCRAM_MECHANISM: &str = "SCRAM-SHA-256";
+
+/// Negotiate SCRAM on a connection, or say why it cannot be.
+async fn scram_handshake(
+    conn: &mut RawConnection,
+    version: i16,
+    sasl_addr: &str,
+    correlation_id: i32,
+) -> Result<(), Verdict> {
+    let mut handshake = SaslHandshakeRequest::default();
+    handshake.mechanism = SCRAM_MECHANISM.to_owned();
+    let mut body = BytesMut::new();
+    handshake
+        .encode(&mut body, version)
+        .map_err(|e| Verdict::Error {
+            details: format!("encoding SaslHandshake: {e}"),
+        })?;
+    let resp: SaslHandshakeResponse = api_call(
+        conn,
+        SaslHandshakeRequest::API_KEY,
+        version,
+        correlation_id,
+        &body,
+    )
+    .await
+    .map_err(CheckError::into_verdict)?;
+    let code = ErrorCode(resp.error_code);
+    if code != ErrorCode(0) {
+        return Err(Verdict::Skipped {
+            reason: format!("{sasl_addr} does not offer {SCRAM_MECHANISM} ({code})"),
+        });
+    }
+    Ok(())
+}
 
 /// Begin a SCRAM exchange: handshake, then client-first.
 ///
@@ -1480,45 +1463,86 @@ async fn scram_server_proves_itself(ctx: &ServerCtx) -> Verdict {
         Ok(v) => v,
         Err(skip) => return skip,
     };
-    let (mut conn, _nonce, client_first_bare, server_first) = match scram_begin(ctx, 230).await {
-        Ok(v) => v,
-        Err(verdict) => return verdict,
-    };
-    let (Some(server_nonce), Some(salt), Some(iterations)) = (
-        scram_attr(&server_first, 'r'),
-        scram_attr(&server_first, 's').and_then(|s| b64_decode(&s)),
-        scram_attr(&server_first, 'i').and_then(|i| i.parse::<u32>().ok()),
-    ) else {
-        return Verdict::Fail {
-            details: format!("server-first is not a SCRAM message: {server_first:?}"),
+    let Some(sasl_addr) = ctx.sasl_addr.clone() else {
+        return Verdict::Skipped {
+            reason: "no SASL listener given (--sasl-server)".into(),
         };
     };
+    let handshake_version = match negotiate(
+        "SaslHandshake",
+        match ctx.range(SaslHandshakeRequest::API_KEY) {
+            Ok(a) => a,
+            Err(v) => return v,
+        },
+        SaslHandshakeRequest::MIN_VERSION,
+        SaslHandshakeRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
 
-    let without_proof = format!("c=biws,r={server_nonce}");
-    let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
-    let keys = scram_keys(SCRAM_PASSWORD, &salt, iterations);
-    let proof = scram_client_proof(&keys, &auth_message);
-    let client_final = format!("{without_proof},p={proof}");
+    // The exchange is driven by odradek-sasl, which is the same code the
+    // client crate uses and is checked against the RFC vectors. A suite
+    // that reimplemented it here would be testing its own arithmetic
+    // against itself.
+    let mut client = match odradek_sasl::ScramClient::new(
+        odradek_sasl::Mechanism::ScramSha256,
+        SCRAM_USER,
+        SCRAM_PASSWORD,
+        odradek_sasl::Limits::default(),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            return Verdict::Error {
+                details: format!("building a SCRAM client: {e}"),
+            };
+        }
+    };
 
+    let mut conn = match connect(&sasl_addr).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
+    match scram_handshake(&mut conn, handshake_version, &sasl_addr, 230).await {
+        Ok(()) => {}
+        Err(verdict) => return verdict,
+    }
+
+    let server_first = match scram_token(
+        &mut conn,
+        auth_version,
+        client.client_first().as_bytes(),
+        231,
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(verdict) => return verdict,
+    };
+    let client_final = match client.client_final(&server_first) {
+        Ok(m) => m,
+        Err(e) => {
+            return Verdict::Fail {
+                details: format!("server-first is not usable: {e}"),
+            };
+        }
+    };
     let server_final =
         match scram_token(&mut conn, auth_version, client_final.as_bytes(), 232).await {
             Ok(t) => t,
             Err(verdict) => return verdict,
         };
-    let Some(signature) = scram_attr(&server_final, 'v') else {
-        return Verdict::Fail {
+    match client.verify_server_final(&server_final) {
+        Ok(()) => Verdict::Pass,
+        Err(odradek_sasl::SaslError::NoServerSignature) => Verdict::Fail {
             details: format!(
                 "server-final carries no signature ({server_final:?}), so a client has \
                  authenticated itself to something it cannot identify"
             ),
-        };
-    };
-    if signature == scram_server_signature(&keys, &auth_message) {
-        Verdict::Pass
-    } else {
-        Verdict::Fail {
-            details: "server signature does not verify against the account's key material".into(),
-        }
+        },
+        Err(e) => Verdict::Fail {
+            details: format!("server signature does not verify: {e}"),
+        },
     }
 }
 

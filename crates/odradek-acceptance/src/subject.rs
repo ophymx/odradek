@@ -442,7 +442,7 @@ struct GroupState {
 /// error rather than as bad credentials. The two answers are different
 /// on purpose: one tells a client its code is wrong, the other tells it
 /// its password is.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 enum SaslState {
     /// Nothing has been negotiated on this connection.
     #[default]
@@ -452,10 +452,7 @@ enum SaslState {
     /// A SCRAM exchange is mid-flight: the client's first bare message
     /// and our first message, both needed to rebuild the auth message
     /// the proof is computed over.
-    ScramPending {
-        client_first_bare: String,
-        server_first: String,
-    },
+    ScramPending(Box<odradek_sasl::ScramServer>),
     /// Authentication completed.
     Authenticated,
 }
@@ -603,184 +600,61 @@ fn response_header_version(api_key: i16, api_version: i16) -> i16 {
 }
 
 /// Frame a response: length prefix, header at `header_version`, body bytes.
-/// SCRAM-SHA-256, server side (RFC 5802 / RFC 7677).
+/// A SCRAM server for this subject's one account.
 ///
-/// Implementing this is what shows why the exchange has the shape it
-/// does, and three of those reasons became checks:
-///
-/// 1. **The server's nonce extends the client's.** It does not replace
-///    it. The client chose a nonce it has never used before; a server
-///    answer that does not contain it could be a recording of an older
-///    exchange, and the client has no other way to tell.
-/// 2. **The salt and iteration count are the server's to state, and the
-///    client's to spend.** The client must run the KDF at whatever cost
-///    the server names before it learns anything at all — so a server
-///    naming a low count has silently weakened every client's password
-///    hashing, and one naming a huge count has a denial of service.
-/// 3. **The final message proves the server too.** `v=` is computed
-///    from a key only someone holding the password material can derive.
-///    Without it a client has authenticated itself to an impostor and
-///    has no idea.
-mod scram {
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD as B64;
-    use hmac::{Hmac, Mac, SimpleHmac};
-    use sha2::{Digest, Sha256};
-
-    type HmacSha256 = Hmac<Sha256>;
-
-    fn hmac(key: &[u8], msg: &[u8]) -> [u8; 32] {
-        let mut mac = HmacSha256::new_from_slice(key).expect("hmac takes any key length");
-        mac.update(msg);
-        mac.finalize().into_bytes().into()
-    }
-
-    fn salted_password(password: &str, salt: &[u8], iterations: u32) -> [u8; 32] {
-        let mut out = [0u8; 32];
-        pbkdf2::pbkdf2::<SimpleHmac<Sha256>>(password.as_bytes(), salt, iterations, &mut out)
-            .expect("pbkdf2 accepts any output length");
-        out
-    }
-
-    /// The server's half of the exchange, once the client's first
-    /// message and the auth message are known.
-    pub(super) struct Keys {
-        pub stored_key: [u8; 32],
-        pub server_key: [u8; 32],
-    }
-
-    pub(super) fn keys(password: &str, salt: &[u8], iterations: u32) -> Keys {
-        let salted = salted_password(password, salt, iterations);
-        let client_key = hmac(&salted, b"Client Key");
-        Keys {
-            stored_key: Sha256::digest(client_key).into(),
-            server_key: hmac(&salted, b"Server Key"),
-        }
-    }
-
-    /// `v=` — proof that this server holds the account's key material.
-    pub(super) fn server_signature(keys: &Keys, auth_message: &str) -> String {
-        B64.encode(hmac(&keys.server_key, auth_message.as_bytes()))
-    }
-
-    /// Whether `proof` (base64) is the client's, for `auth_message`.
-    pub(super) fn verify_proof(keys: &Keys, auth_message: &str, proof: &str) -> bool {
-        let Ok(proof) = B64.decode(proof) else {
-            return false;
-        };
-        if proof.len() != 32 {
-            return false;
-        }
-        let signature = hmac(&keys.stored_key, auth_message.as_bytes());
-        // ClientKey = ClientProof XOR ClientSignature, and H(ClientKey)
-        // must be the stored key.
-        let mut client_key = [0u8; 32];
-        for (i, byte) in client_key.iter_mut().enumerate() {
-            *byte = proof[i] ^ signature[i];
-        }
-        let digest: [u8; 32] = Sha256::digest(client_key).into();
-        digest == keys.stored_key
-    }
-
-    pub(super) fn encode(bytes: &[u8]) -> String {
-        B64.encode(bytes)
-    }
-
-    /// Split a SCRAM message into its `k=v` attributes.
-    pub(super) fn attrs(message: &str) -> Vec<(char, String)> {
-        message
-            .split(',')
-            .filter_map(|part| {
-                let mut chars = part.chars();
-                let key = chars.next()?;
-                let rest = chars.as_str().strip_prefix('=')?;
-                Some((key, rest.to_owned()))
-            })
-            .collect()
-    }
-
-    pub(super) fn attr(message: &str, key: char) -> Option<String> {
-        attrs(message)
-            .into_iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, v)| v)
-    }
-}
-
-/// The server's first SCRAM message, from the client's first.
-///
-/// Returns `(client-first-bare, server-first)` — both are needed later,
-/// because the proof is computed over a message built from all three
-/// exchanges and the server has to remember its own part verbatim.
-fn scram_first(token: &str, faults: &[Fault]) -> Result<(String, String), String> {
-    // "n,,n=user,r=nonce": strip the GS2 header to get the bare part the
-    // auth message is built from.
-    let bare = token
-        .splitn(3, ',')
-        .nth(2)
-        .ok_or_else(|| "client-first is not a SCRAM message".to_owned())?;
-    let client_nonce =
-        scram::attr(bare, 'r').ok_or_else(|| "client-first carries no nonce".to_owned())?;
-    let user = scram::attr(bare, 'n').unwrap_or_default();
-    if user != SCRAM_USER {
-        return Err(format!("no such user {user:?}"));
-    }
-
-    // The server nonce *extends* the client's. Replacing it would leave
-    // the client unable to tell this exchange from a recording of an
-    // older one.
-    let server_nonce = if faults.contains(&Fault::ScramNonceReplacesClients) {
-        "odradek-server-nonce".to_owned()
-    } else {
-        format!("{client_nonce}odradek-server-nonce")
-    };
+/// The exchange itself is [`odradek_sasl`]'s, which speaks both roles
+/// and is checked against the RFC 7677 vectors. What is left here is the
+/// fault injection: a subject whose whole job is to be wrong in one
+/// named way at a time cannot share an implementation with the thing
+/// under test, so the faults reach in through the seams the crate
+/// leaves — a fixed nonce, a stated iteration count, a dropped
+/// signature.
+fn scram_server(faults: &[Fault]) -> Result<odradek_sasl::ScramServer, String> {
     let iterations = if faults.contains(&Fault::ScramWeakIterations) {
         1
     } else {
         SCRAM_ITERATIONS
     };
-    let server_first = format!(
-        "r={server_nonce},s={},i={iterations}",
-        scram::encode(SCRAM_SALT)
-    );
-    Ok((bare.to_owned(), server_first))
+    let server = odradek_sasl::ScramServer::new(
+        odradek_sasl::Mechanism::ScramSha256,
+        SCRAM_USER,
+        SCRAM_PASSWORD,
+        SCRAM_SALT.to_vec(),
+        iterations,
+        // A floor of 1, because this subject has to be *allowed* to
+        // misbehave: the crate's default floor would refuse to build a
+        // server weak enough to test a client against.
+        odradek_sasl::Limits::new(1, 1_000_000),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(server)
 }
 
-/// The server's final SCRAM message, proving it holds the key material.
-fn scram_final(
-    client_first_bare: &str,
-    server_first: &str,
-    token: &str,
-    faults: &[Fault],
-) -> Result<String, String> {
-    let proof =
-        scram::attr(token, 'p').ok_or_else(|| "client-final carries no proof".to_owned())?;
-    // The auth message covers every byte of the exchange so far, which
-    // is what stops any of it from being altered in flight.
-    let without_proof = token
-        .rsplit_once(",p=")
-        .map(|(head, _)| head)
-        .ok_or_else(|| "client-final is malformed".to_owned())?;
-    let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
-
-    let iterations = if faults.contains(&Fault::ScramWeakIterations) {
-        1
-    } else {
-        SCRAM_ITERATIONS
-    };
-    let keys = scram::keys(SCRAM_PASSWORD, SCRAM_SALT, iterations);
-    if !scram::verify_proof(&keys, &auth_message, &proof) {
-        return Err("client proof does not verify".to_owned());
+/// Make a conformant `server-first` wrong, one named way at a time.
+///
+/// The faults live here rather than in the SCRAM implementation on
+/// purpose: `odradek-sasl`'s server always extends the client's nonce,
+/// because that is the invariant it exists to hold. A subject that has
+/// to violate it therefore mangles the message on the way out, which is
+/// also what a broken server actually does — the wrongness is in what
+/// went on the wire, not in some setting it was given.
+fn mangle_server_first(server_first: String, faults: &[Fault]) -> String {
+    if !faults.contains(&Fault::ScramNonceReplacesClients) {
+        return server_first;
     }
-    if faults.contains(&Fault::ScramSkipsServerSignature) {
-        // Cheerful success with nothing to check it against: the client
-        // has authenticated itself to whoever this is.
-        return Ok(String::new());
-    }
-    Ok(format!(
-        "v={}",
-        scram::server_signature(&keys, &auth_message)
-    ))
+    server_first
+        .split(',')
+        .map(|part| {
+            if part.starts_with("r=") {
+                // Our nonce alone: the client's contribution is gone, so
+                // this answer could be a recording of any exchange.
+                "r=odradek-server-nonce".to_owned()
+            } else {
+                part.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// SaslHandshake: agree a mechanism, or say what is on offer.
@@ -847,20 +721,23 @@ fn sasl_authenticate_exchange(
 
     let mut resp = SaslAuthenticateResponse::default();
     let token = String::from_utf8_lossy(&_request.auth_bytes).into_owned();
-    match &state.sasl {
+    match &mut state.sasl {
         SaslState::Unstarted if !faults.contains(&Fault::SaslAuthenticateWithoutHandshake) => {
             resp.error_code = ErrorCode::ILLEGAL_SASL_STATE.0;
             resp.error_message = Some("no mechanism negotiated".into());
         }
         SaslState::Negotiated(mechanism) if mechanism == "SCRAM-SHA-256" => {
-            match scram_first(&token, faults) {
-                Ok((client_first_bare, server_first)) => {
+            match scram_server(faults).and_then(|mut server| {
+                server
+                    .server_first(&token)
+                    .map(|first| (server, first))
+                    .map_err(|e| e.to_string())
+            }) {
+                Ok((server, server_first)) => {
                     resp.error_code = 0;
-                    resp.auth_bytes = Bytes::from(server_first.clone().into_bytes());
-                    state.sasl = SaslState::ScramPending {
-                        client_first_bare,
-                        server_first,
-                    };
+                    let server_first = mangle_server_first(server_first, faults);
+                    resp.auth_bytes = Bytes::from(server_first.into_bytes());
+                    state.sasl = SaslState::ScramPending(Box::new(server));
                 }
                 Err(message) => {
                     resp.error_code = ErrorCode::SASL_AUTHENTICATION_FAILED.0;
@@ -868,18 +745,22 @@ fn sasl_authenticate_exchange(
                 }
             }
         }
-        SaslState::ScramPending {
-            client_first_bare,
-            server_first,
-        } => match scram_final(client_first_bare, server_first, &token, faults) {
+        SaslState::ScramPending(server) => match server.server_final(&token) {
             Ok(server_final) => {
                 resp.error_code = 0;
-                resp.auth_bytes = Bytes::from(server_final.into_bytes());
+                // A subject that completes the exchange without signing
+                // it: the client has authenticated itself to whatever
+                // this is, and has no way to notice.
+                resp.auth_bytes = if faults.contains(&Fault::ScramSkipsServerSignature) {
+                    Bytes::new()
+                } else {
+                    Bytes::from(server_final.into_bytes())
+                };
                 state.sasl = SaslState::Authenticated;
             }
-            Err(message) => {
+            Err(e) => {
                 resp.error_code = ErrorCode::SASL_AUTHENTICATION_FAILED.0;
-                resp.error_message = Some(message);
+                resp.error_message = Some(e.to_string());
             }
         },
         _ => {

@@ -16,7 +16,7 @@ default = ["tls", "sasl", "gzip", "lz4", "snappy", "zstd"]
 ## TLS broker connections via rustls.
 tls = ["dep:tokio-rustls", "dep:webpki-roots", "dep:rustls-pki-types"]
 ## SASL authentication (PLAIN, SCRAM-SHA-256/512).
-sasl = ["dep:base64", "dep:hmac", "dep:pbkdf2", "dep:sha2", "dep:subtle", "dep:zeroize"]
+sasl = ["dep:odradek-sasl", "dep:base64", "dep:zeroize"]
 ## Compression codecs; a disabled codec is a typed runtime error, not a
 ## compile error, since a fetch can encounter any codec.
 gzip = ["dep:flate2"]
@@ -26,6 +26,7 @@ zstd = ["dep:zstd"]
 
 [dependencies]
 odradek-protocol = { workspace = true }
+odradek-sasl = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 bytes = { workspace = true }
 flate2 = { workspace = true, optional = true }

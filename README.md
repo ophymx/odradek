@@ -11,6 +11,7 @@ the protocol as the first-class artifact and builds outward from it.
 | Crate | Purpose |
 |---|---|
 | [`odradek-protocol`](crates/odradek-protocol) | Sans-I/O wire protocol: primitive codecs (varints, compact strings, tagged fields), the API key registry, versioned message types generated from the upstream schemas, and the record-batch codec with the byte-identical proxy guarantee. |
+| [`odradek-sasl`](crates/odradek-sasl) | Sans-I/O SASL for these crates: SCRAM-SHA-256/512 and PLAIN, both roles, checked against the RFC 7677 vectors. |
 | [`odradek-client`](crates/odradek-client) | Async, Rust-native Kafka client built on tokio: connections, metadata routing, producer, consumer. TLS, SASL, and each compression codec are default-on cargo features you can opt out of. |
 | [`odradek-acceptance`](crates/odradek-acceptance) | Acceptance suite that validates *either side* of the protocol: run it against a server (suite acts as client) or against a client (suite acts as server harness). |
 | [`odradek-web-core`](crates/odradek-web-core) | Transport-agnostic bridge from Kafka partitions to web-shaped subscribers: fan-out, replay from offsets, filtering, self-healing backpressure. |

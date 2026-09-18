@@ -14,6 +14,7 @@ repository = "https://github.com/ophymx/odradek"
 # internal crates
 odradek-protocol = { path = "crates/odradek-protocol", version = "0.1.0" }
 odradek-client = { path = "crates/odradek-client", version = "0.1.0" }
+odradek-sasl = { path = "crates/odradek-sasl", version = "0.1.0" }
 odradek-web-core = { path = "crates/odradek-web-core", version = "0.1.0" }
 
 # external
@@ -29,6 +30,7 @@ lz4_flex = "0.11"
 pbkdf2 = { version = "0.12", default-features = false }
 sha2 = "0.10"
 snap = "1"
+stringprep = "0.1"
 subtle = { version = "2.6", default-features = false }
 zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
 rustls-pki-types = "1"
