@@ -7,6 +7,28 @@
 //! protocol layer), skipping records below the requested offset (brokers
 //! return whole batches, which may start earlier), and skipping control
 //! batches (transaction markers are not data).
+//!
+//! # Bounding what a fetch can materialize
+//!
+//! A fetch response is broker-controlled input, and a compressed batch
+//! is a lever: a few hundred kilobytes on the wire can claim to hold
+//! millions of records, each of which costs ~112 bytes of `Vec` once
+//! materialized even when its wire form is 7 bytes. Three limits box
+//! that in, and they compose:
+//!
+//! 1. Decompression of any one batch stops at 64 MiB, the frame cap.
+//! 2. Across all batches of one response, decompressed bytes are capped
+//!    at 64 MiB in total, so a response full of small compressed batches
+//!    cannot get that much each.
+//! 3. A batch's claimed record count is checked against what its own
+//!    decompressed bytes could possibly encode (7 bytes minimum per
+//!    record) *before* any record is decoded, and the running total is
+//!    capped at [`ConsumerConfig::max_fetch_records`].
+//!
+//! The result is a stated ceiling per [`Consumer::fetch`] call: at most
+//! `max_fetch_records` records (~112 MiB of [`ConsumedRecord`] at the
+//! default) over at most 64 MiB of record bytes, from a response that
+//! was itself at most 64 MiB on the wire.
 
 use std::time::Duration;
 
@@ -37,6 +59,26 @@ const LIST_OFFSETS_SUPPORTED: (i16, i16) = (1, ListOffsetsRequest::MAX_VERSION);
 const EARLIEST: i64 = -2;
 const LATEST: i64 = -1;
 
+/// The fewest bytes a record can occupy on the wire.
+///
+/// A record is a varint length followed by that many bytes, and the body
+/// needs at least: attributes (1), timestamp delta (1), offset delta
+/// (1), a null key (1), a null value (1), and a zero header count (1) —
+/// six bytes, which the leading length varint encodes in one more. So a
+/// decompressed payload of `n` bytes cannot hold more than `n / 7`
+/// records, whatever the batch header claims. Asserted in the tests
+/// against the protocol crate's encoder.
+const MIN_RECORD_WIRE_LEN: usize = 7;
+
+/// Decompressed record bytes one fetch response may produce in total,
+/// summed over its batches.
+///
+/// Equal to the connection layer's frame ceiling: a response is allowed
+/// to expand to, at most, what a response is allowed to *be*. Without
+/// the cumulative accounting, a 64 MiB frame packed with thousands of
+/// tiny compressed batches could each expand to the per-batch cap.
+const MAX_FETCH_DECOMPRESSED: usize = odradek_protocol::frame::DEFAULT_MAX_FRAME;
+
 /// Fetch tuning knobs.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -58,6 +100,29 @@ pub struct ConsumerConfig {
     pub max_attempts: u32,
     /// Pause between attempts.
     pub retry_backoff: Duration,
+    /// Ceiling on the records one [`Consumer::fetch`] will materialize
+    /// (default: 1_048_576).
+    ///
+    /// This is a safety bound on broker-controlled input, not a paging
+    /// knob: a response that asks for more is rejected as a
+    /// [`ClientError::ProtocolViolation`], not truncated. The count a
+    /// compressed batch declares is checked against it *before* records
+    /// are decoded, so a batch claiming millions costs nothing to
+    /// refuse.
+    ///
+    /// Every materialized record costs about 112 bytes of
+    /// [`ConsumedRecord`] on top of its payload (payloads are slices of
+    /// the decompressed buffer, not copies), so the default caps one
+    /// fetch at roughly 112 MiB of record structs. Compression is what
+    /// makes this necessary: a minimal record is 7 bytes decompressed
+    /// and gzip shrinks a run of them by several hundred times, so
+    /// without the bound a ~200 KiB response can ask for gigabytes.
+    ///
+    /// Raise it only alongside [`ConsumerConfig::partition_max_bytes`],
+    /// and only if a legitimate broker actually returns that many
+    /// records per fetch; the default is already ~7x what a 1 MiB
+    /// partition fetch of minimum-size records could hold uncompressed.
+    pub max_fetch_records: usize,
 }
 
 impl Default for ConsumerConfig {
@@ -70,6 +135,7 @@ impl Default for ConsumerConfig {
             // offsets topic on first use) can take seconds; budget for it.
             max_attempts: 20,
             retry_backoff: Duration::from_millis(250),
+            max_fetch_records: 1 << 20,
         }
     }
 }
@@ -302,6 +368,10 @@ impl Consumer {
         let mut set = entry.records.clone().unwrap_or_default();
         let batches = decode_set(&mut set)?;
         let mut records = Vec::new();
+        let mut budget = FetchBudget {
+            records_left: self.config.max_fetch_records,
+            decompressed_left: MAX_FETCH_DECOMPRESSED,
+        };
         let mut next_offset = offset;
         for batch in &batches {
             next_offset =
@@ -309,39 +379,16 @@ impl Consumer {
             if batch.is_control() {
                 continue;
             }
-            let materialized;
-            let plain: &[Record] = match &batch.records {
-                Records::Plain(records) => records,
+            match &batch.records {
+                Records::Plain(plain) => {
+                    budget.claim_records(plain.len())?;
+                    for record in plain {
+                        push_record(&mut records, batch, record.clone(), offset);
+                    }
+                }
                 Records::Compressed { count, payload } => {
-                    let mut data = crate::compression::decompress(batch.compression(), payload)?;
-                    let mut records = Vec::new();
-                    for _ in 0..*count {
-                        records.push(Record::decode(&mut data)?);
-                    }
-                    if !data.is_empty() {
-                        return Err(ClientError::ProtocolViolation(format!(
-                            "{} byte(s) left after the batch's {count} compressed records",
-                            data.len()
-                        )));
-                    }
-                    materialized = records;
-                    &materialized
+                    decode_compressed(&mut records, &mut budget, batch, *count, payload, offset)?;
                 }
-            };
-            for record in plain {
-                let absolute = batch.base_offset + i64::from(record.offset_delta);
-                if absolute < offset {
-                    // Brokers return whole batches; the head may predate
-                    // the requested offset.
-                    continue;
-                }
-                records.push(ConsumedRecord {
-                    offset: absolute,
-                    timestamp: batch.base_timestamp + record.timestamp_delta,
-                    key: record.key.clone(),
-                    value: record.value.clone(),
-                    headers: record.headers.clone(),
-                });
             }
         }
         Ok(FetchResult {
@@ -396,5 +443,266 @@ impl Consumer {
         } else {
             Err(ClientError::Broker(code))
         }
+    }
+}
+
+/// What one fetch response is still allowed to spend.
+///
+/// Both counters run for the whole response rather than per batch, so a
+/// response cannot multiply its allowance by splitting itself up.
+#[derive(Debug)]
+struct FetchBudget {
+    records_left: usize,
+    decompressed_left: usize,
+}
+
+impl FetchBudget {
+    /// Charge `count` records, refusing rather than truncating.
+    fn claim_records(&mut self, count: usize) -> Result<(), ClientError> {
+        if count > self.records_left {
+            return Err(ClientError::ProtocolViolation(format!(
+                "fetch response wants to materialize more than this client's \
+                 limit of records (ConsumerConfig::max_fetch_records); \
+                 {count} more asked for with room for {}",
+                self.records_left
+            )));
+        }
+        self.records_left -= count;
+        Ok(())
+    }
+
+    /// Charge `len` decompressed bytes.
+    fn claim_decompressed(&mut self, len: usize) -> Result<(), ClientError> {
+        if len > self.decompressed_left {
+            return Err(ClientError::ProtocolViolation(format!(
+                "fetch response decompresses past this client's limit of \
+                 {MAX_FETCH_DECOMPRESSED} bytes per response"
+            )));
+        }
+        self.decompressed_left -= len;
+        Ok(())
+    }
+}
+
+/// Decode a compressed batch's records straight into `out`.
+///
+/// Single pass on purpose: an intermediate `Vec<Record>` would double
+/// the peak for no benefit, since every record here is consumed exactly
+/// once. The payload bytes are not copied — keys and values are slices
+/// of the decompressed buffer.
+fn decode_compressed(
+    out: &mut Vec<ConsumedRecord>,
+    budget: &mut FetchBudget,
+    batch: &odradek_protocol::records::RecordBatch,
+    count: i32,
+    payload: &[u8],
+    min_offset: i64,
+) -> Result<(), ClientError> {
+    let count = usize::try_from(count).map_err(|_| {
+        ClientError::ProtocolViolation(format!("batch claims a negative record count ({count})"))
+    })?;
+    let mut data = crate::compression::decompress(batch.compression(), payload)?;
+    budget.claim_decompressed(data.len())?;
+    // The count is the broker's claim; the decompressed length is the
+    // arithmetic limit on what that claim can possibly be true about.
+    // Check it before decoding, so a lie costs one division, not a
+    // multi-gigabyte `Vec`.
+    let possible = data.len() / MIN_RECORD_WIRE_LEN;
+    if count > possible {
+        return Err(ClientError::ProtocolViolation(format!(
+            "batch claims {count} records but its {} decompressed byte(s) \
+             can hold at most {possible}",
+            data.len()
+        )));
+    }
+    budget.claim_records(count)?;
+    for _ in 0..count {
+        let record = Record::decode(&mut data)?;
+        push_record(out, batch, record, min_offset);
+    }
+    if !data.is_empty() {
+        return Err(ClientError::ProtocolViolation(format!(
+            "{} byte(s) left after the batch's {count} compressed records",
+            data.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Give `record` its absolute coordinates and keep it, unless it
+/// predates the requested offset.
+fn push_record(
+    out: &mut Vec<ConsumedRecord>,
+    batch: &odradek_protocol::records::RecordBatch,
+    record: Record,
+    min_offset: i64,
+) {
+    let absolute = batch.base_offset + i64::from(record.offset_delta);
+    if absolute < min_offset {
+        // Brokers return whole batches; the head may predate the
+        // requested offset.
+        return;
+    }
+    out.push(ConsumedRecord {
+        offset: absolute,
+        timestamp: batch.base_timestamp + record.timestamp_delta,
+        key: record.key,
+        value: record.value,
+        headers: record.headers,
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use odradek_protocol::records::{Compression, RecordBatch};
+
+    use super::*;
+
+    fn budget() -> FetchBudget {
+        FetchBudget {
+            records_left: ConsumerConfig::default().max_fetch_records,
+            decompressed_left: MAX_FETCH_DECOMPRESSED,
+        }
+    }
+
+    /// [`MIN_RECORD_WIRE_LEN`] is load-bearing arithmetic, not a guess:
+    /// the smallest record the protocol crate can encode must be exactly
+    /// that long.
+    #[test]
+    fn minimum_record_is_seven_bytes() {
+        let mut buf = BytesMut::new();
+        Record::default().encode(&mut buf).unwrap();
+        assert_eq!(buf.len(), MIN_RECORD_WIRE_LEN);
+    }
+
+    /// The amplification: ~200 KiB of gzip can claim millions of
+    /// records. The claim has to be refused from the payload's own
+    /// length, before anything is allocated for it.
+    #[test]
+    fn huge_claimed_count_against_a_small_payload_is_rejected() {
+        let mut out = Vec::new();
+        let batch = RecordBatch::default();
+        // Compression::None keeps this test independent of which codec
+        // features are built; the count check is codec-agnostic.
+        let payload = b"a short payload";
+        let err =
+            decode_compressed(&mut out, &mut budget(), &batch, 19_173_961, payload, 0).unwrap_err();
+        assert!(
+            matches!(&err, ClientError::ProtocolViolation(m) if m.contains("can hold at most 2")),
+            "unexpected error: {err}"
+        );
+        assert!(out.is_empty(), "nothing should have been materialized");
+    }
+
+    /// A count that fits the payload arithmetically but blows the
+    /// per-response record budget is refused too, and again before
+    /// decoding.
+    #[test]
+    fn count_over_the_response_budget_is_rejected() {
+        let mut out = Vec::new();
+        let mut budget = FetchBudget {
+            records_left: 3,
+            decompressed_left: MAX_FETCH_DECOMPRESSED,
+        };
+        let payload = vec![0u8; 10 * MIN_RECORD_WIRE_LEN];
+        let err = decode_compressed(
+            &mut out,
+            &mut budget,
+            &RecordBatch::default(),
+            10,
+            &payload,
+            0,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, ClientError::ProtocolViolation(m) if m.contains("max_fetch_records")),
+            "unexpected error: {err}"
+        );
+        assert!(out.is_empty());
+        assert_eq!(budget.records_left, 3, "a refused claim spends nothing");
+    }
+
+    #[test]
+    fn decompressed_bytes_are_charged_against_the_response_budget() {
+        let mut budget = FetchBudget {
+            records_left: 100,
+            decompressed_left: 8,
+        };
+        let payload = vec![0u8; 9];
+        let err = decode_compressed(
+            &mut Vec::new(),
+            &mut budget,
+            &RecordBatch::default(),
+            1,
+            &payload,
+            0,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, ClientError::ProtocolViolation(m) if m.contains("decompresses past")),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Honest batches still decode, with the offsets and timestamps made
+    /// absolute and the pre-offset head skipped.
+    #[test]
+    fn honest_compressed_batch_still_materializes() {
+        let records = [
+            Record {
+                offset_delta: 0,
+                timestamp_delta: 5,
+                value: Some(Bytes::from_static(b"first")),
+                ..Default::default()
+            },
+            Record {
+                offset_delta: 1,
+                timestamp_delta: 6,
+                value: Some(Bytes::from_static(b"second")),
+                ..Default::default()
+            },
+        ];
+        let mut payload = BytesMut::new();
+        for record in &records {
+            record.encode(&mut payload).unwrap();
+        }
+        let batch = RecordBatch {
+            base_offset: 100,
+            base_timestamp: 1_000,
+            ..Default::default()
+        };
+        assert_eq!(batch.compression(), Compression::None);
+
+        let mut out = Vec::new();
+        let mut spent = budget();
+        decode_compressed(&mut out, &mut spent, &batch, 2, &payload, 0).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].offset, 100);
+        assert_eq!(out[0].timestamp, 1_005);
+        assert_eq!(out[1].value.as_deref(), Some(b"second".as_slice()));
+        assert_eq!(
+            spent.records_left,
+            ConsumerConfig::default().max_fetch_records - 2
+        );
+
+        // Records below the requested offset are skipped, not an error.
+        let mut out = Vec::new();
+        decode_compressed(&mut out, &mut budget(), &batch, 2, &payload, 101).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].offset, 101);
+    }
+
+    #[test]
+    fn negative_claimed_count_is_rejected() {
+        let err = decode_compressed(
+            &mut Vec::new(),
+            &mut budget(),
+            &RecordBatch::default(),
+            -1,
+            b"",
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ClientError::ProtocolViolation(_)));
     }
 }

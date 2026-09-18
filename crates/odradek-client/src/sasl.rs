@@ -10,6 +10,39 @@
 //! salted-password via Hi (PBKDF2 with HMAC), client proof, and —
 //! importantly — verification of the *server's* signature, so a broker
 //! that doesn't know the password fails the handshake too.
+//!
+//! # Transport security
+//!
+//! SASL authenticates; it does not encrypt. What each mechanism exposes
+//! when the underlying connection is plaintext TCP:
+//!
+//! - **PLAIN** sends the password itself. This client refuses to do that
+//!   on an unencrypted connection — the attempt fails with
+//!   [`ClientError::InsecureCredentials`] before the handshake begins —
+//!   unless [`crate::ClientConfig::allow_plaintext_credentials`] is set.
+//! - **SCRAM** never sends the password, so it is permitted over
+//!   plaintext, but a passive observer still collects the username, the
+//!   salt, the iteration count, the nonces, and the client proof. Those
+//!   are exactly the inputs to an offline dictionary attack against the
+//!   password, at the cost the iteration count sets. An active on-path
+//!   attacker can additionally impersonate the broker up to the point of
+//!   the server-signature check, harvesting one proof per connection.
+//!
+//! In other words: SCRAM over plaintext protects the password from
+//! being *read*, not from being *cracked*. Configure TLS
+//! (`ClientConfig::tls`) for anything beyond a loopback broker.
+//!
+//! # Broker-controlled work
+//!
+//! The broker picks the SCRAM iteration count, and the client must spend
+//! it before it can decide whether the broker is even genuine. Both
+//! directions are bounded here: counts below [`MIN_SCRAM_ITERATIONS`]
+//! (RFC 7677's floor) are rejected because they downgrade the KDF toward
+//! a single HMAC, counts above
+//! [`crate::ClientConfig::scram_max_iterations`] are rejected because
+//! they are a CPU-burn primitive, and the derivation itself runs on
+//! [`tokio::task::spawn_blocking`] so an in-bounds but expensive count
+//! cannot occupy an async runtime worker.
 
 use bytes::{Bytes, BytesMut};
 use hmac::{Mac, SimpleHmac};
@@ -20,10 +53,28 @@ use odradek_protocol::messages::sasl_handshake_request::SaslHandshakeRequest;
 use odradek_protocol::messages::sasl_handshake_response::SaslHandshakeResponse;
 use sha2::digest::core_api::BlockSizeUser;
 use sha2::{Digest, Sha256, Sha512};
+use subtle::ConstantTimeEq;
 
+use crate::ClientConfig;
 use crate::conn::Connection;
 use crate::error::ClientError;
 use crate::negotiate::ApiVersionRanges;
+
+/// The smallest SCRAM iteration count this client will honour: RFC 7677
+/// §4 makes 4096 the minimum for SCRAM-SHA-256, and Kafka's own default
+/// is exactly that.
+///
+/// A broker that asks for less is either broken or hostile. The hostile
+/// case matters: `pbkdf2` with one round (or zero, which produces
+/// bit-identical output) collapses `Hi()` to a single HMAC, and the
+/// client emits a valid client proof over that weak key *before* it gets
+/// to check the server signature. The proof is on the wire either way,
+/// so the only defence is to never compute it.
+pub const MIN_SCRAM_ITERATIONS: u32 = 4096;
+
+/// Default ceiling on the SCRAM iteration count; see
+/// [`crate::ClientConfig::scram_max_iterations`].
+pub const DEFAULT_MAX_SCRAM_ITERATIONS: u32 = 1_000_000;
 
 /// Credentials plus mechanism. `Debug` never prints the password.
 #[derive(Clone)]
@@ -58,14 +109,45 @@ impl Mechanism {
             Mechanism::ScramSha512 => "SCRAM-SHA-512",
         }
     }
+
+    /// True when the mechanism puts the password itself on the wire, so
+    /// the transport has to be encrypted for it to be safe at all.
+    fn sends_password(self) -> bool {
+        match self {
+            Mechanism::Plain => true,
+            // SCRAM sends a proof, never the password.
+            Mechanism::ScramSha256 | Mechanism::ScramSha512 => false,
+        }
+    }
 }
 
-/// Authenticate `conn`; must run before any non-handshake request.
+/// Authenticate `conn` with `config.sasl`; must run before any
+/// non-handshake request. A config with no credentials is a no-op.
+///
+/// Fails with [`ClientError::InsecureCredentials`], before sending
+/// anything, when the mechanism would put the password on an
+/// unencrypted connection. See the [module docs](self) for what the
+/// mechanisms expose and how broker-controlled work is bounded.
 pub async fn authenticate(
     conn: &Connection,
     ranges: &ApiVersionRanges,
-    sasl: &SaslConfig,
+    config: &ClientConfig,
 ) -> Result<(), ClientError> {
+    let Some(sasl) = &config.sasl else {
+        return Ok(());
+    };
+    // Decide before the handshake: a mechanism that transmits the
+    // password must not even be announced on a connection that cannot
+    // protect it.
+    if sasl.mechanism.sends_password()
+        && !conn.is_encrypted()
+        && !config.allow_plaintext_credentials
+    {
+        return Err(ClientError::InsecureCredentials {
+            mechanism: sasl.mechanism.name(),
+        });
+    }
+
     // Handshake v1: v0 predates SaslAuthenticate framing.
     let version = ranges.pick(SaslHandshakeRequest::API_KEY, (1, 1))?;
     let mut request = SaslHandshakeRequest::default();
@@ -95,8 +177,26 @@ pub async fn authenticate(
             let resp = sasl_round(conn, ranges, token.into()).await?;
             check_auth(&resp)
         }
-        Mechanism::ScramSha256 => scram::<Sha256>(conn, ranges, sasl, &fresh_nonce()?).await,
-        Mechanism::ScramSha512 => scram::<Sha512>(conn, ranges, sasl, &fresh_nonce()?).await,
+        Mechanism::ScramSha256 => {
+            scram::<Sha256>(
+                conn,
+                ranges,
+                sasl,
+                &fresh_nonce()?,
+                config.scram_max_iterations,
+            )
+            .await
+        }
+        Mechanism::ScramSha512 => {
+            scram::<Sha512>(
+                conn,
+                ranges,
+                sasl,
+                &fresh_nonce()?,
+                config.scram_max_iterations,
+            )
+            .await
+        }
     }
 }
 
@@ -161,9 +261,10 @@ async fn scram<D>(
     ranges: &ApiVersionRanges,
     sasl: &SaslConfig,
     nonce: &str,
+    max_iterations: u32,
 ) -> Result<(), ClientError>
 where
-    D: Digest + BlockSizeUser + Clone + Sync,
+    D: Digest + BlockSizeUser + Clone + Send + Sync + 'static,
 {
     let client_first_bare = format!("n={},r={nonce}", saslname(&sasl.username));
     let client_first = format!("n,,{client_first_bare}");
@@ -185,15 +286,31 @@ where
         .get('i')?
         .parse()
         .map_err(|_| ClientError::Sasl("bad iteration count".into()))?;
+    check_iterations(iterations, max_iterations)?;
 
-    let (client_final, server_signature) = scram_client_final::<D>(
-        &sasl.password,
-        &salt,
-        iterations,
-        &client_first_bare,
-        &server_first,
-        server_nonce,
-    )?;
+    // PBKDF2 is a synchronous CPU burn proportional to a number the
+    // broker chose: run it on a blocking thread so it cannot stall this
+    // task's runtime worker (a `current_thread` runtime has exactly one,
+    // and no timeout can interrupt a synchronous call that already
+    // holds it).
+    let (client_final, server_signature) = {
+        let password = sasl.password.clone();
+        let client_first_bare = client_first_bare.clone();
+        let server_first = server_first.clone();
+        let server_nonce = server_nonce.to_owned();
+        tokio::task::spawn_blocking(move || {
+            scram_client_final::<D>(
+                &password,
+                &salt,
+                iterations,
+                &client_first_bare,
+                &server_first,
+                &server_nonce,
+            )
+        })
+        .await
+        .map_err(|e| ClientError::Sasl(format!("key derivation task failed: {e}")))??
+    };
 
     let resp = sasl_round(conn, ranges, Bytes::from(client_final)).await?;
     check_auth(&resp)?;
@@ -204,7 +321,9 @@ where
         return Err(ClientError::Sasl(format!("server error: {err}")));
     }
     let verifier = base64_decode(attrs.get('v')?)?;
-    if verifier != server_signature {
+    // Constant time: a length-independent, early-exit-free comparison
+    // denies an attacker a timing oracle on the expected signature.
+    if verifier.ct_eq(&server_signature).unwrap_u8() != 1 {
         return Err(ClientError::Sasl(
             "server signature mismatch: the broker does not know this password".into(),
         ));
@@ -212,8 +331,34 @@ where
     Ok(())
 }
 
+/// Bound the broker's iteration count from both sides.
+///
+/// Below [`MIN_SCRAM_ITERATIONS`] the derivation is a KDF downgrade
+/// dressed as a handshake; above `max` it is a CPU-burn primitive. Both
+/// are the peer misusing the protocol rather than an authentication
+/// failure, so both are [`ClientError::ProtocolViolation`].
+fn check_iterations(iterations: u32, max: u32) -> Result<(), ClientError> {
+    if iterations < MIN_SCRAM_ITERATIONS {
+        return Err(ClientError::ProtocolViolation(format!(
+            "broker asked for {iterations} scram iterations, below the \
+             RFC 7677 minimum of {MIN_SCRAM_ITERATIONS}; refusing to derive \
+             (and hand over) a proof under a weakened key"
+        )));
+    }
+    if iterations > max {
+        return Err(ClientError::ProtocolViolation(format!(
+            "broker asked for {iterations} scram iterations, above this \
+             client's ceiling of {max} (ClientConfig::scram_max_iterations)"
+        )));
+    }
+    Ok(())
+}
+
 /// The client-final-message and the expected server signature. Pure so
 /// the RFC 7677 vector can drive it.
+///
+/// Synchronous and, for a large `iterations`, slow: callers on an async
+/// task must run it under [`tokio::task::spawn_blocking`].
 fn scram_client_final<D>(
     password: &str,
     salt: &[u8],
@@ -245,6 +390,10 @@ where
 }
 
 /// `Hi()` from RFC 5802 is PBKDF2 with HMAC-D at one block width.
+///
+/// Cost is linear in `iterations`, which the broker chose; the caller is
+/// responsible for having bounded it (see [`check_iterations`]) and for
+/// keeping this off an async runtime worker.
 fn hi<D>(password: &[u8], salt: &[u8], iterations: u32) -> Vec<u8>
 where
     D: Digest + BlockSizeUser + Clone + Sync,
@@ -352,5 +501,90 @@ mod tests {
     #[test]
     fn saslname_escapes() {
         assert_eq!(saslname("a=b,c"), "a=3Db=2Cc");
+    }
+
+    #[test]
+    fn iteration_count_below_the_rfc_floor_is_rejected() {
+        // i=0 and i=1 are the downgrade: pbkdf2 with zero or one round
+        // is a single HMAC, and the proof derived from it is cheap to
+        // attack offline once it has been sent.
+        for iterations in [0, 1, 1000, MIN_SCRAM_ITERATIONS - 1] {
+            assert!(
+                matches!(
+                    check_iterations(iterations, DEFAULT_MAX_SCRAM_ITERATIONS),
+                    Err(ClientError::ProtocolViolation(_))
+                ),
+                "i={iterations} should have been rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn iteration_count_above_the_ceiling_is_rejected() {
+        for iterations in [DEFAULT_MAX_SCRAM_ITERATIONS + 1, 1 << 31, u32::MAX] {
+            assert!(
+                matches!(
+                    check_iterations(iterations, DEFAULT_MAX_SCRAM_ITERATIONS),
+                    Err(ClientError::ProtocolViolation(_))
+                ),
+                "i={iterations} should have been rejected"
+            );
+        }
+        // The ceiling is the caller's to set.
+        assert!(check_iterations(1 << 20, 1 << 21).is_ok());
+        assert!(check_iterations(1 << 20, 1 << 19).is_err());
+    }
+
+    #[test]
+    fn in_range_iteration_counts_are_accepted() {
+        for iterations in [
+            MIN_SCRAM_ITERATIONS,
+            8192,
+            DEFAULT_MAX_SCRAM_ITERATIONS - 1,
+            DEFAULT_MAX_SCRAM_ITERATIONS,
+        ] {
+            check_iterations(iterations, DEFAULT_MAX_SCRAM_ITERATIONS).unwrap();
+        }
+    }
+
+    /// The bounds must not disturb the RFC 7677 exchange itself: its
+    /// i=4096 sits exactly on the floor and still derives the documented
+    /// proof.
+    #[test]
+    fn rfc_7677_iteration_count_survives_the_bounds() {
+        let iterations = 4096;
+        check_iterations(iterations, DEFAULT_MAX_SCRAM_ITERATIONS).unwrap();
+        let server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,\
+                            s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+        let (client_final, _) = scram_client_final::<Sha256>(
+            "pencil",
+            &base64_decode("W22ZaJ0SNY7soEsUEjb6gQ==").unwrap(),
+            iterations,
+            "n=user,r=rOprNGfwEbeRWgbNEkqO",
+            server_first,
+            "rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0",
+        )
+        .unwrap();
+        assert!(client_final.ends_with("p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="));
+    }
+
+    /// The default must be safe: PLAIN is only allowed to reach an
+    /// unencrypted socket when the caller opted in.
+    #[test]
+    fn plaintext_credential_policy() {
+        let config = ClientConfig::default();
+        assert!(!config.allow_plaintext_credentials);
+        assert!(Mechanism::Plain.sends_password());
+        assert!(!Mechanism::ScramSha256.sends_password());
+        assert!(!Mechanism::ScramSha512.sends_password());
+    }
+
+    #[test]
+    fn default_scram_ceiling_is_configured() {
+        assert_eq!(
+            ClientConfig::default().scram_max_iterations,
+            DEFAULT_MAX_SCRAM_ITERATIONS
+        );
+        const { assert!(DEFAULT_MAX_SCRAM_ITERATIONS > MIN_SCRAM_ITERATIONS) };
     }
 }

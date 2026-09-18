@@ -30,6 +30,30 @@
 //! that produces from many tasks is one shared `Cluster` and a cheap
 //! `Producer` per task. See [`cluster`] for how blocking requests
 //! (long-poll fetch, parked join) interact with a shared connection.
+//!
+//! # Security defaults
+//!
+//! **Connections are plaintext TCP unless you say otherwise.**
+//! [`ClientConfig::default`] uses no transport encryption, so every
+//! request, response, and record body crosses the network in the clear
+//! and any on-path party can read or rewrite it. Turn on TLS with the
+//! `tls` feature and `ClientConfig::tls` (see `Tls::system` or
+//! `Tls::with_ca_pem`) for any network you do not own.
+//!
+//! Because that default is unsafe for credentials, the client refuses to
+//! put a SASL PLAIN password on an unencrypted socket: it fails with
+//! [`ClientError::InsecureCredentials`] before the handshake starts,
+//! unless you explicitly set `ClientConfig::allow_plaintext_credentials`.
+//! SCRAM is allowed over plaintext (it never transmits the password), but
+//! a passive observer still learns the username, the salt, the iteration
+//! count, and the client proof — enough to mount an offline dictionary
+//! attack — so TLS is the right answer there too.
+//!
+//! Broker-controlled work is bounded on the paths where a hostile or
+//! compromised broker could otherwise spend the client's CPU and memory:
+//! see `ClientConfig::scram_max_iterations` for the SCRAM key-derivation
+//! bound and [`consumer::ConsumerConfig::max_fetch_records`] for the
+//! fetch materialization bound.
 
 pub mod cluster;
 mod compression;
@@ -66,6 +90,21 @@ pub use sasl::{Mechanism, SaslConfig};
 pub use tls::Tls;
 
 /// Configuration shared by every entry point of the client.
+///
+/// # Security defaults
+///
+/// **The default is plaintext TCP.** [`ClientConfig::default`] sets no
+/// transport encryption, so unless you build with the `tls` feature and
+/// set `ClientConfig::tls`, everything — records, request headers, and
+/// any SCRAM handshake material — crosses the network readable and
+/// modifiable by anything on the path. That default suits a loopback
+/// broker in a test; it does not suit any network you do not own.
+///
+/// Credentials get a stronger default: SASL PLAIN over an unencrypted
+/// connection is refused with [`ClientError::InsecureCredentials`]
+/// rather than silently sending the password in the clear. Set
+/// [`ClientConfig::allow_plaintext_credentials`] to accept that exposure
+/// deliberately.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ClientConfig {
@@ -98,6 +137,21 @@ pub struct ClientConfig {
     /// fd-tight environments; raise it past your peak fan-out if you
     /// run more concurrent long polls than this per broker.
     pub blocking_idle_max: usize,
+    /// Permit mechanisms that transmit the password — SASL PLAIN — on
+    /// connections with no transport encryption (default: `false`).
+    ///
+    /// Left `false`, a PLAIN authentication over plaintext TCP fails
+    /// with [`ClientError::InsecureCredentials`] *before* anything is
+    /// sent, because the alternative is putting the password on the wire
+    /// where every hop can read it. Set it to `true` only when you have
+    /// decided the exposure is acceptable — a loopback broker, a
+    /// container network you own — or when encryption is terminated
+    /// somewhere this client cannot see (a sidecar proxy, a VPN).
+    ///
+    /// It does not affect SCRAM, which never transmits the password;
+    /// see the `sasl` module docs for what SCRAM does leak over
+    /// plaintext.
+    pub allow_plaintext_credentials: bool,
     /// TLS for every broker connection (default: plaintext).
     #[cfg(feature = "tls")]
     pub tls: Tls,
@@ -105,6 +159,29 @@ pub struct ClientConfig {
     /// version negotiation (default: none).
     #[cfg(feature = "sasl")]
     pub sasl: Option<SaslConfig>,
+    /// Ceiling on the SCRAM iteration count this client will honour
+    /// (default: 1_000_000).
+    ///
+    /// The iteration count in a SCRAM exchange is chosen by the
+    /// *broker*, and the client must run that many PBKDF2 rounds before
+    /// it can tell whether the broker even knows the password. At
+    /// roughly 2.8s per million rounds, an unbounded count is a remote
+    /// CPU-burn primitive: `i=2^31` is about 1.6 hours of work per
+    /// connection. The derivation runs on a blocking thread so it cannot
+    /// wedge the async runtime, but it still costs a thread and a core,
+    /// so it is bounded here too.
+    ///
+    /// The default is about two orders of magnitude above what brokers
+    /// configure in practice (Kafka's own default is 4096). Raise it if
+    /// your cluster deliberately runs a harder KDF; there is no reason
+    /// to raise it past the work you are willing to spend per dial.
+    ///
+    /// The floor is not configurable: counts below RFC 7677's minimum of
+    /// 4096 are always rejected, since accepting one lets a rogue broker
+    /// downgrade the KDF to a single HMAC and harvest a proof that is
+    /// cheap to attack offline.
+    #[cfg(feature = "sasl")]
+    pub scram_max_iterations: u32,
 }
 
 impl Default for ClientConfig {
@@ -115,10 +192,13 @@ impl Default for ClientConfig {
             connect_timeout: std::time::Duration::from_secs(10),
             request_timeout: std::time::Duration::from_secs(30),
             blocking_idle_max: 256,
+            allow_plaintext_credentials: false,
             #[cfg(feature = "tls")]
             tls: Tls::None,
             #[cfg(feature = "sasl")]
             sasl: None,
+            #[cfg(feature = "sasl")]
+            scram_max_iterations: sasl::DEFAULT_MAX_SCRAM_ITERATIONS,
         }
     }
 }

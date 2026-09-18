@@ -45,6 +45,28 @@ let consumer = Consumer::new(cluster);   // shares the producer's pool
 See [`examples/`](examples/) for produce/consume, consumer groups, and
 TLS/SASL smoke tests against a real broker.
 
+## Security defaults
+
+**Connections are plaintext TCP unless configured otherwise.**
+`ClientConfig::default()` sets no transport encryption, which is fine
+for a loopback broker and wrong for any network you do not own; build
+with the `tls` feature and set `ClientConfig::tls`.
+
+Because that default is unsafe for credentials, SASL PLAIN over an
+unencrypted connection is refused before the handshake starts
+(`ClientError::InsecureCredentials`) unless you opt in with
+`ClientConfig::allow_plaintext_credentials`. SCRAM is permitted over
+plaintext — it never sends the password — but an observer still
+collects the username, salt, iteration count, and client proof, which
+is everything an offline dictionary attack needs.
+
+Work a broker can make this client do is bounded on both paths where it
+is worth doing: SCRAM iteration counts are clamped to
+`[4096, ClientConfig::scram_max_iterations]` and derived on a blocking
+thread, and one `fetch()` materializes at most
+`ConsumerConfig::max_fetch_records` records over at most 64 MiB of
+decompressed record bytes.
+
 ## Features
 
 All on by default: `tls`, `sasl`, `gzip`, `lz4`, `snappy`, `zstd`.

@@ -747,9 +747,7 @@ async fn dial(addr: &str, config: &ClientConfig) -> Result<Broker, ClientError> 
         let conn = Connection::connect(addr, config).await?;
         let ranges = conn.negotiate().await?;
         #[cfg(feature = "sasl")]
-        if let Some(sasl) = &config.sasl {
-            crate::sasl::authenticate(&conn, &ranges, sasl).await?;
-        }
+        crate::sasl::authenticate(&conn, &ranges, config).await?;
         Ok(Broker { conn, ranges })
     })
     .await

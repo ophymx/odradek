@@ -43,6 +43,18 @@ enum Transport {
     Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
 }
 
+impl Transport {
+    /// Whether this wire encrypts what is written to it. Callers that
+    /// are about to send a secret need to know.
+    fn is_encrypted(&self) -> bool {
+        match self {
+            Transport::Plain(_) => false,
+            #[cfg(feature = "tls")]
+            Transport::Tls(_) => true,
+        }
+    }
+}
+
 impl AsyncRead for Transport {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -116,6 +128,7 @@ struct Inner {
     next_correlation: AtomicI32,
     client_id: String,
     request_timeout: std::time::Duration,
+    encrypted: bool,
     reader: JoinHandle<()>,
 }
 
@@ -162,6 +175,7 @@ impl Connection {
         };
         #[cfg(not(feature = "tls"))]
         let transport = Transport::Plain(stream);
+        let encrypted = transport.is_encrypted();
         let (read_half, write_half) = tokio::io::split(transport);
 
         let shared = Arc::new(Shared {
@@ -177,9 +191,22 @@ impl Connection {
                 next_correlation: AtomicI32::new(1),
                 client_id: config.client_id.clone(),
                 request_timeout: config.request_timeout,
+                encrypted,
                 reader,
             }),
         })
+    }
+
+    /// Whether this connection is encrypted (TLS) rather than plaintext
+    /// TCP.
+    ///
+    /// Anything about to put a secret on the wire — SASL PLAIN, say —
+    /// should consult this first; see the `sasl` module. It reflects only
+    /// what *this* client negotiated: encryption terminated elsewhere
+    /// (a sidecar proxy, a tunnel) is invisible here and reads as
+    /// `false`.
+    pub fn is_encrypted(&self) -> bool {
+        self.inner.encrypted
     }
 
     /// Send a request body (already encoded at `api_version`) and await the

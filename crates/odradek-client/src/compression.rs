@@ -19,15 +19,24 @@ use odradek_protocol::records::Compression;
 
 use crate::error::ClientError;
 
-/// Guard decompression against bombs: a record batch's decompressed
-/// records must still fit in a sane fetch response.
+/// Guard decompression against bombs: one batch's decompressed records
+/// must still fit in a sane fetch response.
+///
+/// Pinned to `frame::DEFAULT_MAX_FRAME`, the largest response the
+/// connection layer will read at all. Anything larger would make this
+/// the *looser* of the two limits, which is backwards: the frame cap is
+/// what the peer paid for on the wire, and a compressed batch should not
+/// be allowed to buy more client memory than an uncompressed one of the
+/// same wire size. The consumer applies a second, cumulative budget
+/// across the batches of a single response — see
+/// [`crate::consumer::ConsumerConfig::max_fetch_records`].
 #[cfg(any(
     feature = "gzip",
     feature = "lz4",
     feature = "snappy",
     feature = "zstd"
 ))]
-const MAX_DECOMPRESSED: u64 = 128 << 20;
+const MAX_DECOMPRESSED: u64 = odradek_protocol::frame::DEFAULT_MAX_FRAME as u64;
 
 /// Header of the xerial snappy stream format: magic, then version and
 /// minimum compatible version (both big-endian 1), then a sequence of

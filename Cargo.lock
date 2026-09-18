@@ -672,6 +672,7 @@ dependencies = [
  "rustls-pki-types",
  "sha2",
  "snap",
+ "subtle",
  "thiserror",
  "tokio",
  "tokio-rustls",

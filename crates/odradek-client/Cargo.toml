@@ -16,7 +16,7 @@ default = ["tls", "sasl", "gzip", "lz4", "snappy", "zstd"]
 ## TLS broker connections via rustls.
 tls = ["dep:tokio-rustls", "dep:webpki-roots", "dep:rustls-pki-types"]
 ## SASL authentication (PLAIN, SCRAM-SHA-256/512).
-sasl = ["dep:base64", "dep:hmac", "dep:pbkdf2", "dep:sha2"]
+sasl = ["dep:base64", "dep:hmac", "dep:pbkdf2", "dep:sha2", "dep:subtle"]
 ## Compression codecs; a disabled codec is a typed runtime error, not a
 ## compile error, since a fetch can encounter any codec.
 gzip = ["dep:flate2"]
@@ -35,6 +35,7 @@ lz4_flex = { workspace = true, optional = true }
 pbkdf2 = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 snap = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

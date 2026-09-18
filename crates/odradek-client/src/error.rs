@@ -49,6 +49,19 @@ pub enum ClientError {
     /// mechanism, or a malformed exchange).
     #[error("sasl: {0}")]
     Sasl(String),
+    /// Sending the configured credentials would have put them on an
+    /// unencrypted socket, so nothing was sent.
+    ///
+    /// Raised before the SASL handshake starts. Fix it by configuring
+    /// TLS (`ClientConfig::tls`) or, if the exposure is acceptable (a
+    /// loopback broker, a trusted lab network), by opting in with
+    /// `ClientConfig::allow_plaintext_credentials`.
+    #[error(
+        "refusing to send {mechanism} credentials over a plaintext connection; \
+         configure ClientConfig::tls, or set \
+         ClientConfig::allow_plaintext_credentials to accept the exposure"
+    )]
+    InsecureCredentials { mechanism: &'static str },
 }
 
 /// The session-level classification of a [`ClientError`]: what kind of
@@ -88,7 +101,7 @@ impl ClientError {
                 | ErrorCode::UNSUPPORTED_SASL_MECHANISM => ErrorCategory::Auth,
                 _ => ErrorCategory::Other,
             },
-            ClientError::Sasl(_) => ErrorCategory::Auth,
+            ClientError::Sasl(_) | ClientError::InsecureCredentials { .. } => ErrorCategory::Auth,
             ClientError::ConnectionClosed
             | ClientError::Io(_)
             | ClientError::Timeout(_)

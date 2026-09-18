@@ -3,8 +3,14 @@
 //!
 //! ```sh
 //! cargo run -p odradek-client --example secure_smoke -- <bootstrap> \
-//!     [--ca cert.pem] [--mechanism plain|scram256|scram512 --user u --pass p]
+//!     [--ca cert.pem] [--mechanism plain|scram256|scram512 --user u --pass p] \
+//!     [--allow-plaintext-credentials]
 //! ```
+//!
+//! `--mechanism plain` without `--ca` would put the password on an
+//! unencrypted socket, so it is refused unless
+//! `--allow-plaintext-credentials` says that is intended (a local broker
+//! in a lab, say).
 
 use bytes::Bytes;
 use odradek_client::protocol::records::Record;
@@ -18,10 +24,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut mechanism = None;
     let mut user = String::new();
     let mut pass = String::new();
+    let mut allow_plaintext_credentials = false;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
             "--ca" => tls = Tls::with_ca_pem(&std::fs::read(value()?)?)?,
+            "--allow-plaintext-credentials" => allow_plaintext_credentials = true,
             "--mechanism" => {
                 mechanism = Some(match value()?.as_str() {
                     "plain" => Mechanism::Plain,
@@ -39,6 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.bootstrap_servers = vec![bootstrap];
     config.client_id = "odradek-secure-smoke".into();
     config.tls = tls;
+    config.allow_plaintext_credentials = allow_plaintext_credentials;
     config.sasl = mechanism.map(|mechanism| SaslConfig {
         mechanism,
         username: user,
