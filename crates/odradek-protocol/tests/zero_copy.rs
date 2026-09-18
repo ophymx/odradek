@@ -22,12 +22,14 @@ use odradek_protocol::records::{Record, RecordBatch, Records, decode_set, encode
 struct Counting;
 
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+static BYTES: AtomicUsize = AtomicUsize::new(0);
 static ARMED: AtomicBool = AtomicBool::new(false);
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if ARMED.load(Ordering::Relaxed) {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
+            BYTES.fetch_add(layout.size(), Ordering::Relaxed);
         }
         unsafe { System.alloc(layout) }
     }
@@ -37,6 +39,7 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if ARMED.load(Ordering::Relaxed) {
             ALLOCS.fetch_add(1, Ordering::Relaxed);
+            BYTES.fetch_add(new_size.saturating_sub(layout.size()), Ordering::Relaxed);
         }
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -45,13 +48,47 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
-/// Run `f`, returning its value and how many allocations it made.
-fn allocations_of<T>(f: impl FnOnce() -> T) -> (T, usize) {
+/// Slack allowed when comparing two allocation counts. Well below the
+/// one-allocation-per-record a real copy would cost, but enough to
+/// absorb allocator size-class differences across platforms — CI caught
+/// a one-allocation wobble that an exact-equality assertion called a
+/// zero-copy violation.
+const TOLERANCE: usize = 4;
+
+/// Slack allowed when comparing allocated *volume* between two runs
+/// whose payloads differ by orders of magnitude. Generous next to the
+/// hundreds of kilobytes a real copy would move, tight next to the
+/// bookkeeping a decode legitimately allocates.
+const BYTE_TOLERANCE: usize = 8 << 10;
+
+/// How many records the materialization guard decodes.
+const RECORDS: usize = 64;
+
+/// What one measured region allocated.
+#[derive(Debug, Clone, Copy)]
+struct Alloc {
+    /// Number of allocations — catches per-record copying.
+    count: usize,
+    /// Bytes requested — catches one big copy of a whole payload, which
+    /// a count cannot see (copying a 1 MiB records blob is a single
+    /// allocation).
+    bytes: usize,
+}
+
+/// Run `f`, returning its value and what it allocated.
+fn allocations_of<T>(f: impl FnOnce() -> T) -> (T, Alloc) {
     ALLOCS.store(0, Ordering::Relaxed);
+    BYTES.store(0, Ordering::Relaxed);
     ARMED.store(true, Ordering::Relaxed);
     let value = f();
     ARMED.store(false, Ordering::Relaxed);
-    (value, ALLOCS.load(Ordering::Relaxed))
+    (
+        value,
+        Alloc {
+            count: ALLOCS.load(Ordering::Relaxed),
+            bytes: BYTES.load(Ordering::Relaxed),
+        },
+    )
 }
 
 /// A fetch response whose one partition carries `record_count` records
@@ -107,12 +144,26 @@ fn message_decode_does_not_scale_with_payload_size() {
     let (_, large_allocs) =
         allocations_of(|| FetchResponse::decode(&mut large.clone(), 12).expect("decodes"));
 
-    assert_eq!(
-        small_allocs,
-        large_allocs,
-        "message decode allocated {large_allocs} for a {}-byte response vs {small_allocs} for \
-         {} bytes — the records field is being copied instead of sliced",
+    assert!(
+        large_allocs.count <= small_allocs.count + TOLERANCE,
+        "message decode made {} allocations for a {}-byte response vs {} for {} bytes — \
+         the records field is being copied instead of sliced",
+        large_allocs.count,
         large.len(),
+        small_allocs.count,
+        small.len()
+    );
+    // The decisive check: a copied payload shows up as volume, not count
+    // — copying a whole records blob is one big allocation. Compare the
+    // two runs against each other, so the bar is "does not scale with
+    // payload" rather than an arbitrary absolute size.
+    assert!(
+        large_allocs.bytes <= small_allocs.bytes + BYTE_TOLERANCE,
+        "message decode allocated {} bytes for a {}-byte response vs {} bytes for {} — \
+         allocation volume is tracking payload size, so it is copying",
+        large_allocs.bytes,
+        large.len(),
+        small_allocs.bytes,
         small.len()
     );
 }
@@ -121,8 +172,8 @@ fn message_decode_does_not_scale_with_payload_size() {
 fn record_materialization_allocates_per_record_not_per_byte() {
     // Ten times the payload per record, same record count: materializing
     // must cost the same, because keys and values are slices.
-    let thin = fetch_response(64, 32);
-    let fat = fetch_response(64, 32 * 10);
+    let thin = fetch_response(RECORDS, 32);
+    let fat = fetch_response(RECORDS, 32 * 10);
 
     let materialize = |response: &Bytes| {
         let decoded = FetchResponse::decode(&mut response.clone(), 12).expect("decodes");
@@ -138,10 +189,21 @@ fn record_materialization_allocates_per_record_not_per_byte() {
     assert_eq!(thin_batches.len(), 1);
     assert_eq!(fat_batches.len(), 1);
 
-    assert_eq!(
-        thin_allocs, fat_allocs,
-        "materializing 64 records cost {fat_allocs} allocations at 320-byte values vs \
-         {thin_allocs} at 32-byte values — record payloads are being copied"
+    // Copying payloads would cost at least one allocation per record
+    // (64 more); a couple of allocations either way is size-class noise.
+    assert!(
+        fat_allocs.count <= thin_allocs.count + TOLERANCE,
+        "materializing {RECORDS} records made {} allocations at 320-byte values vs {} at \
+         32-byte values — record payloads are being copied",
+        fat_allocs.count,
+        thin_allocs.count
+    );
+    assert!(
+        fat_allocs.bytes <= thin_allocs.bytes + BYTE_TOLERANCE,
+        "materializing allocated {} bytes at 320-byte values vs {} at 32-byte values — \
+         allocation volume is tracking payload size, so payloads are being copied",
+        fat_allocs.bytes,
+        thin_allocs.bytes
     );
 }
 
@@ -178,4 +240,30 @@ fn decoded_payloads_alias_the_input_buffer() {
             "a record value was copied out of the response buffer"
         );
     }
+}
+
+#[test]
+fn the_guard_has_teeth_decoding_through_a_slice_does_copy() {
+    // The tolerance above must not be wide enough to hide a real copy.
+    // Decoding the same response through `&[u8]` instead of `Bytes` gets
+    // `Buf::copy_to_bytes`'s default — the exact cliff the crate docs
+    // warn about — so it is the honest control: if this does not blow
+    // past the tolerance, the other two tests prove nothing.
+    let response = fetch_response(RECORDS, 32 * 10);
+
+    let (_, sliced_allocs) = allocations_of(|| {
+        let mut buf: &[u8] = &response;
+        FetchResponse::decode(&mut buf, 12).expect("decodes")
+    });
+    let (_, bytes_allocs) =
+        allocations_of(|| FetchResponse::decode(&mut response.clone(), 12).expect("decodes"));
+
+    assert!(
+        sliced_allocs.bytes >= response.len() && bytes_allocs.bytes < response.len(),
+        "decoding a {}-byte response allocated {} bytes through a slice and {} through Bytes — \
+         if the slice path is not visibly copying, these guards prove nothing",
+        response.len(),
+        sliced_allocs.bytes,
+        bytes_allocs.bytes
+    );
 }
