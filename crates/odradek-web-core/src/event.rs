@@ -131,7 +131,31 @@ pub enum TopicPosition {
 /// live path, and it would not even fail loudly — backpressure would
 /// dutifully demote every subscriber into permanent catch-up, and the
 /// bridge would look slow rather than broken.
+///
+/// # Construction
+///
+/// Build from [`Default`] and assign, rather than by struct literal:
+///
+/// ```
+/// # use odradek_web_core::Filter;
+/// let mut filter = Filter::default();
+/// filter.key_prefix = Some(b"tenant-7/".as_slice().into());
+/// ```
+///
+/// The type is `#[non_exhaustive]` to keep room for one specific future
+/// field: a caller-supplied predicate. Filtering is the request this
+/// crate expects to refuse most often — JSON paths, expression
+/// languages, anything that must parse a value — and the answer is
+/// meant to be an escape hatch rather than a feature: hand us your own
+/// closure, own its cost. Adding that field to a struct downstream code
+/// could build by literal would be a breaking change, so the room is
+/// reserved before publication rather than after. The `Debug`,
+/// `PartialEq`, and `Eq` derives here do not stand in the way of that —
+/// a closure satisfies none of them, but replacing a derive with a
+/// hand-written impl (comparing predicates by `Arc::ptr_eq`) is not a
+/// breaking change the way struct-literal construction is.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Filter {
     /// Keep only records whose key starts with these bytes.
     pub key_prefix: Option<Bytes>,

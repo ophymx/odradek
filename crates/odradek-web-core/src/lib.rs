@@ -52,6 +52,11 @@
 //! through what each clause refuses and where those things belong
 //! instead.
 
+// This crate carries no `unsafe` block and has never needed one:
+// forbid rather than deny, so the decision cannot be reversed by a
+// local `allow` in a module nobody re-reads.
+#![forbid(unsafe_code)]
+
 pub mod cursor;
 pub mod event;
 pub mod hub;

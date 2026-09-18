@@ -177,10 +177,12 @@ async fn filters_apply_to_replay_and_live() {
     log.append(TOPIC, 0, Some(b"order:9"), b"drop", Vec::new());
     let pump = pump_for(&log, PumpConfig::default());
 
-    let filter = Filter {
-        key_prefix: Some(Bytes::from_static(b"user:")),
-        ..Default::default()
-    };
+    // Built the way a downstream crate must: `Filter` is non-exhaustive,
+    // so the struct literal this used to be is not available outside the
+    // engine. Keeping the test on the public path proves the ergonomics
+    // are tolerable rather than assuming it.
+    let mut filter = Filter::default();
+    filter.key_prefix = Some(Bytes::from_static(b"user:"));
     let mut sub = pump.subscribe(Position::Earliest, filter).await.unwrap();
 
     log.append(TOPIC, 0, Some(b"user:2"), b"keep-b", Vec::new());

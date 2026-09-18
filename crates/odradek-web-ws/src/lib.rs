@@ -71,6 +71,11 @@
 //! `with_graceful_shutdown`) — every pump stops, open sockets close
 //! with `1001`, and new subscribes are refused with `503`.
 
+// This crate carries no `unsafe` block and has never needed one:
+// forbid rather than deny, so the decision cannot be reversed by a
+// local `allow` in a module nobody re-reads.
+#![forbid(unsafe_code)]
+
 use std::collections::HashSet;
 use std::sync::Arc;
 

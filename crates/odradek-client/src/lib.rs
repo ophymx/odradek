@@ -55,6 +55,11 @@
 //! bound and [`consumer::ConsumerConfig::max_fetch_records`] for the
 //! fetch materialization bound.
 
+// This crate carries no `unsafe` block and has never needed one:
+// forbid rather than deny, so the decision cannot be reversed by a
+// local `allow` in a module nobody re-reads.
+#![forbid(unsafe_code)]
+
 pub mod cluster;
 mod compression;
 pub mod conn;

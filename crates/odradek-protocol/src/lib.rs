@@ -68,6 +68,11 @@
 //! `Bytes::copy_from_slice(&value)`, which pays one small copy to
 //! release the frame.
 
+// This crate carries no `unsafe` block and has never needed one:
+// forbid rather than deny, so the decision cannot be reversed by a
+// local `allow` in a module nobody re-reads.
+#![forbid(unsafe_code)]
+
 pub mod api_key;
 pub mod budget;
 pub mod consumer_protocol;
