@@ -62,10 +62,14 @@ impl Default for ConsumerGroupHeartbeatResponse {
 }
 
 impl ConsumerGroupHeartbeatResponse {
+    /// This message's api key in Kafka's registry.
     pub const API_KEY: i16 = 68;
+    /// The lowest schema version this snapshot can speak.
     pub const MIN_VERSION: i16 = 0;
+    /// The highest schema version this snapshot can speak.
     pub const MAX_VERSION: i16 = 1;
 
+    /// Encode this `ConsumerGroupHeartbeatResponse` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         buf.put_i32(self.throttle_time_ms);
         buf.put_i16(self.error_code);
@@ -185,6 +189,7 @@ impl Default for Assignment {
 }
 
 impl Assignment {
+    /// Encode this `Assignment` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if is_flexible(version) {
             wire::put_compact_array_len(buf, Some(self.topic_partitions.len()));
@@ -273,6 +278,7 @@ impl Default for TopicPartitions {
 }
 
 impl TopicPartitions {
+    /// Encode this `TopicPartitions` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         wire::put_uuid(buf, self.topic_id);
         if is_flexible(version) {

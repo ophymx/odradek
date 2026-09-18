@@ -53,10 +53,14 @@ impl Default for OffsetFetchResponse {
 }
 
 impl OffsetFetchResponse {
+    /// This message's api key in Kafka's registry.
     pub const API_KEY: i16 = 9;
+    /// The lowest schema version this snapshot can speak.
     pub const MIN_VERSION: i16 = 1;
+    /// The highest schema version this snapshot can speak.
     pub const MAX_VERSION: i16 = 10;
 
+    /// Encode this `OffsetFetchResponse` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version >= 3 {
             buf.put_i32(self.throttle_time_ms);
@@ -215,6 +219,7 @@ impl Default for OffsetFetchResponseTopic {
 }
 
 impl OffsetFetchResponseTopic {
+    /// Encode this `OffsetFetchResponseTopic` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version <= 7 {
             if is_flexible(version) {
@@ -332,6 +337,7 @@ impl Default for OffsetFetchResponsePartition {
 }
 
 impl OffsetFetchResponsePartition {
+    /// Encode this `OffsetFetchResponsePartition` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version <= 7 {
             buf.put_i32(self.partition_index);
@@ -433,6 +439,7 @@ impl Default for OffsetFetchResponseGroup {
 }
 
 impl OffsetFetchResponseGroup {
+    /// Encode this `OffsetFetchResponseGroup` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version >= 8 {
             if is_flexible(version) {
@@ -550,6 +557,7 @@ impl Default for OffsetFetchResponseTopics {
 }
 
 impl OffsetFetchResponseTopics {
+    /// Encode this `OffsetFetchResponseTopics` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if (8..=9).contains(&version) {
             if is_flexible(version) {
@@ -673,6 +681,7 @@ impl Default for OffsetFetchResponsePartitions {
 }
 
 impl OffsetFetchResponsePartitions {
+    /// Encode this `OffsetFetchResponsePartitions` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version >= 8 {
             buf.put_i32(self.partition_index);

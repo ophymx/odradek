@@ -505,7 +505,11 @@ fn encode_batch(mut records: Vec<Record>, codec: Compression) -> Result<Bytes, C
         ..Default::default()
     };
     let mut out = BytesMut::new();
-    batch.encode(&mut out)?;
+    // encode_to, not encode: this destination *is* a BytesMut, and the
+    // generic path would encode into a scratch buffer and copy the whole
+    // batch across — an extra allocation and memcpy of every byte
+    // produced, on every produce.
+    batch.encode_to(&mut out)?;
     // freeze() hands the buffer over; to_vec() would copy it.
     Ok(out.freeze())
 }

@@ -11,7 +11,9 @@
 use bytes::{Bytes, BytesMut};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use odradek_protocol::messages::fetch_response::FetchResponse;
-use odradek_protocol::records::{Record, RecordBatch, Records, crc32c, decode_set, encode_set};
+use odradek_protocol::records::{
+    Record, RecordBatch, Records, crc32c, decode_set, encode_set, encode_set_to,
+};
 
 /// Roughly one megabyte of records with `value_len`-byte values.
 fn batch_of(value_len: usize) -> RecordBatch {
@@ -91,10 +93,21 @@ fn bench_records(c: &mut Criterion) {
         group.bench_function("decode_set", |b| {
             b.iter(|| decode_set(&mut std::hint::black_box(set.clone())).expect("decodes"))
         });
+        // The pair is the point: `encode_set` takes a generic BufMut,
+        // which cannot be read back, so the crc forces every batch
+        // through a scratch buffer and a copy. `encode_set_to` knows the
+        // destination is a BytesMut and back-patches in place.
         group.bench_function("encode_set", |b| {
             b.iter(|| {
                 let mut buf = BytesMut::new();
                 encode_set(&mut buf, std::slice::from_ref(&batch)).expect("encodes");
+                buf
+            })
+        });
+        group.bench_function("encode_set_to", |b| {
+            b.iter(|| {
+                let mut buf = BytesMut::new();
+                encode_set_to(&mut buf, std::slice::from_ref(&batch)).expect("encodes");
                 buf
             })
         });

@@ -646,14 +646,24 @@ fn generate_struct(w: &mut String, msg: &Message, def: &StructDef, is_top: bool)
     let _ = writeln!(w, "impl {} {{", def.name);
     if is_top {
         if let Some(key) = msg.api_key {
+            let _ = writeln!(w, "    /// This message's api key in Kafka's registry.");
             let _ = writeln!(w, "    pub const API_KEY: i16 = {key};");
         }
+        let _ = writeln!(
+            w,
+            "    /// The lowest schema version this snapshot can speak."
+        );
         let _ = writeln!(w, "    pub const MIN_VERSION: i16 = {};", msg.valid.min);
+        let _ = writeln!(
+            w,
+            "    /// The highest schema version this snapshot can speak."
+        );
         let _ = writeln!(w, "    pub const MAX_VERSION: i16 = {};", msg.valid.max);
         let _ = writeln!(w);
     }
 
     // encode
+    let _ = writeln!(w, "    /// Encode this `{}` at `version`.", def.name);
     let _ = writeln!(
         w,
         "    pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {{"

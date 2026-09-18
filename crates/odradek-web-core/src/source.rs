@@ -241,25 +241,22 @@ impl RecordSource for KafkaSource {
         partition: i32,
         offset: i64,
     ) -> Result<SourceBatch, SourceError> {
+        // fetch_with, not fetch: an `Event` is what this bridge wants,
+        // and asking for records first means building a whole
+        // `Vec<ConsumedRecord>` in order to walk it once and drop it.
         let result = self
             .consumer
-            .fetch(topic, partition, offset)
+            .fetch_with(topic, partition, offset, |r| {
+                let mut event = Event::at(topic, partition, r.offset, r.timestamp);
+                event.key = r.key;
+                event.value = r.value;
+                event.headers = r.headers.into_iter().map(|h| (h.key, h.value)).collect();
+                event
+            })
             .await
             .map_err(SourceError::from)?;
         Ok(SourceBatch {
-            events: result
-                .records
-                .into_iter()
-                .map(|r| Event {
-                    topic: topic.to_owned(),
-                    partition,
-                    offset: r.offset,
-                    timestamp: r.timestamp,
-                    key: r.key,
-                    value: r.value,
-                    headers: r.headers.into_iter().map(|h| (h.key, h.value)).collect(),
-                })
-                .collect(),
+            events: result.records,
             next_offset: result.next_offset,
             high_watermark: result.high_watermark,
         })

@@ -50,10 +50,14 @@ impl Default for FindCoordinatorRequest {
 }
 
 impl FindCoordinatorRequest {
+    /// This message's api key in Kafka's registry.
     pub const API_KEY: i16 = 10;
+    /// The lowest schema version this snapshot can speak.
     pub const MIN_VERSION: i16 = 0;
+    /// The highest schema version this snapshot can speak.
     pub const MAX_VERSION: i16 = 6;
 
+    /// Encode this `FindCoordinatorRequest` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version <= 3 {
             if is_flexible(version) {

@@ -47,10 +47,14 @@ impl Default for OffsetCommitResponse {
 }
 
 impl OffsetCommitResponse {
+    /// This message's api key in Kafka's registry.
     pub const API_KEY: i16 = 8;
+    /// The lowest schema version this snapshot can speak.
     pub const MIN_VERSION: i16 = 2;
+    /// The highest schema version this snapshot can speak.
     pub const MAX_VERSION: i16 = 10;
 
+    /// Encode this `OffsetCommitResponse` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version >= 3 {
             buf.put_i32(self.throttle_time_ms);
@@ -169,6 +173,7 @@ impl Default for OffsetCommitResponseTopic {
 }
 
 impl OffsetCommitResponseTopic {
+    /// Encode this `OffsetCommitResponseTopic` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version <= 9 {
             if is_flexible(version) {
@@ -279,6 +284,7 @@ impl Default for OffsetCommitResponsePartition {
 }
 
 impl OffsetCommitResponsePartition {
+    /// Encode this `OffsetCommitResponsePartition` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         buf.put_i32(self.partition_index);
         buf.put_i16(self.error_code);

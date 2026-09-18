@@ -44,10 +44,14 @@ impl Default for SaslAuthenticateRequest {
 }
 
 impl SaslAuthenticateRequest {
+    /// This message's api key in Kafka's registry.
     pub const API_KEY: i16 = 36;
+    /// The lowest schema version this snapshot can speak.
     pub const MIN_VERSION: i16 = 0;
+    /// The highest schema version this snapshot can speak.
     pub const MAX_VERSION: i16 = 2;
 
+    /// Encode this `SaslAuthenticateRequest` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if is_flexible(version) {
             wire::put_compact_bytes(buf, &self.auth_bytes);

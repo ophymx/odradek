@@ -53,10 +53,14 @@ impl Default for ProduceRequest {
 }
 
 impl ProduceRequest {
+    /// This message's api key in Kafka's registry.
     pub const API_KEY: i16 = 0;
+    /// The lowest schema version this snapshot can speak.
     pub const MIN_VERSION: i16 = 3;
+    /// The highest schema version this snapshot can speak.
     pub const MAX_VERSION: i16 = 13;
 
+    /// Encode this `ProduceRequest` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if is_flexible(version) {
             wire::put_compact_nullable_string(buf, self.transactional_id.as_deref());
@@ -182,6 +186,7 @@ impl Default for TopicProduceData {
 }
 
 impl TopicProduceData {
+    /// Encode this `TopicProduceData` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version <= 12 {
             if is_flexible(version) {
@@ -290,6 +295,7 @@ impl Default for PartitionProduceData {
 }
 
 impl PartitionProduceData {
+    /// Encode this `PartitionProduceData` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         buf.put_i32(self.index);
         if is_flexible(version) {

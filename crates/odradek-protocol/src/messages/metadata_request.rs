@@ -53,10 +53,14 @@ impl Default for MetadataRequest {
 }
 
 impl MetadataRequest {
+    /// This message's api key in Kafka's registry.
     pub const API_KEY: i16 = 3;
+    /// The lowest schema version this snapshot can speak.
     pub const MIN_VERSION: i16 = 0;
+    /// The highest schema version this snapshot can speak.
     pub const MAX_VERSION: i16 = 13;
 
+    /// Encode this `MetadataRequest` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         match &self.topics {
             Some(items) => {
@@ -202,6 +206,7 @@ impl Default for MetadataRequestTopic {
 }
 
 impl MetadataRequestTopic {
+    /// Encode this `MetadataRequestTopic` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version >= 10 {
             wire::put_uuid(buf, self.topic_id);

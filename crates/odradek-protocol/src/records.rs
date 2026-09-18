@@ -516,7 +516,28 @@ pub fn decode_set_with_budget(
     }
 }
 
+/// Encode a record set into a [`BytesMut`], in place.
+///
+/// The counterpart to [`RecordBatch::encode_to`], and preferred for the
+/// same reason: [`encode_set`] has to take a generic destination, which
+/// cannot be read back, so it stages every batch through a scratch
+/// buffer and copies it across. Here the crc is computed over the bytes
+/// where they already sit.
+///
+/// On error `buf` keeps whatever whole batches preceded the failure;
+/// the failing batch leaves nothing behind, since
+/// [`RecordBatch::encode_to`] rolls itself back.
+pub fn encode_set_to(buf: &mut BytesMut, batches: &[RecordBatch]) -> Result<(), EncodeError> {
+    for batch in batches {
+        batch.encode_to(buf)?;
+    }
+    Ok(())
+}
+
 /// Encode a record set: batches back to back.
+///
+/// Prefer [`encode_set_to`] when the destination is a [`BytesMut`]; see
+/// there for what this one costs.
 pub fn encode_set(buf: &mut impl BufMut, batches: &[RecordBatch]) -> Result<(), EncodeError> {
     // One scratch buffer for the whole set, reused batch to batch: a
     // generic BufMut cannot be read back, and the crc must be written

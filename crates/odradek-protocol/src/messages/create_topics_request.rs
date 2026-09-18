@@ -50,10 +50,14 @@ impl Default for CreateTopicsRequest {
 }
 
 impl CreateTopicsRequest {
+    /// This message's api key in Kafka's registry.
     pub const API_KEY: i16 = 19;
+    /// The lowest schema version this snapshot can speak.
     pub const MIN_VERSION: i16 = 2;
+    /// The highest schema version this snapshot can speak.
     pub const MAX_VERSION: i16 = 7;
 
+    /// Encode this `CreateTopicsRequest` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if is_flexible(version) {
             wire::put_compact_array_len(buf, Some(self.topics.len()));
@@ -175,6 +179,7 @@ impl Default for CreatableTopic {
 }
 
 impl CreatableTopic {
+    /// Encode this `CreatableTopic` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if is_flexible(version) {
             wire::put_compact_string(buf, &self.name);
@@ -306,6 +311,7 @@ impl Default for CreatableReplicaAssignment {
 }
 
 impl CreatableReplicaAssignment {
+    /// Encode this `CreatableReplicaAssignment` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         buf.put_i32(self.partition_index);
         if is_flexible(version) {
@@ -393,6 +399,7 @@ impl Default for CreatableTopicConfig {
 }
 
 impl CreatableTopicConfig {
+    /// Encode this `CreatableTopicConfig` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if is_flexible(version) {
             wire::put_compact_string(buf, &self.name);

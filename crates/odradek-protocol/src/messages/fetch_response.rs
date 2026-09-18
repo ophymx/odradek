@@ -60,10 +60,14 @@ impl Default for FetchResponse {
 }
 
 impl FetchResponse {
+    /// This message's api key in Kafka's registry.
     pub const API_KEY: i16 = 1;
+    /// The lowest schema version this snapshot can speak.
     pub const MIN_VERSION: i16 = 4;
+    /// The highest schema version this snapshot can speak.
     pub const MAX_VERSION: i16 = 18;
 
+    /// Encode this `FetchResponse` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         buf.put_i32(self.throttle_time_ms);
         if version >= 7 {
@@ -245,6 +249,7 @@ impl Default for FetchableTopicResponse {
 }
 
 impl FetchableTopicResponse {
+    /// Encode this `FetchableTopicResponse` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version <= 12 {
             if is_flexible(version) {
@@ -383,6 +388,7 @@ impl Default for PartitionData {
 }
 
 impl PartitionData {
+    /// Encode this `PartitionData` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         buf.put_i32(self.partition_index);
         buf.put_i16(self.error_code);
@@ -586,6 +592,7 @@ impl Default for EpochEndOffset {
 }
 
 impl EpochEndOffset {
+    /// Encode this `EpochEndOffset` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version >= 12 {
             buf.put_i32(self.epoch);
@@ -658,6 +665,7 @@ impl Default for LeaderIdAndEpoch {
 }
 
 impl LeaderIdAndEpoch {
+    /// Encode this `LeaderIdAndEpoch` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version >= 12 {
             buf.put_i32(self.leader_id);
@@ -730,6 +738,7 @@ impl Default for SnapshotId {
 }
 
 impl SnapshotId {
+    /// Encode this `SnapshotId` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         buf.put_i64(self.end_offset);
         buf.put_i32(self.epoch);
@@ -794,6 +803,7 @@ impl Default for AbortedTransaction {
 }
 
 impl AbortedTransaction {
+    /// Encode this `AbortedTransaction` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         buf.put_i64(self.producer_id);
         buf.put_i64(self.first_offset);
@@ -864,6 +874,7 @@ impl Default for NodeEndpoint {
 }
 
 impl NodeEndpoint {
+    /// Encode this `NodeEndpoint` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version >= 16 {
             buf.put_i32(self.node_id);

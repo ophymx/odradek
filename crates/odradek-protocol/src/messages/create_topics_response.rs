@@ -50,10 +50,14 @@ impl Default for CreateTopicsResponse {
 }
 
 impl CreateTopicsResponse {
+    /// This message's api key in Kafka's registry.
     pub const API_KEY: i16 = 19;
+    /// The lowest schema version this snapshot can speak.
     pub const MIN_VERSION: i16 = 2;
+    /// The highest schema version this snapshot can speak.
     pub const MAX_VERSION: i16 = 7;
 
+    /// Encode this `CreateTopicsResponse` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         buf.put_i32(self.throttle_time_ms);
         if is_flexible(version) {
@@ -183,6 +187,7 @@ impl Default for CreatableTopicResult {
 }
 
 impl CreatableTopicResult {
+    /// Encode this `CreatableTopicResult` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if is_flexible(version) {
             wire::put_compact_string(buf, &self.name);
@@ -364,6 +369,7 @@ impl Default for CreatableTopicConfigs {
 }
 
 impl CreatableTopicConfigs {
+    /// Encode this `CreatableTopicConfigs` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version >= 5 {
             if is_flexible(version) {

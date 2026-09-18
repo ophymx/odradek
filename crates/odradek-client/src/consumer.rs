@@ -154,10 +154,16 @@ pub struct ConsumedRecord {
 }
 
 /// What one fetch returned.
+///
+/// The record type is a parameter so a caller with its own record shape
+/// can be handed records as they are materialized, rather than being
+/// given a `Vec<ConsumedRecord>` to walk and throw away. See
+/// [`Consumer::fetch_with`]. The default keeps `FetchResult` meaning
+/// what it says for everyone else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct FetchResult {
-    pub records: Vec<ConsumedRecord>,
+pub struct FetchResult<R = ConsumedRecord> {
+    pub records: Vec<R>,
     /// Where the next fetch should start.
     pub next_offset: i64,
     pub high_watermark: i64,
@@ -191,13 +197,37 @@ impl Consumer {
         partition: i32,
         offset: i64,
     ) -> Result<FetchResult, ClientError> {
+        self.fetch_with(topic, partition, offset, |record| record)
+            .await
+    }
+
+    /// Fetch, converting each record as it is materialized.
+    ///
+    /// [`fetch`](Consumer::fetch) is this with the identity function.
+    /// Use this one when the records are headed for a type of your own:
+    /// the alternative is a `Vec<ConsumedRecord>` built in full, walked
+    /// once to convert, and dropped — an allocation and a move of every
+    /// record, spent on a buffer nobody reads.
+    ///
+    /// `map` runs inside the fetch's retry loop, so it may run more than
+    /// once for one call and must not carry state that a second attempt
+    /// would corrupt. A plain conversion is the intended shape; the
+    /// [`Fn`] bound rather than [`FnMut`] is there to say so.
+    pub async fn fetch_with<R: Send>(
+        &self,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+        map: impl Fn(ConsumedRecord) -> R + Sync,
+    ) -> Result<FetchResult<R>, ClientError> {
+        let map = &map;
         retry_loop(
             &mut &*self,
             self.config.max_attempts,
             self.config.retry_backoff,
             |this| {
                 Box::pin(async move {
-                    let result = this.fetch_once(topic, partition, offset).await;
+                    let result = this.fetch_once(topic, partition, offset, map).await;
                     or_mark_stale(&this.cluster, topic, partition, result)
                 })
             },
@@ -292,12 +322,13 @@ impl Consumer {
         .await
     }
 
-    async fn fetch_once(
+    async fn fetch_once<R>(
         &self,
         topic: &str,
         partition: i32,
         offset: i64,
-    ) -> Result<FetchResult, ClientError> {
+        map: &(impl Fn(ConsumedRecord) -> R + Sync),
+    ) -> Result<FetchResult<R>, ClientError> {
         // Long-poll fetches hold their connection for up to max_wait_ms;
         // a leased connection keeps them off the shared fast lane.
         let lease = self
@@ -386,11 +417,19 @@ impl Consumer {
                 Records::Plain(plain) => {
                     budget.claim_records(plain.len())?;
                     for record in plain {
-                        push_record(&mut records, batch, record.clone(), offset);
+                        push_record(&mut records, batch, record.clone(), offset, map);
                     }
                 }
                 Records::Compressed { count, payload } => {
-                    decode_compressed(&mut records, &mut budget, batch, *count, payload, offset)?;
+                    decode_compressed(
+                        &mut records,
+                        &mut budget,
+                        batch,
+                        *count,
+                        payload,
+                        offset,
+                        map,
+                    )?;
                 }
             }
         }
@@ -493,13 +532,14 @@ impl FetchBudget {
 /// the peak for no benefit, since every record here is consumed exactly
 /// once. The payload bytes are not copied — keys and values are slices
 /// of the decompressed buffer.
-fn decode_compressed(
-    out: &mut Vec<ConsumedRecord>,
+fn decode_compressed<R>(
+    out: &mut Vec<R>,
     budget: &mut FetchBudget,
     batch: &odradek_protocol::records::RecordBatch,
     count: i32,
     payload: &[u8],
     min_offset: i64,
+    map: &(impl Fn(ConsumedRecord) -> R + Sync),
 ) -> Result<(), ClientError> {
     let count = usize::try_from(count).map_err(|_| {
         ClientError::ProtocolViolation(format!("batch claims a negative record count ({count})"))
@@ -521,7 +561,7 @@ fn decode_compressed(
     budget.claim_records(count)?;
     for _ in 0..count {
         let record = Record::decode(&mut data)?;
-        push_record(out, batch, record, min_offset);
+        push_record(out, batch, record, min_offset, map);
     }
     if !data.is_empty() {
         return Err(ClientError::ProtocolViolation(format!(
@@ -534,11 +574,12 @@ fn decode_compressed(
 
 /// Give `record` its absolute coordinates and keep it, unless it
 /// predates the requested offset.
-fn push_record(
-    out: &mut Vec<ConsumedRecord>,
+fn push_record<R>(
+    out: &mut Vec<R>,
     batch: &odradek_protocol::records::RecordBatch,
     record: Record,
     min_offset: i64,
+    map: &(impl Fn(ConsumedRecord) -> R + Sync),
 ) {
     let absolute = batch.base_offset + i64::from(record.offset_delta);
     if absolute < min_offset {
@@ -546,13 +587,13 @@ fn push_record(
         // requested offset.
         return;
     }
-    out.push(ConsumedRecord {
+    out.push(map(ConsumedRecord {
         offset: absolute,
         timestamp: batch.base_timestamp + record.timestamp_delta,
         key: record.key,
         value: record.value,
         headers: record.headers,
-    });
+    }));
 }
 
 #[cfg(test)]
@@ -560,6 +601,11 @@ mod tests {
     use odradek_protocol::records::{Compression, RecordBatch};
 
     use super::*;
+
+    /// The mapper `Consumer::fetch` itself uses: keep the record as-is.
+    fn keep(record: ConsumedRecord) -> ConsumedRecord {
+        record
+    }
 
     fn budget() -> FetchBudget {
         FetchBudget {
@@ -588,8 +634,16 @@ mod tests {
         // Compression::None keeps this test independent of which codec
         // features are built; the count check is codec-agnostic.
         let payload = b"a short payload";
-        let err =
-            decode_compressed(&mut out, &mut budget(), &batch, 19_173_961, payload, 0).unwrap_err();
+        let err = decode_compressed(
+            &mut out,
+            &mut budget(),
+            &batch,
+            19_173_961,
+            payload,
+            0,
+            &keep,
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, ClientError::ProtocolViolation(m) if m.contains("can hold at most 2")),
             "unexpected error: {err}"
@@ -615,6 +669,7 @@ mod tests {
             10,
             &payload,
             0,
+            &keep,
         )
         .unwrap_err();
         assert!(
@@ -639,6 +694,7 @@ mod tests {
             1,
             &payload,
             0,
+            &keep,
         )
         .unwrap_err();
         assert!(
@@ -678,7 +734,7 @@ mod tests {
 
         let mut out = Vec::new();
         let mut spent = budget();
-        decode_compressed(&mut out, &mut spent, &batch, 2, &payload, 0).unwrap();
+        decode_compressed(&mut out, &mut spent, &batch, 2, &payload, 0, &keep).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].offset, 100);
         assert_eq!(out[0].timestamp, 1_005);
@@ -690,7 +746,7 @@ mod tests {
 
         // Records below the requested offset are skipped, not an error.
         let mut out = Vec::new();
-        decode_compressed(&mut out, &mut budget(), &batch, 2, &payload, 101).unwrap();
+        decode_compressed(&mut out, &mut budget(), &batch, 2, &payload, 101, &keep).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].offset, 101);
     }
@@ -704,6 +760,7 @@ mod tests {
             -1,
             b"",
             0,
+            &keep,
         )
         .unwrap_err();
         assert!(matches!(err, ClientError::ProtocolViolation(_)));

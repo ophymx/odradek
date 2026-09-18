@@ -47,9 +47,12 @@ impl Default for ConsumerProtocolAssignment {
 }
 
 impl ConsumerProtocolAssignment {
+    /// The lowest schema version this snapshot can speak.
     pub const MIN_VERSION: i16 = 0;
+    /// The highest schema version this snapshot can speak.
     pub const MAX_VERSION: i16 = 3;
 
+    /// Encode this `ConsumerProtocolAssignment` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if is_flexible(version) {
             wire::put_compact_array_len(buf, Some(self.assigned_partitions.len()));
@@ -148,6 +151,7 @@ impl Default for TopicPartition {
 }
 
 impl TopicPartition {
+    /// Encode this `TopicPartition` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if is_flexible(version) {
             wire::put_compact_string(buf, &self.topic);

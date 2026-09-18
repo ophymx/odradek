@@ -62,10 +62,14 @@ impl Default for MetadataResponse {
 }
 
 impl MetadataResponse {
+    /// This message's api key in Kafka's registry.
     pub const API_KEY: i16 = 3;
+    /// The lowest schema version this snapshot can speak.
     pub const MIN_VERSION: i16 = 0;
+    /// The highest schema version this snapshot can speak.
     pub const MAX_VERSION: i16 = 13;
 
+    /// Encode this `MetadataResponse` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version >= 3 {
             buf.put_i32(self.throttle_time_ms);
@@ -247,6 +251,7 @@ impl Default for MetadataResponseBroker {
 }
 
 impl MetadataResponseBroker {
+    /// Encode this `MetadataResponseBroker` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         buf.put_i32(self.node_id);
         if is_flexible(version) {
@@ -347,6 +352,7 @@ impl Default for MetadataResponseTopic {
 }
 
 impl MetadataResponseTopic {
+    /// Encode this `MetadataResponseTopic` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         buf.put_i16(self.error_code);
         if self.name.is_none() && !(version >= 12) {
@@ -490,6 +496,7 @@ impl Default for MetadataResponsePartition {
 }
 
 impl MetadataResponsePartition {
+    /// Encode this `MetadataResponsePartition` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         buf.put_i16(self.error_code);
         buf.put_i32(self.partition_index);

@@ -53,9 +53,12 @@ impl Default for RequestHeader {
 }
 
 impl RequestHeader {
+    /// The lowest schema version this snapshot can speak.
     pub const MIN_VERSION: i16 = 1;
+    /// The highest schema version this snapshot can speak.
     pub const MAX_VERSION: i16 = 2;
 
+    /// Encode this `RequestHeader` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         buf.put_i16(self.request_api_key);
         buf.put_i16(self.request_api_version);

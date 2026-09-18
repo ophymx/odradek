@@ -54,10 +54,14 @@ impl Default for ProduceResponse {
 }
 
 impl ProduceResponse {
+    /// This message's api key in Kafka's registry.
     pub const API_KEY: i16 = 0;
+    /// The lowest schema version this snapshot can speak.
     pub const MIN_VERSION: i16 = 3;
+    /// The highest schema version this snapshot can speak.
     pub const MAX_VERSION: i16 = 13;
 
+    /// Encode this `ProduceResponse` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if is_flexible(version) {
             wire::put_compact_array_len(buf, Some(self.responses.len()));
@@ -226,6 +230,7 @@ impl Default for TopicProduceResponse {
 }
 
 impl TopicProduceResponse {
+    /// Encode this `TopicProduceResponse` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version <= 12 {
             if is_flexible(version) {
@@ -354,6 +359,7 @@ impl Default for PartitionProduceResponse {
 }
 
 impl PartitionProduceResponse {
+    /// Encode this `PartitionProduceResponse` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         buf.put_i32(self.index);
         buf.put_i16(self.error_code);
@@ -505,6 +511,7 @@ impl Default for BatchIndexAndErrorMessage {
 }
 
 impl BatchIndexAndErrorMessage {
+    /// Encode this `BatchIndexAndErrorMessage` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version >= 8 {
             buf.put_i32(self.batch_index);
@@ -585,6 +592,7 @@ impl Default for LeaderIdAndEpoch {
 }
 
 impl LeaderIdAndEpoch {
+    /// Encode this `LeaderIdAndEpoch` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version >= 10 {
             buf.put_i32(self.leader_id);
@@ -663,6 +671,7 @@ impl Default for NodeEndpoint {
 }
 
 impl NodeEndpoint {
+    /// Encode this `NodeEndpoint` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version >= 10 {
             buf.put_i32(self.node_id);

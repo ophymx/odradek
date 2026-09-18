@@ -82,10 +82,14 @@ impl Default for FetchRequest {
 }
 
 impl FetchRequest {
+    /// This message's api key in Kafka's registry.
     pub const API_KEY: i16 = 1;
+    /// The lowest schema version this snapshot can speak.
     pub const MIN_VERSION: i16 = 4;
+    /// The highest schema version this snapshot can speak.
     pub const MAX_VERSION: i16 = 18;
 
+    /// Encode this `FetchRequest` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version <= 14 {
             buf.put_i32(self.replica_id);
@@ -325,6 +329,7 @@ impl Default for ReplicaState {
 }
 
 impl ReplicaState {
+    /// Encode this `ReplicaState` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version >= 15 {
             buf.put_i32(self.replica_id);
@@ -400,6 +405,7 @@ impl Default for FetchTopic {
 }
 
 impl FetchTopic {
+    /// Encode this `FetchTopic` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version <= 12 {
             if is_flexible(version) {
@@ -528,6 +534,7 @@ impl Default for FetchPartition {
 }
 
 impl FetchPartition {
+    /// Encode this `FetchPartition` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         buf.put_i32(self.partition);
         if version >= 9 {
@@ -665,6 +672,7 @@ impl Default for ForgottenTopic {
 }
 
 impl ForgottenTopic {
+    /// Encode this `ForgottenTopic` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if (7..=12).contains(&version) {
             if is_flexible(version) {

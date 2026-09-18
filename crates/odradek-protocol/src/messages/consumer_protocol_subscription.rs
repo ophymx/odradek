@@ -56,9 +56,12 @@ impl Default for ConsumerProtocolSubscription {
 }
 
 impl ConsumerProtocolSubscription {
+    /// The lowest schema version this snapshot can speak.
     pub const MIN_VERSION: i16 = 0;
+    /// The highest schema version this snapshot can speak.
     pub const MAX_VERSION: i16 = 3;
 
+    /// Encode this `ConsumerProtocolSubscription` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if is_flexible(version) {
             wire::put_compact_array_len(buf, Some(self.topics.len()));
@@ -217,6 +220,7 @@ impl Default for TopicPartition {
 }
 
 impl TopicPartition {
+    /// Encode this `TopicPartition` at `version`.
     pub fn encode(&self, buf: &mut impl BufMut, version: i16) -> Result<(), EncodeError> {
         if version >= 1 {
             if is_flexible(version) {
