@@ -43,6 +43,9 @@ struct Subject {
     /// Whether this subject serves a second, SASL-configured listener on
     /// 9094. Without one the `sasl/*` checks that need it skip.
     sasl_listener: bool,
+    /// Commands to run inside the container once it is ready, before the
+    /// suite starts — for state that cannot be configured at boot.
+    provision: &'static [&'static [&'static str]],
 }
 
 /// The subject matrix. The container must expose its plaintext Kafka
@@ -64,28 +67,46 @@ const SUBJECTS: &[Subject] = &[
             "-e",
             "KAFKA_PROCESS_ROLES=broker,controller",
             "-e",
-            "KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,SASL://0.0.0.0:9094",
+            "KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,SASL://0.0.0.0:9094,INTERNAL://0.0.0.0:9099",
             "-e",
-            "KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:{port},SASL://127.0.0.1:{sasl_port}",
+            "KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:{port},SASL://127.0.0.1:{sasl_port},INTERNAL://localhost:9099",
             "-e",
             "KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER",
             "-e",
-            "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,SASL:SASL_PLAINTEXT",
+            "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,SASL:SASL_PLAINTEXT,INTERNAL:PLAINTEXT",
             "-e",
-            "KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT",
+            "KAFKA_INTER_BROKER_LISTENER_NAME=INTERNAL",
             "-e",
-            "KAFKA_SASL_ENABLED_MECHANISMS=PLAIN",
-            // The credentials are never used: no check authenticates.
-            // They exist so the listener has a mechanism to name when it
-            // refuses one it does not have.
+            "KAFKA_SASL_ENABLED_MECHANISMS=SCRAM-SHA-256",
+            // SCRAM keeps its credentials in the metadata log rather
+            // than in this config, but the broker still refuses to start
+            // without a login module named for the mechanism.
             "-e",
-            "KAFKA_LISTENER_NAME_SASL_PLAIN_SASL_JAAS_CONFIG=org.apache.kafka.common.security.plain.PlainLoginModule required username=\"conformance\" password=\"conformance\" user_conformance=\"conformance\";",
+            "KAFKA_LISTENER_NAME_SASL_SCRAM-SHA-256_SASL_JAAS_CONFIG=org.apache.kafka.common.security.scram.ScramLoginModule required;",
             "-e",
             "KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093",
             "-e",
             "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1",
         ],
         sasl_listener: true,
+        // SCRAM credentials live in the metadata log, so they are added
+        // after the broker is up rather than configured into it.
+        provision: &[&[
+            "/opt/kafka/bin/kafka-configs.sh",
+            // The INTERNAL listener, not the published one: the
+            // published listener advertises a host address that is not
+            // reachable from inside the container, so a tool run here
+            // would be told to connect somewhere it cannot.
+            "--bootstrap-server",
+            "localhost:9099",
+            "--alter",
+            "--add-config",
+            "SCRAM-SHA-256=[password=conformance]",
+            "--entity-type",
+            "users",
+            "--entity-name",
+            "conformance",
+        ]],
     },
     Subject {
         name: "redpanda-25.2.1",
@@ -114,6 +135,7 @@ const SUBJECTS: &[Subject] = &[
             // this configuration can be asked.
         ],
         sasl_listener: false,
+        provision: &[],
     },
 ];
 
@@ -226,6 +248,12 @@ fn run_subject(
         return Err(e);
     }
 
+    for command in subject.provision {
+        container
+            .exec(command)
+            .with_context(|| format!("provisioning {} with {:?}", subject.name, command))?;
+    }
+
     let baseline = conf_dir.join(format!("{}.json", subject.name));
     let mut cmd = Command::new(accept);
     cmd.args(["--server", &addr]);
@@ -312,6 +340,28 @@ impl Container {
             );
         }
         Ok(Container { name })
+    }
+
+    /// Run a command inside the container, failing loudly if it does.
+    ///
+    /// Provisioning that silently failed would leave the SASL checks
+    /// skipping or failing for a reason that looks like the subject's
+    /// fault, so this reports the command's own output.
+    fn exec(&self, command: &[&str]) -> Result<()> {
+        let mut args: Vec<&str> = vec!["exec", &self.name];
+        args.extend_from_slice(command);
+        let out = Command::new("docker")
+            .args(&args)
+            .output()
+            .context("running docker exec")?;
+        if !out.status.success() {
+            bail!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout).trim(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
     }
 
     fn dump_logs(&self, log: &mut String) {

@@ -84,6 +84,14 @@ the ones where the *wrong* answer is plausible:
   `ILLEGAL_SASL_STATE`: "your sequence is wrong", not "your credentials
   are wrong". A client told the latter retries the same broken sequence
   forever.
+- A SCRAM server nonce must *extend* the client's, not replace it. The
+  client's nonce is its only evidence that an answer is not a recording
+  of an older exchange.
+- The iteration count a SCRAM server states is one the client must spend
+  before it learns anything, and cannot refuse without failing to
+  connect, so it has a floor (RFC 7677: 4096).
+- A SCRAM exchange ends with a server signature, or the client has
+  authenticated itself to whatever answered the socket and cannot tell.
 
 Five checks sweep **every version the subject advertises** rather than
 negotiating one and stopping. Against Kafka 4.1 that is 13 Metadata

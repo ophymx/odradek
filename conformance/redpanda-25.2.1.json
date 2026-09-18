@@ -28,6 +28,9 @@
     "produce/basic": "pass",
     "produce/topic-id": "skipped",
     "sasl/authenticate-requires-handshake": "pass",
-    "sasl/refusal-names-mechanisms": "skipped"
+    "sasl/refusal-names-mechanisms": "skipped",
+    "sasl/scram-iteration-floor": "skipped",
+    "sasl/scram-nonce-extends-client": "skipped",
+    "sasl/scram-server-proves-itself": "skipped"
   }
 }

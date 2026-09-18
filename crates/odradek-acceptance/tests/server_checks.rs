@@ -141,6 +141,15 @@ const SENSITIVITY: &[(Fault, &str)] = &[
         Fault::SaslHandshakeHidesMechanisms,
         "sasl/refusal-names-mechanisms",
     ),
+    (
+        Fault::ScramNonceReplacesClients,
+        "sasl/scram-nonce-extends-client",
+    ),
+    (Fault::ScramWeakIterations, "sasl/scram-iteration-floor"),
+    (
+        Fault::ScramSkipsServerSignature,
+        "sasl/scram-server-proves-itself",
+    ),
 ];
 
 /// The calibration registry is exhaustive in both directions against the

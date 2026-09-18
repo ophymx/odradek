@@ -648,11 +648,15 @@ dependencies = [
 name = "odradek-acceptance"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
+ "hmac",
  "odradek-client",
  "odradek-protocol",
+ "pbkdf2",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
 ]

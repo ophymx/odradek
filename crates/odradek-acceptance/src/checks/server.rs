@@ -241,6 +241,24 @@ pub static SERVER_CHECKS: &[Check] = &[
                       support, so a client has something to fall back to",
         runner: Runner::Server(|ctx| Box::pin(sasl_refusal_names_mechanisms(ctx))),
     },
+    Check {
+        id: "sasl/scram-nonce-extends-client",
+        requirement: "answers a SCRAM client-first with a nonce that begins with \
+                      the client's own, rather than replacing it",
+        runner: Runner::Server(|ctx| Box::pin(scram_nonce_extends_client(ctx))),
+    },
+    Check {
+        id: "sasl/scram-iteration-floor",
+        requirement: "states a salt and an iteration count at or above RFC 7677's \
+                      floor of 4096 for SCRAM-SHA-256",
+        runner: Runner::Server(|ctx| Box::pin(scram_iteration_floor(ctx))),
+    },
+    Check {
+        id: "sasl/scram-server-proves-itself",
+        requirement: "completes a SCRAM exchange with a server signature that \
+                      verifies, proving it holds the account's key material",
+        runner: Runner::Server(|ctx| Box::pin(scram_server_proves_itself(ctx))),
+    },
 ];
 
 /// Limits for one server-side run.
@@ -1190,6 +1208,318 @@ async fn api_call<T: Message>(
         body,
     )
     .await
+}
+
+/// The account the suite authenticates as. The reference subject knows
+/// it, and the conformance harness provisions it on the brokers that get
+/// a SASL listener.
+pub const SCRAM_USER: &str = "conformance";
+pub const SCRAM_PASSWORD: &str = "conformance";
+
+/// One `k=v` attribute of a SCRAM message.
+fn scram_attr(message: &str, key: char) -> Option<String> {
+    message.split(',').find_map(|part| {
+        let mut chars = part.chars();
+        let found = chars.next()?;
+        let rest = chars.as_str().strip_prefix('=')?;
+        (found == key).then(|| rest.to_owned())
+    })
+}
+
+fn b64_decode(value: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.decode(value).ok()
+}
+
+/// The client-side keys of a SCRAM exchange.
+struct ScramKeys {
+    client_key: [u8; 32],
+    stored_key: [u8; 32],
+    server_key: [u8; 32],
+}
+
+fn scram_hmac(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac takes any key length");
+    mac.update(msg);
+    mac.finalize().into_bytes().into()
+}
+
+fn scram_keys(password: &str, salt: &[u8], iterations: u32) -> ScramKeys {
+    use hmac::SimpleHmac;
+    use sha2::{Digest, Sha256};
+    let mut salted = [0u8; 32];
+    pbkdf2::pbkdf2::<SimpleHmac<Sha256>>(password.as_bytes(), salt, iterations, &mut salted)
+        .expect("pbkdf2 accepts any output length");
+    let client_key = scram_hmac(&salted, b"Client Key");
+    ScramKeys {
+        client_key,
+        stored_key: Sha256::digest(client_key).into(),
+        server_key: scram_hmac(&salted, b"Server Key"),
+    }
+}
+
+fn scram_client_proof(keys: &ScramKeys, auth_message: &str) -> String {
+    use base64::Engine as _;
+    let signature = scram_hmac(&keys.stored_key, auth_message.as_bytes());
+    let mut proof = [0u8; 32];
+    for (i, byte) in proof.iter_mut().enumerate() {
+        *byte = keys.client_key[i] ^ signature[i];
+    }
+    base64::engine::general_purpose::STANDARD.encode(proof)
+}
+
+fn scram_server_signature(keys: &ScramKeys, auth_message: &str) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .encode(scram_hmac(&keys.server_key, auth_message.as_bytes()))
+}
+
+/// The SCRAM mechanism these checks speak.
+const SCRAM_MECHANISM: &str = "SCRAM-SHA-256";
+
+/// Begin a SCRAM exchange: handshake, then client-first.
+///
+/// Returns `(connection, client nonce, client-first-bare, server-first)`,
+/// or a verdict — `Skipped` when this subject has no SASL listener or
+/// does not offer SCRAM, which is a capability statement rather than a
+/// failure.
+async fn scram_begin(
+    ctx: &ServerCtx,
+    correlation_base: i32,
+) -> Result<(RawConnection, String, String, String), Verdict> {
+    let Some(sasl_addr) = ctx.sasl_addr.clone() else {
+        return Err(Verdict::Skipped {
+            reason: "no SASL listener given (--sasl-server)".into(),
+        });
+    };
+    let handshake_version = negotiate(
+        "SaslHandshake",
+        ctx.range(SaslHandshakeRequest::API_KEY)?,
+        SaslHandshakeRequest::MIN_VERSION,
+        SaslHandshakeRequest::MAX_VERSION,
+    )?;
+    let auth_version = negotiate(
+        "SaslAuthenticate",
+        ctx.range(SaslAuthenticateRequest::API_KEY)?,
+        SaslAuthenticateRequest::MIN_VERSION,
+        SaslAuthenticateRequest::MAX_VERSION,
+    )?;
+    let mut conn = connect(&sasl_addr)
+        .await
+        .map_err(CheckError::into_verdict)?;
+
+    let mut handshake = SaslHandshakeRequest::default();
+    handshake.mechanism = SCRAM_MECHANISM.to_owned();
+    let mut body = BytesMut::new();
+    handshake
+        .encode(&mut body, handshake_version)
+        .map_err(|e| Verdict::Error {
+            details: format!("encoding SaslHandshake: {e}"),
+        })?;
+    let resp: SaslHandshakeResponse = api_call(
+        &mut conn,
+        SaslHandshakeRequest::API_KEY,
+        handshake_version,
+        correlation_base,
+        &body,
+    )
+    .await
+    .map_err(CheckError::into_verdict)?;
+    let code = ErrorCode(resp.error_code);
+    if code != ErrorCode(0) {
+        return Err(Verdict::Skipped {
+            reason: format!("{sasl_addr} does not offer {SCRAM_MECHANISM} ({code})"),
+        });
+    }
+
+    // A nonce this exchange has never used. Printable, per RFC 5802,
+    // and unique enough that a recorded answer could not contain it.
+    let nonce = format!(
+        "odradekNonce{}{}",
+        std::process::id(),
+        correlation_base as u32
+    );
+    let client_first_bare = format!("n={SCRAM_USER},r={nonce}");
+    let client_first = format!("n,,{client_first_bare}");
+    let server_first = scram_token(
+        &mut conn,
+        auth_version,
+        client_first.as_bytes(),
+        correlation_base + 1,
+    )
+    .await?;
+    Ok((conn, nonce, client_first_bare, server_first))
+}
+
+/// Send one SASL token and return the server's, as text.
+async fn scram_token(
+    conn: &mut RawConnection,
+    version: i16,
+    token: &[u8],
+    correlation_id: i32,
+) -> Result<String, Verdict> {
+    let mut request = SaslAuthenticateRequest::default();
+    request.auth_bytes = Bytes::copy_from_slice(token);
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| Verdict::Error {
+            details: format!("encoding SaslAuthenticate: {e}"),
+        })?;
+    let resp: SaslAuthenticateResponse = api_call(
+        conn,
+        SaslAuthenticateRequest::API_KEY,
+        version,
+        correlation_id,
+        &body,
+    )
+    .await
+    .map_err(CheckError::into_verdict)?;
+    let code = ErrorCode(resp.error_code);
+    if !code.is_ok() {
+        return Err(Verdict::Fail {
+            details: format!(
+                "SCRAM exchange answered {code}{}",
+                resp.error_message
+                    .as_deref()
+                    .map(|m| format!(": {m}"))
+                    .unwrap_or_default()
+            ),
+        });
+    }
+    Ok(String::from_utf8_lossy(&resp.auth_bytes).into_owned())
+}
+
+/// The server's nonce must begin with the client's.
+///
+/// The client picked a nonce it has never used. A server answer that
+/// does not contain it might be a recording of an earlier exchange, and
+/// the nonce is the only thing in the protocol that could tell the
+/// client otherwise — so a server that replaces it rather than extending
+/// it has removed the client's only replay defence, while still looking
+/// like it is working.
+async fn scram_nonce_extends_client(ctx: &ServerCtx) -> Verdict {
+    let (_conn, nonce, _bare, server_first) = match scram_begin(ctx, 210).await {
+        Ok(v) => v,
+        Err(verdict) => return verdict,
+    };
+    let Some(server_nonce) = scram_attr(&server_first, 'r') else {
+        return Verdict::Fail {
+            details: format!("server-first carries no nonce: {server_first:?}"),
+        };
+    };
+    if server_nonce.starts_with(&nonce) {
+        Verdict::Pass
+    } else {
+        Verdict::Fail {
+            details: format!(
+                "client sent nonce {nonce:?}; server answered {server_nonce:?}, which does \
+                 not extend it, so the client cannot tell this exchange from a replay"
+            ),
+        }
+    }
+}
+
+/// The stated cost of the key derivation has a floor.
+///
+/// The client must run the KDF at whatever cost the server names, before
+/// it has learned anything at all. A server naming a low count has
+/// quietly weakened the password hashing of every client that talks to
+/// it, and the client cannot refuse without failing to connect.
+async fn scram_iteration_floor(ctx: &ServerCtx) -> Verdict {
+    let (_conn, _nonce, _bare, server_first) = match scram_begin(ctx, 220).await {
+        Ok(v) => v,
+        Err(verdict) => return verdict,
+    };
+    let salt = scram_attr(&server_first, 's').unwrap_or_default();
+    if salt.is_empty() {
+        return Verdict::Fail {
+            details: format!("server-first states no salt: {server_first:?}"),
+        };
+    }
+    let Some(iterations) = scram_attr(&server_first, 'i').and_then(|i| i.parse::<u32>().ok())
+    else {
+        return Verdict::Fail {
+            details: format!("server-first states no iteration count: {server_first:?}"),
+        };
+    };
+    if iterations >= SCRAM_MIN_ITERATIONS {
+        Verdict::Pass
+    } else {
+        Verdict::Fail {
+            details: format!(
+                "server asks for {iterations} iterations; RFC 7677 makes \
+                 {SCRAM_MIN_ITERATIONS} the floor for {SCRAM_MECHANISM}, and a client \
+                 cannot refuse a low one without failing to connect"
+            ),
+        }
+    }
+}
+
+/// RFC 7677 §4: 4096 is the minimum for SCRAM-SHA-256.
+const SCRAM_MIN_ITERATIONS: u32 = 4096;
+
+/// The server signs the exchange too, or the client authenticated to
+/// nobody in particular.
+///
+/// `v=` is derived from key material only a holder of the account can
+/// produce. Without it, a client has proved itself to whatever answered
+/// the socket and has no way to notice.
+async fn scram_server_proves_itself(ctx: &ServerCtx) -> Verdict {
+    let auth_version = match negotiate(
+        "SaslAuthenticate",
+        match ctx.range(SaslAuthenticateRequest::API_KEY) {
+            Ok(a) => a,
+            Err(v) => return v,
+        },
+        SaslAuthenticateRequest::MIN_VERSION,
+        SaslAuthenticateRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let (mut conn, _nonce, client_first_bare, server_first) = match scram_begin(ctx, 230).await {
+        Ok(v) => v,
+        Err(verdict) => return verdict,
+    };
+    let (Some(server_nonce), Some(salt), Some(iterations)) = (
+        scram_attr(&server_first, 'r'),
+        scram_attr(&server_first, 's').and_then(|s| b64_decode(&s)),
+        scram_attr(&server_first, 'i').and_then(|i| i.parse::<u32>().ok()),
+    ) else {
+        return Verdict::Fail {
+            details: format!("server-first is not a SCRAM message: {server_first:?}"),
+        };
+    };
+
+    let without_proof = format!("c=biws,r={server_nonce}");
+    let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
+    let keys = scram_keys(SCRAM_PASSWORD, &salt, iterations);
+    let proof = scram_client_proof(&keys, &auth_message);
+    let client_final = format!("{without_proof},p={proof}");
+
+    let server_final =
+        match scram_token(&mut conn, auth_version, client_final.as_bytes(), 232).await {
+            Ok(t) => t,
+            Err(verdict) => return verdict,
+        };
+    let Some(signature) = scram_attr(&server_final, 'v') else {
+        return Verdict::Fail {
+            details: format!(
+                "server-final carries no signature ({server_final:?}), so a client has \
+                 authenticated itself to something it cannot identify"
+            ),
+        };
+    };
+    if signature == scram_server_signature(&keys, &auth_message) {
+        Verdict::Pass
+    } else {
+        Verdict::Fail {
+            details: "server signature does not verify against the account's key material".into(),
+        }
+    }
 }
 
 /// A SASL token on a connection that negotiated nothing is refused.

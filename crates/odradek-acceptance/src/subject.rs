@@ -135,6 +135,15 @@ pub enum Fault {
     /// Answer a never-committed partition with 0 rather than the -1
     /// sentinel — a plausible offset where "nothing here" was meant.
     OffsetFetchUnsetIsZero,
+    /// Answer with a server nonce that replaces the client's instead of
+    /// extending it.
+    ScramNonceReplacesClients,
+    /// Name an iteration count far below the RFC 7677 floor, weakening
+    /// the key derivation every client is forced to spend.
+    ScramWeakIterations,
+    /// Complete the exchange without the `v=` signature, so the client
+    /// has no way to know whether the server holds the account at all.
+    ScramSkipsServerSignature,
     /// Refuse an unsupported mechanism without naming any supported
     /// one, leaving the client nothing to fall back to.
     SaslHandshakeHidesMechanisms,
@@ -224,6 +233,9 @@ impl Fault {
         Fault::ConsumerGroupIgnoresEpoch,
         Fault::SaslHandshakeHidesMechanisms,
         Fault::SaslAuthenticateWithoutHandshake,
+        Fault::ScramNonceReplacesClients,
+        Fault::ScramWeakIterations,
+        Fault::ScramSkipsServerSignature,
     ];
 }
 
@@ -437,6 +449,13 @@ enum SaslState {
     Unstarted,
     /// A handshake named this mechanism; tokens are now interpretable.
     Negotiated(String),
+    /// A SCRAM exchange is mid-flight: the client's first bare message
+    /// and our first message, both needed to rebuild the auth message
+    /// the proof is computed over.
+    ScramPending {
+        client_first_bare: String,
+        server_first: String,
+    },
     /// Authentication completed.
     Authenticated,
 }
@@ -445,6 +464,17 @@ enum SaslState {
 /// back on, so a refusal that omits it leaves the client with nothing to
 /// try next.
 const SASL_MECHANISMS: &[&str] = &["SCRAM-SHA-256", "PLAIN"];
+
+/// The one account this subject knows. Published, because the checks
+/// that exercise a full SCRAM exchange need both halves of it and there
+/// is nothing here worth protecting.
+pub const SCRAM_USER: &str = "conformance";
+pub const SCRAM_PASSWORD: &str = "conformance";
+/// RFC 7677 makes 4096 the floor for SCRAM-SHA-256.
+const SCRAM_ITERATIONS: u32 = 4096;
+/// A fixed salt. Real servers vary it per account; this one has one
+/// account and the checks need the exchange to be reproducible.
+const SCRAM_SALT: &[u8] = b"odradek-acceptance-salt";
 
 /// One KIP-848 member.
 ///
@@ -573,6 +603,186 @@ fn response_header_version(api_key: i16, api_version: i16) -> i16 {
 }
 
 /// Frame a response: length prefix, header at `header_version`, body bytes.
+/// SCRAM-SHA-256, server side (RFC 5802 / RFC 7677).
+///
+/// Implementing this is what shows why the exchange has the shape it
+/// does, and three of those reasons became checks:
+///
+/// 1. **The server's nonce extends the client's.** It does not replace
+///    it. The client chose a nonce it has never used before; a server
+///    answer that does not contain it could be a recording of an older
+///    exchange, and the client has no other way to tell.
+/// 2. **The salt and iteration count are the server's to state, and the
+///    client's to spend.** The client must run the KDF at whatever cost
+///    the server names before it learns anything at all — so a server
+///    naming a low count has silently weakened every client's password
+///    hashing, and one naming a huge count has a denial of service.
+/// 3. **The final message proves the server too.** `v=` is computed
+///    from a key only someone holding the password material can derive.
+///    Without it a client has authenticated itself to an impostor and
+///    has no idea.
+mod scram {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use hmac::{Hmac, Mac, SimpleHmac};
+    use sha2::{Digest, Sha256};
+
+    type HmacSha256 = Hmac<Sha256>;
+
+    fn hmac(key: &[u8], msg: &[u8]) -> [u8; 32] {
+        let mut mac = HmacSha256::new_from_slice(key).expect("hmac takes any key length");
+        mac.update(msg);
+        mac.finalize().into_bytes().into()
+    }
+
+    fn salted_password(password: &str, salt: &[u8], iterations: u32) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        pbkdf2::pbkdf2::<SimpleHmac<Sha256>>(password.as_bytes(), salt, iterations, &mut out)
+            .expect("pbkdf2 accepts any output length");
+        out
+    }
+
+    /// The server's half of the exchange, once the client's first
+    /// message and the auth message are known.
+    pub(super) struct Keys {
+        pub stored_key: [u8; 32],
+        pub server_key: [u8; 32],
+    }
+
+    pub(super) fn keys(password: &str, salt: &[u8], iterations: u32) -> Keys {
+        let salted = salted_password(password, salt, iterations);
+        let client_key = hmac(&salted, b"Client Key");
+        Keys {
+            stored_key: Sha256::digest(client_key).into(),
+            server_key: hmac(&salted, b"Server Key"),
+        }
+    }
+
+    /// `v=` — proof that this server holds the account's key material.
+    pub(super) fn server_signature(keys: &Keys, auth_message: &str) -> String {
+        B64.encode(hmac(&keys.server_key, auth_message.as_bytes()))
+    }
+
+    /// Whether `proof` (base64) is the client's, for `auth_message`.
+    pub(super) fn verify_proof(keys: &Keys, auth_message: &str, proof: &str) -> bool {
+        let Ok(proof) = B64.decode(proof) else {
+            return false;
+        };
+        if proof.len() != 32 {
+            return false;
+        }
+        let signature = hmac(&keys.stored_key, auth_message.as_bytes());
+        // ClientKey = ClientProof XOR ClientSignature, and H(ClientKey)
+        // must be the stored key.
+        let mut client_key = [0u8; 32];
+        for (i, byte) in client_key.iter_mut().enumerate() {
+            *byte = proof[i] ^ signature[i];
+        }
+        let digest: [u8; 32] = Sha256::digest(client_key).into();
+        digest == keys.stored_key
+    }
+
+    pub(super) fn encode(bytes: &[u8]) -> String {
+        B64.encode(bytes)
+    }
+
+    /// Split a SCRAM message into its `k=v` attributes.
+    pub(super) fn attrs(message: &str) -> Vec<(char, String)> {
+        message
+            .split(',')
+            .filter_map(|part| {
+                let mut chars = part.chars();
+                let key = chars.next()?;
+                let rest = chars.as_str().strip_prefix('=')?;
+                Some((key, rest.to_owned()))
+            })
+            .collect()
+    }
+
+    pub(super) fn attr(message: &str, key: char) -> Option<String> {
+        attrs(message)
+            .into_iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v)
+    }
+}
+
+/// The server's first SCRAM message, from the client's first.
+///
+/// Returns `(client-first-bare, server-first)` — both are needed later,
+/// because the proof is computed over a message built from all three
+/// exchanges and the server has to remember its own part verbatim.
+fn scram_first(token: &str, faults: &[Fault]) -> Result<(String, String), String> {
+    // "n,,n=user,r=nonce": strip the GS2 header to get the bare part the
+    // auth message is built from.
+    let bare = token
+        .splitn(3, ',')
+        .nth(2)
+        .ok_or_else(|| "client-first is not a SCRAM message".to_owned())?;
+    let client_nonce =
+        scram::attr(bare, 'r').ok_or_else(|| "client-first carries no nonce".to_owned())?;
+    let user = scram::attr(bare, 'n').unwrap_or_default();
+    if user != SCRAM_USER {
+        return Err(format!("no such user {user:?}"));
+    }
+
+    // The server nonce *extends* the client's. Replacing it would leave
+    // the client unable to tell this exchange from a recording of an
+    // older one.
+    let server_nonce = if faults.contains(&Fault::ScramNonceReplacesClients) {
+        "odradek-server-nonce".to_owned()
+    } else {
+        format!("{client_nonce}odradek-server-nonce")
+    };
+    let iterations = if faults.contains(&Fault::ScramWeakIterations) {
+        1
+    } else {
+        SCRAM_ITERATIONS
+    };
+    let server_first = format!(
+        "r={server_nonce},s={},i={iterations}",
+        scram::encode(SCRAM_SALT)
+    );
+    Ok((bare.to_owned(), server_first))
+}
+
+/// The server's final SCRAM message, proving it holds the key material.
+fn scram_final(
+    client_first_bare: &str,
+    server_first: &str,
+    token: &str,
+    faults: &[Fault],
+) -> Result<String, String> {
+    let proof =
+        scram::attr(token, 'p').ok_or_else(|| "client-final carries no proof".to_owned())?;
+    // The auth message covers every byte of the exchange so far, which
+    // is what stops any of it from being altered in flight.
+    let without_proof = token
+        .rsplit_once(",p=")
+        .map(|(head, _)| head)
+        .ok_or_else(|| "client-final is malformed".to_owned())?;
+    let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
+
+    let iterations = if faults.contains(&Fault::ScramWeakIterations) {
+        1
+    } else {
+        SCRAM_ITERATIONS
+    };
+    let keys = scram::keys(SCRAM_PASSWORD, SCRAM_SALT, iterations);
+    if !scram::verify_proof(&keys, &auth_message, &proof) {
+        return Err("client proof does not verify".to_owned());
+    }
+    if faults.contains(&Fault::ScramSkipsServerSignature) {
+        // Cheerful success with nothing to check it against: the client
+        // has authenticated itself to whoever this is.
+        return Ok(String::new());
+    }
+    Ok(format!(
+        "v={}",
+        scram::server_signature(&keys, &auth_message)
+    ))
+}
+
 /// SaslHandshake: agree a mechanism, or say what is on offer.
 fn sasl_handshake_exchange(
     mut frame: Bytes,
@@ -636,15 +846,49 @@ fn sasl_authenticate_exchange(
     let _request = SaslAuthenticateRequest::decode(&mut frame, api_version).ok()?;
 
     let mut resp = SaslAuthenticateResponse::default();
-    let out_of_state = state.sasl == SaslState::Unstarted
-        && !faults.contains(&Fault::SaslAuthenticateWithoutHandshake);
-    if out_of_state {
-        resp.error_code = ErrorCode::ILLEGAL_SASL_STATE.0;
-        resp.error_message = Some("no mechanism negotiated".into());
-    } else {
-        state.sasl = SaslState::Authenticated;
-        resp.error_code = 0;
-        resp.auth_bytes = Bytes::new();
+    let token = String::from_utf8_lossy(&_request.auth_bytes).into_owned();
+    match &state.sasl {
+        SaslState::Unstarted if !faults.contains(&Fault::SaslAuthenticateWithoutHandshake) => {
+            resp.error_code = ErrorCode::ILLEGAL_SASL_STATE.0;
+            resp.error_message = Some("no mechanism negotiated".into());
+        }
+        SaslState::Negotiated(mechanism) if mechanism == "SCRAM-SHA-256" => {
+            match scram_first(&token, faults) {
+                Ok((client_first_bare, server_first)) => {
+                    resp.error_code = 0;
+                    resp.auth_bytes = Bytes::from(server_first.clone().into_bytes());
+                    state.sasl = SaslState::ScramPending {
+                        client_first_bare,
+                        server_first,
+                    };
+                }
+                Err(message) => {
+                    resp.error_code = ErrorCode::SASL_AUTHENTICATION_FAILED.0;
+                    resp.error_message = Some(message);
+                }
+            }
+        }
+        SaslState::ScramPending {
+            client_first_bare,
+            server_first,
+        } => match scram_final(client_first_bare, server_first, &token, faults) {
+            Ok(server_final) => {
+                resp.error_code = 0;
+                resp.auth_bytes = Bytes::from(server_final.into_bytes());
+                state.sasl = SaslState::Authenticated;
+            }
+            Err(message) => {
+                resp.error_code = ErrorCode::SASL_AUTHENTICATION_FAILED.0;
+                resp.error_message = Some(message);
+            }
+        },
+        _ => {
+            // Any other mechanism, or a token after the exchange ended:
+            // this subject has no credentials to check beyond SCRAM.
+            state.sasl = SaslState::Authenticated;
+            resp.error_code = 0;
+            resp.auth_bytes = Bytes::new();
+        }
     }
     frame_response(
         req_header.correlation_id,
