@@ -5,55 +5,86 @@ on:
     branches: [main]
   pull_request:
 
+# Nothing here comments, tags, releases, or writes to the repository, so
+# no job needs more than read. Without this, jobs inherit the repository
+# default — which is write, and which would let a compromised action push
+# to main or approve a pull request, i.e. reach a future `cargo publish`.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
+
+# Actions are pinned by commit SHA, not by tag. `@v7` and `@stable` are
+# mutable refs the action's owner can repoint at any time, so a tag pin
+# trusts that repository forever; a SHA pin trusts exactly the code that
+# was reviewed. The trailing comment records the human-readable ref each
+# SHA was resolved from.
 
 jobs:
   checks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # --locked throughout: without it CI silently resolves newer
+      # semver-compatible dependencies than the reviewed lockfile, so a
+      # freshly published malicious patch release would run here with no
+      # lockfile change to review.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
       - name: docs build warning-free
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
       - name: hardware-accelerated crc is bit-identical
-        run: cargo test -p odradek-protocol --features hardware-crc
+        run: cargo test -p odradek-protocol --features hardware-crc --locked
       - name: lean client builds (no tls/sasl/codecs)
-        run: cargo check -p odradek-client --no-default-features
+        run: cargo check -p odradek-client --no-default-features --locked
       - name: lean web transports build (no kafka)
-        run: cargo check -p odradek-web-sse -p odradek-web-ws --no-default-features
+        run: cargo check -p odradek-web-sse -p odradek-web-ws --no-default-features --locked
       - name: generated code is in sync with the schemas
         # codegen output is committed formatted, so format before diffing
         run: cargo xtask codegen && cargo fmt && git diff --exit-code
       - name: crates package cleanly
-        run: cargo package --workspace --no-verify
+        run: cargo package --workspace --no-verify --locked
 
   msrv:
     name: MSRV (1.85)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: 1.85.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: workspace compiles on the declared rust-version
         run: cargo check --workspace --all-targets --locked
+
+  crc-aarch64:
+    name: hardware crc (aarch64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # The crc32c crate dispatches at runtime, so the x86-64 leg only
+      # ever exercises SSE4.2. Two odradek nodes whose CRCs disagreed
+      # would silently reject each other's every batch, so the
+      # bit-identical claim needs the other architecture too.
+      - name: crc is bit-identical on CRC32CX as well
+        run: cargo test -p odradek-protocol --features hardware-crc --locked
 
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check
 
@@ -61,9 +92,9 @@ jobs:
     name: real-broker conformance
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: enforce committed baselines against Kafka and Redpanda
         # ~850MB of images, otherwise pulled implicitly by the first
         # `docker run` — that is, only once the build is over. Start both
