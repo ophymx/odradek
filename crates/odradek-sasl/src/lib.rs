@@ -16,15 +16,18 @@
 //! socket.
 //!
 //! ```
-//! use odradek_sasl::{Limits, Mechanism, ScramClient, ScramServer};
+//! use odradek_sasl::{Limits, Mechanism, ScramClient, ScramCredential, ScramServer};
 //!
 //! let mut client = ScramClient::new(
 //!     Mechanism::ScramSha256, "user", "pencil", Limits::default(),
 //! )?;
-//! let mut server = ScramServer::new(
-//!     Mechanism::ScramSha256, "user", "pencil",
-//!     b"salt".to_vec(), 4096, Limits::default(),
+//! // A server stores keys, never a password — `derive` is the
+//! // convenience for when you have one in hand anyway.
+//! let credential = ScramCredential::derive(
+//!     Mechanism::ScramSha256, "pencil", b"salt".to_vec(), 4096,
+//!     Limits::default(),
 //! )?;
+//! let mut server = ScramServer::new("user", credential)?;
 //!
 //! let first = client.client_first();
 //! let challenge = server.server_first(&first)?;
@@ -42,10 +45,10 @@
 //!   support it) rather than `y` (supports it, server did not offer),
 //!   so a server requiring channel binding refuses instead of silently
 //!   downgrading.
-//! - **No credential store.** [`ScramServer`] holds one account, because
-//!   its consumers are a reference implementation and a test double.
-//!   Storing derived keys rather than a password is what a real server
-//!   should do, and this deliberately does not pretend to be one.
+//! - **No credential store.** [`ScramServer`] serves one account. It
+//!   holds a [`ScramCredential`] — derived keys, never a password —
+//!   because RFC 5802 is built so a server never needs one; looking up
+//!   which credential belongs to which account is the caller's job.
 //! - **No GSSAPI, OAUTHBEARER, or DIGEST-MD5.** [`Mechanism`] is
 //!   `#[non_exhaustive]` so adding one is not a breaking change.
 //!
@@ -70,7 +73,7 @@ mod scram;
 pub use mechanism::Mechanism;
 pub use plain::{plain_token, verify_plain_token};
 pub use prep::saslprep;
-pub use scram::{GS2_HEADER, ScramClient, ScramServer, fresh_nonce};
+pub use scram::{GS2_HEADER, ScramClient, ScramCredential, ScramServer, fresh_nonce};
 
 /// Bounds on the iteration count, which one side names and the other
 /// pays.

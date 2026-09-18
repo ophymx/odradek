@@ -615,18 +615,19 @@ fn scram_server(faults: &[Fault]) -> Result<odradek_sasl::ScramServer, String> {
     } else {
         SCRAM_ITERATIONS
     };
-    let server = odradek_sasl::ScramServer::new(
+    let credential = odradek_sasl::ScramCredential::derive(
         odradek_sasl::Mechanism::ScramSha256,
-        SCRAM_USER,
         SCRAM_PASSWORD,
         SCRAM_SALT.to_vec(),
         iterations,
         // A floor of 1, because this subject has to be *allowed* to
         // misbehave: the crate's default floor would refuse to build a
-        // server weak enough to test a client against.
+        // credential weak enough to test a client against.
         odradek_sasl::Limits::new(1, 1_000_000),
     )
     .map_err(|e| e.to_string())?;
+    let server =
+        odradek_sasl::ScramServer::new(SCRAM_USER, credential).map_err(|e| e.to_string())?;
     Ok(server)
 }
 

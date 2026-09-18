@@ -140,6 +140,11 @@ cargo xtask conformance      # real-broker conformance runs (needs docker)
 cargo xtask conformance --record   # refresh baselines from a run
 ```
 
+## Security
+
+Report vulnerabilities privately: see [SECURITY.md](SECURITY.md) for how
+and for what is in scope.
+
 ## License
 
 Copyright © 2026 Jeffrey T. Peckham (Ophymx).

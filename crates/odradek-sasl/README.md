@@ -57,9 +57,11 @@ against the RFC's worked examples, without a socket.
 - **No channel binding.** The client advertises `n` — does not support
   it — so a server requiring it refuses rather than silently
   downgrading.
-- **No credential store.** `ScramServer` holds one account. Storing
-  derived keys rather than a password is what a real server should do,
-  and this does not pretend to be one.
+- **No credential store.** `ScramServer` serves one account, and holds
+  a `ScramCredential` — derived keys, never a password. RFC 5802 is
+  built so a server never needs one, and the type makes that the only
+  option. Deciding which credential belongs to which account is the
+  caller's job.
 - **No GSSAPI, OAUTHBEARER, or DIGEST-MD5.** `Mechanism` is
   `#[non_exhaustive]`, so adding one later is not a breaking change.
 
@@ -71,6 +73,9 @@ plaintext connection still collects the username, salt, iteration count,
 nonces and proof — exactly the inputs to an offline dictionary attack,
 at the cost the iteration count sets. SCRAM over plaintext protects a
 password from being *read*, not from being *cracked*. Use TLS.
+
+Report security issues privately — see
+[SECURITY.md](https://github.com/ophymx/odradek/blob/main/SECURITY.md).
 
 Part of the [odradek](https://github.com/ophymx/odradek) constellation.
 

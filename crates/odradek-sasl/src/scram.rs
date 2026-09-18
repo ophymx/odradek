@@ -189,15 +189,116 @@ impl std::fmt::Debug for ScramClient {
 }
 
 impl std::fmt::Debug for ScramServer {
-    /// As above: the salt is the only value here that is safe to print,
-    /// and printing it alone is not worth the risk of the habit.
+    /// The credential redacts itself; there is no password here to
+    /// leak any more.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScramServer")
-            .field("mechanism", &self.mechanism)
             .field("username", &self.username)
-            .field("password", &"<redacted>")
+            .field("credential", &self.credential)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What a SCRAM server stores for one account.
+///
+/// Not a password. RFC 5802 is built so a server never needs one: the
+/// client's proof is verified by recovering `ClientKey` from it and
+/// hashing that, which takes only `StoredKey`, and the server's own
+/// signature takes only `ServerKey`. So a server that keeps a password
+/// is keeping something it has no use for — and a database that leaks
+/// these values leaks the ability to impersonate the server to that
+/// account, but not the password itself or the account anywhere else.
+///
+/// [`derive`](ScramCredential::derive) exists for the cases with a
+/// password in hand anyway — a test, a reference implementation, a
+/// provisioning step. It consumes the password and does not keep it.
+/// [`from_stored`](ScramCredential::from_stored) is what a real
+/// credential store uses.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct ScramCredential {
+    #[zeroize(skip)]
+    mechanism: Mechanism,
+    #[zeroize(skip)]
+    salt: Vec<u8>,
+    #[zeroize(skip)]
+    iterations: u32,
+    stored_key: [u8; 64],
+    server_key: [u8; 64],
+    #[zeroize(skip)]
+    len: usize,
+}
+
+impl std::fmt::Debug for ScramCredential {
+    /// The keys are the whole of it; there is nothing here to print.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScramCredential")
+            .field("mechanism", &self.mechanism)
             .field("iterations", &self.iterations)
             .finish_non_exhaustive()
+    }
+}
+
+impl ScramCredential {
+    /// Derive a credential from a password, which is not retained.
+    pub fn derive(
+        mechanism: Mechanism,
+        password: &str,
+        salt: Vec<u8>,
+        iterations: u32,
+        limits: Limits,
+    ) -> Result<ScramCredential, SaslError> {
+        limits.check(iterations)?;
+        let password = Zeroizing::new(saslprep(password)?);
+        let keys = with_digest!(mechanism, |D| Keys::derive::<D>(
+            &password, &salt, iterations
+        ));
+        Ok(ScramCredential {
+            mechanism,
+            salt,
+            iterations,
+            stored_key: keys.stored_key,
+            server_key: keys.server_key,
+            len: keys.len,
+        })
+    }
+
+    /// The stored form of this credential: `(StoredKey, ServerKey)`.
+    ///
+    /// What a credential store persists, and the only way to get these
+    /// out — there is deliberately no accessor for anything else,
+    /// because there is nothing else.
+    pub fn keys(&self) -> (Vec<u8>, Vec<u8>) {
+        (
+            self.stored_key[..self.len].to_vec(),
+            self.server_key[..self.len].to_vec(),
+        )
+    }
+
+    /// A credential from values already stored, as a real server holds
+    /// them. Both keys are the digest's own width.
+    pub fn from_stored(
+        mechanism: Mechanism,
+        salt: Vec<u8>,
+        iterations: u32,
+        stored_key: &[u8],
+        server_key: &[u8],
+    ) -> Result<ScramCredential, SaslError> {
+        let len = with_digest!(mechanism, |D| <D as Digest>::output_size());
+        if stored_key.len() != len || server_key.len() != len {
+            return Err(SaslError::Malformed("stored key width"));
+        }
+        let mut stored = [0u8; 64];
+        let mut server = [0u8; 64];
+        stored[..len].copy_from_slice(stored_key);
+        server[..len].copy_from_slice(server_key);
+        Ok(ScramCredential {
+            mechanism,
+            salt,
+            iterations,
+            stored_key: stored,
+            server_key: server,
+            len,
+        })
     }
 }
 
@@ -336,11 +437,8 @@ impl ScramClient {
 /// them is the slower and simpler choice, and the one that cannot get
 /// the stored-key format wrong.
 pub struct ScramServer {
-    mechanism: Mechanism,
     username: String,
-    password: Zeroizing<String>,
-    salt: Vec<u8>,
-    iterations: u32,
+    credential: ScramCredential,
     nonce: String,
     /// Set once `server_first` has been produced.
     pending: Option<ServerPending>,
@@ -356,21 +454,10 @@ struct ServerPending {
 
 impl ScramServer {
     /// A server for one account, with a freshly generated nonce.
-    pub fn new(
-        mechanism: Mechanism,
-        username: &str,
-        password: &str,
-        salt: Vec<u8>,
-        iterations: u32,
-        limits: Limits,
-    ) -> Result<ScramServer, SaslError> {
-        limits.check(iterations)?;
+    pub fn new(username: &str, credential: ScramCredential) -> Result<ScramServer, SaslError> {
         Ok(ScramServer {
-            mechanism,
             username: saslprep(username)?,
-            password: Zeroizing::new(saslprep(password)?),
-            salt,
-            iterations,
+            credential,
             nonce: fresh_nonce()?,
             pending: None,
         })
@@ -414,8 +501,8 @@ impl ScramServer {
         let server_first = format!(
             "r={client_nonce}{},s={},i={}",
             self.nonce,
-            b64::encode(&self.salt),
-            self.iterations
+            b64::encode(&self.credential.salt),
+            self.credential.iterations
         );
         self.pending = Some(ServerPending {
             client_first_bare: bare.to_owned(),
@@ -444,20 +531,43 @@ impl ScramServer {
             pending.client_first_bare, pending.server_first, without_proof
         );
 
-        let mechanism = self.mechanism;
-        let keys = with_digest!(mechanism, |D| Keys::derive::<D>(
-            &self.password,
-            &self.salt,
-            self.iterations
-        ));
-        let expected = with_digest!(mechanism, |D| keys.client_proof::<D>(&auth_message));
-        // Constant time: the proof is attacker-supplied and compared
-        // against a secret-derived value, which is the textbook shape of
-        // a timing oracle.
-        if expected.as_bytes().ct_eq(proof.as_bytes()).unwrap_u8() != 1 {
+        // RFC 5802's verification, which is why a server needs no
+        // password: recover ClientKey from the proof and hash it. The
+        // result must be the StoredKey on file.
+        let proof = b64::decode(proof)?;
+        let credential = &self.credential;
+        if proof.len() != credential.len {
             return Err(SaslError::BadClientProof);
         }
-        let signature = with_digest!(mechanism, |D| keys.server_signature::<D>(&auth_message));
+        let mechanism = credential.mechanism;
+        let verified = with_digest!(mechanism, |D| {
+            let signature = hmac::<D>(
+                &credential.stored_key[..credential.len],
+                auth_message.as_bytes(),
+            );
+            let mut client_key = [0u8; 64];
+            for i in 0..credential.len {
+                client_key[i] = proof[i] ^ signature[i];
+            }
+            let digest = <D as Digest>::digest(&client_key[..credential.len]);
+            // Constant time: the digest is derived from attacker-supplied
+            // bytes and compared against a stored secret.
+            digest
+                .as_slice()
+                .ct_eq(&credential.stored_key[..credential.len])
+                .unwrap_u8()
+                == 1
+        });
+        if !verified {
+            return Err(SaslError::BadClientProof);
+        }
+        let signature = with_digest!(mechanism, |D| {
+            let sig = hmac::<D>(
+                &credential.server_key[..credential.len],
+                auth_message.as_bytes(),
+            );
+            b64::encode(&sig[..credential.len])
+        });
         Ok(format!("v={signature}"))
     }
 }

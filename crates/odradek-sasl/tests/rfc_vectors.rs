@@ -5,7 +5,9 @@
 //! from this crate, so agreeing with them is evidence about the
 //! protocol and not about our own arithmetic.
 
-use odradek_sasl::{Limits, Mechanism, SaslError, ScramClient, ScramServer, saslprep};
+use odradek_sasl::{
+    Limits, Mechanism, SaslError, ScramClient, ScramCredential, ScramServer, saslprep,
+};
 
 /// RFC 7677 §5: the SCRAM-SHA-256 exchange, verbatim.
 const USER: &str = "user";
@@ -37,12 +39,15 @@ fn rfc_client() -> ScramClient {
 
 fn rfc_server() -> ScramServer {
     ScramServer::new(
-        Mechanism::ScramSha256,
         USER,
-        PASSWORD,
-        salt(),
-        ITERATIONS,
-        Limits::default(),
+        ScramCredential::derive(
+            Mechanism::ScramSha256,
+            PASSWORD,
+            salt(),
+            ITERATIONS,
+            Limits::default(),
+        )
+        .unwrap(),
     )
     .expect("rfc credentials are preparable")
     .with_fixed_nonce_for_tests(SERVER_NONCE)
@@ -76,12 +81,15 @@ fn the_roles_complete_an_exchange() {
         let mut client =
             ScramClient::new(mechanism, "admin", "hunter2", Limits::default()).unwrap();
         let mut server = ScramServer::new(
-            mechanism,
             "admin",
-            "hunter2",
-            b"a-different-salt".to_vec(),
-            4096,
-            Limits::default(),
+            ScramCredential::derive(
+                mechanism,
+                "hunter2",
+                b"a-different-salt".to_vec(),
+                4096,
+                Limits::default(),
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -107,12 +115,15 @@ fn a_wrong_password_is_refused() {
     )
     .unwrap();
     let mut server = ScramServer::new(
-        Mechanism::ScramSha256,
         "admin",
-        "hunter2",
-        b"salt".to_vec(),
-        4096,
-        Limits::default(),
+        ScramCredential::derive(
+            Mechanism::ScramSha256,
+            "hunter2",
+            b"salt".to_vec(),
+            4096,
+            Limits::default(),
+        )
+        .unwrap(),
     )
     .unwrap();
 
@@ -208,12 +219,15 @@ fn saslprep_is_applied_to_credentials() {
     )
     .unwrap();
     let mut server = ScramServer::new(
-        Mechanism::ScramSha256,
         "user",
-        "pa ss",
-        b"salt".to_vec(),
-        4096,
-        Limits::default(),
+        ScramCredential::derive(
+            Mechanism::ScramSha256,
+            "pa ss",
+            b"salt".to_vec(),
+            4096,
+            Limits::default(),
+        )
+        .unwrap(),
     )
     .unwrap();
 
@@ -268,12 +282,15 @@ fn usernames_containing_escapes_round_trip() {
         let mut client =
             ScramClient::new(Mechanism::ScramSha256, user, "pw", Limits::default()).unwrap();
         let mut server = ScramServer::new(
-            Mechanism::ScramSha256,
             user,
-            "pw",
-            b"salt".to_vec(),
-            4096,
-            Limits::default(),
+            ScramCredential::derive(
+                Mechanism::ScramSha256,
+                "pw",
+                b"salt".to_vec(),
+                4096,
+                Limits::default(),
+            )
+            .unwrap(),
         )
         .unwrap();
         let challenge = server
@@ -293,12 +310,15 @@ fn a_different_username_is_refused() {
     let mut client =
         ScramClient::new(Mechanism::ScramSha256, "a,b", "pw", Limits::default()).unwrap();
     let mut server = ScramServer::new(
-        Mechanism::ScramSha256,
         "a=b",
-        "pw",
-        b"salt".to_vec(),
-        4096,
-        Limits::default(),
+        ScramCredential::derive(
+            Mechanism::ScramSha256,
+            "pw",
+            b"salt".to_vec(),
+            4096,
+            Limits::default(),
+        )
+        .unwrap(),
     )
     .unwrap();
     assert_eq!(
@@ -315,12 +335,15 @@ fn a_rewritten_gs2_header_is_caught() {
     let mut client =
         ScramClient::new(Mechanism::ScramSha256, "u", "pw", Limits::default()).unwrap();
     let mut server = ScramServer::new(
-        Mechanism::ScramSha256,
         "u",
-        "pw",
-        b"salt".to_vec(),
-        4096,
-        Limits::default(),
+        ScramCredential::derive(
+            Mechanism::ScramSha256,
+            "pw",
+            b"salt".to_vec(),
+            4096,
+            Limits::default(),
+        )
+        .unwrap(),
     )
     .unwrap();
     let challenge = server.server_first(&client.client_first()).unwrap();
@@ -365,12 +388,15 @@ fn hostile_messages_do_not_panic() {
         let _ = client.verify_server_final(message);
 
         let mut server = ScramServer::new(
-            Mechanism::ScramSha256,
             "u",
-            "pw",
-            b"salt".to_vec(),
-            4096,
-            Limits::default(),
+            ScramCredential::derive(
+                Mechanism::ScramSha256,
+                "pw",
+                b"salt".to_vec(),
+                4096,
+                Limits::default(),
+            )
+            .unwrap(),
         )
         .unwrap();
         let _ = server.server_first(message);
@@ -379,4 +405,49 @@ fn hostile_messages_do_not_panic() {
         let _ = odradek_sasl::verify_plain_token(message.as_bytes(), "u", "pw");
         let _ = odradek_sasl::saslprep(message);
     }
+}
+
+/// A credential built from stored keys authenticates exactly as one
+/// derived from the password — which is the point: a server that only
+/// ever saw the stored form can still run the exchange, and so never
+/// needs the password at all.
+#[test]
+fn stored_keys_serve_as_well_as_a_password() {
+    // The RFC's account, in the form a credential store would hold.
+    // StoredKey and ServerKey are what a server keeps; deriving them
+    // here is only how the test obtains them.
+    let derived = ScramCredential::derive(
+        Mechanism::ScramSha256,
+        PASSWORD,
+        salt(),
+        ITERATIONS,
+        Limits::default(),
+    )
+    .unwrap();
+    let (stored_key, server_key) = derived.keys();
+
+    let from_store = ScramCredential::from_stored(
+        Mechanism::ScramSha256,
+        salt(),
+        ITERATIONS,
+        &stored_key,
+        &server_key,
+    )
+    .unwrap();
+
+    let mut server = ScramServer::new(USER, from_store)
+        .unwrap()
+        .with_fixed_nonce_for_tests(SERVER_NONCE);
+    assert_eq!(server.server_first(CLIENT_FIRST).unwrap(), SERVER_FIRST);
+    assert_eq!(server.server_final(CLIENT_FINAL).unwrap(), SERVER_FINAL);
+}
+
+/// Stored keys of the wrong width are refused rather than padded into
+/// something that silently authenticates nobody.
+#[test]
+fn stored_keys_must_be_the_digest_width() {
+    assert!(matches!(
+        ScramCredential::from_stored(Mechanism::ScramSha256, salt(), 4096, &[0u8; 16], &[0u8; 32]),
+        Err(SaslError::Malformed(_))
+    ));
 }
