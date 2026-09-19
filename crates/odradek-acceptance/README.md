@@ -61,9 +61,9 @@ catalog worth anything — a check that cannot fail passes everywhere.
 
 `api-versions/*`, `metadata/*`, `produce/*`, `fetch/*`,
 `list-offsets/*`, `find-coordinator/*`, `offsets/*`, `create-topics/*`,
-`groups/*`, `consumer-group/*` (KIP-848), and `sasl/*` — everything a
-consumer needs, plus the group protocols and the SASL handshake
-sequence.
+`groups/*`, `consumer-group/*` (KIP-848), `sasl/*`, and `txn/*` —
+everything a consumer needs, plus the group protocols, the SASL
+handshake sequence, and transactions.
 
 Success paths are the easy half. The checks that earn their keep are
 the ones where the *wrong* answer is plausible:
@@ -92,6 +92,18 @@ the ones where the *wrong* answer is plausible:
   connect, so it has a floor (RFC 7677: 4096).
 - A SCRAM exchange ends with a server signature, or the client has
   authenticated itself to whatever answered the socket and cannot tell.
+- Re-taking a transactional id must hand out a *higher* epoch, and the
+  superseded one must then be refused. Either half alone is worthless:
+  an epoch nobody enforces fences nothing, and enforcement without a
+  bump fences the wrong producer.
+- While a transaction is open the last stable offset stays below the
+  high watermark. A broker that lets them meet shows `read_committed`
+  consumers records that may still be aborted — the one thing they
+  asked not to see.
+- An aborted transaction is *named* in a `read_committed` fetch over
+  its records. The records are returned either way, because aborting
+  does not unwrite anything; the list is the only thing that tells a
+  client which of them to drop.
 
 The `client/*` checks run the same idea from the other side: the
 harness plays broker, and the fault it injects is a refusal shaped like
@@ -113,15 +125,27 @@ misbehaves only at the lowest version keeps it honest: it is
 undetectable by a suite that negotiates once, so calibration fails if a
 sweep is ever removed.
 
-The group and KIP-848 checks came out of *implementing* those protocols
-in the reference subject rather than out of reading the schemas, which
-is where the underspecified parts surface. A join carrying no member id
+The group, KIP-848 and transaction checks came out of *implementing*
+those protocols in the reference subject rather than out of reading the
+schemas, which is where the underspecified parts surface. A join carrying no member id
 must be refused with `MEMBER_ID_REQUIRED` *and* handed an id to rejoin
 with. The assignment bytes a leader supplies must reach their member
 unexamined — the same opacity the record-batch codec promises. In
 KIP-848, an absent assignment means "unchanged" while an empty one
 means "revoked", which is how a steady-state heartbeat is told apart
 from an unsubscribe.
+
+Transactions surfaced two more. A client must ask FindCoordinator for
+its transactional id before InitProducerId — obvious in a multi-broker
+cluster, but it is also what makes brokers materialize their
+transaction log, and Redpanda 25.2 answers InitProducerId with
+*silence* until it has. And a transactional write to a partition the
+client never announced is not refused by Kafka 4.1: the partition
+leader verifies membership with the coordinator and adds what is
+missing, so the records are in the transaction after all. The check
+was written expecting a refusal, the broker said otherwise, and the
+requirement it now states is the one that actually holds — the records
+must not end up outside the transaction, by either route.
 
 ## What the baselines record
 

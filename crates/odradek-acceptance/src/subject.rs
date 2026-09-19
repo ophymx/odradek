@@ -7,10 +7,14 @@
 //! check that cannot catch its own targeted fault is vacuous, and a check
 //! that fails against the compliant subject is wrong.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 
 use bytes::{Bytes, BytesMut};
+use odradek_protocol::messages::add_partitions_to_txn_request::AddPartitionsToTxnRequest;
+use odradek_protocol::messages::add_partitions_to_txn_response::{
+    AddPartitionsToTxnPartitionResult, AddPartitionsToTxnResponse, AddPartitionsToTxnTopicResult,
+};
 use odradek_protocol::messages::api_versions_request::ApiVersionsRequest;
 use odradek_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
 use odradek_protocol::messages::consumer_group_heartbeat_request::ConsumerGroupHeartbeatRequest;
@@ -21,14 +25,18 @@ use odradek_protocol::messages::create_topics_request::CreateTopicsRequest;
 use odradek_protocol::messages::create_topics_response::{
     CreatableTopicResult, CreateTopicsResponse,
 };
+use odradek_protocol::messages::end_txn_request::EndTxnRequest;
+use odradek_protocol::messages::end_txn_response::EndTxnResponse;
 use odradek_protocol::messages::fetch_request::FetchRequest;
 use odradek_protocol::messages::fetch_response::{
-    FetchResponse, FetchableTopicResponse, PartitionData,
+    AbortedTransaction, FetchResponse, FetchableTopicResponse, PartitionData,
 };
 use odradek_protocol::messages::find_coordinator_request::FindCoordinatorRequest;
 use odradek_protocol::messages::find_coordinator_response::{Coordinator, FindCoordinatorResponse};
 use odradek_protocol::messages::heartbeat_request::HeartbeatRequest;
 use odradek_protocol::messages::heartbeat_response::HeartbeatResponse;
+use odradek_protocol::messages::init_producer_id_request::InitProducerIdRequest;
+use odradek_protocol::messages::init_producer_id_response::InitProducerIdResponse;
 use odradek_protocol::messages::join_group_request::JoinGroupRequest;
 use odradek_protocol::messages::join_group_response::{JoinGroupResponse, JoinGroupResponseMember};
 use odradek_protocol::messages::leave_group_request::LeaveGroupRequest;
@@ -193,6 +201,25 @@ pub enum Fault {
     FetchCorruptOnOldVersions,
     /// Echo a different topic id than the fetch requested.
     FetchWrongTopicId,
+
+    /// Hand a producer re-taking a transactional id the same epoch its
+    /// predecessor had, so the two are indistinguishable and neither is
+    /// fenced.
+    TxnInitReusesEpoch,
+    /// Honour a transaction request carrying a superseded epoch, letting
+    /// a fenced producer write into its successor's transaction.
+    TxnIgnoresProducerEpoch,
+    /// Accept a transactional write to a partition the transaction never
+    /// announced *and* leave it out of the transaction, so no marker
+    /// covers it and aborting does not disown it.
+    TxnUnannouncedWriteEscapes,
+    /// Report the last stable offset as the end of the log even with a
+    /// transaction open, offering read_committed consumers records that
+    /// may yet be aborted.
+    TxnStableOffsetIgnoresOpenTxn,
+    /// Finish an aborted transaction without telling readers it was
+    /// aborted, so its records read as data.
+    TxnAbortListOmitted,
 }
 
 impl Fault {
@@ -215,6 +242,11 @@ impl Fault {
         Fault::FetchCorruptBatch,
         Fault::ProduceTopicIdUnknown,
         Fault::FetchWrongTopicId,
+        Fault::TxnInitReusesEpoch,
+        Fault::TxnIgnoresProducerEpoch,
+        Fault::TxnUnannouncedWriteEscapes,
+        Fault::TxnStableOffsetIgnoresOpenTxn,
+        Fault::TxnAbortListOmitted,
         Fault::ListOffsetsWrongEarliest,
         Fault::FindCoordinatorWrongKey,
         Fault::OffsetFetchLosesCommit,
@@ -314,6 +346,21 @@ fn advertised_keys() -> Vec<ApiVersion> {
             FindCoordinatorRequest::MAX_VERSION,
         ),
         (
+            InitProducerIdRequest::API_KEY,
+            InitProducerIdRequest::MIN_VERSION,
+            InitProducerIdRequest::MAX_VERSION,
+        ),
+        (
+            AddPartitionsToTxnRequest::API_KEY,
+            AddPartitionsToTxnRequest::MIN_VERSION,
+            AddPartitionsToTxnRequest::MAX_VERSION,
+        ),
+        (
+            EndTxnRequest::API_KEY,
+            EndTxnRequest::MIN_VERSION,
+            EndTxnRequest::MAX_VERSION,
+        ),
+        (
             OffsetCommitRequest::API_KEY,
             OffsetCommitRequest::MIN_VERSION,
             OffsetCommitRequest::MAX_VERSION,
@@ -370,12 +417,42 @@ fn advertised_keys() -> Vec<ApiVersion> {
     .collect()
 }
 
-/// One partition's log: appended record sets and the next offset to
-/// assign.
+/// One partition's log: appended record sets, the next offset to
+/// assign, and what transactions have done to it.
 #[derive(Debug, Default)]
 struct PartitionLog {
     bytes: BytesMut,
     next_offset: i64,
+    /// Producers with a transaction open here, and the offset their
+    /// first record landed at. The lowest of these is the last stable
+    /// offset: nothing at or past it is decided yet.
+    open: HashMap<i64, i64>,
+    /// Finished transactions that were aborted: (producer id, first
+    /// offset). Reported to `read_committed` fetches, which is the only
+    /// way a reader learns those records were thrown away.
+    aborted: Vec<(i64, i64)>,
+}
+
+impl PartitionLog {
+    /// The last stable offset: the first offset belonging to a
+    /// transaction that has not finished, or the end of the log when
+    /// none has started.
+    fn last_stable_offset(&self) -> i64 {
+        self.open
+            .values()
+            .copied()
+            .min()
+            .unwrap_or(self.next_offset)
+    }
+}
+
+/// One transactional id's state, as the coordinator sees it.
+#[derive(Debug, Default)]
+struct TxnState {
+    producer_id: i64,
+    epoch: i16,
+    /// Partitions announced for the transaction currently open.
+    partitions: HashSet<(String, i32)>,
 }
 
 /// Connection-scoped broker state — the suite's produce/fetch flow uses
@@ -394,6 +471,10 @@ struct ConnState {
     members_848: HashMap<(String, String), Member848>,
     /// Where this connection is in the SASL exchange.
     sasl: SaslState,
+    /// Transactions by transactional id.
+    txns: HashMap<String, TxnState>,
+    /// The next producer id to hand out.
+    next_producer_id: i64,
     /// Topics CreateTopics actually created. Distinct from `logs`, which
     /// only gains an entry once something is produced, and from
     /// `topic_names`, which maps ids: a topic can exist and be empty.
@@ -576,6 +657,13 @@ async fn handle_connection(mut stream: TcpStream, faults: Vec<Fault>) {
             ConsumerGroupHeartbeatRequest::API_KEY => {
                 consumer_group_heartbeat_exchange(frame, api_version, &faults, &mut state)
             }
+            InitProducerIdRequest::API_KEY => {
+                init_producer_id_exchange(frame, api_version, &faults, &mut state)
+            }
+            AddPartitionsToTxnRequest::API_KEY => {
+                add_partitions_to_txn_exchange(frame, api_version, &faults, &mut state)
+            }
+            EndTxnRequest::API_KEY => end_txn_exchange(frame, api_version, &faults, &mut state),
             SaslHandshakeRequest::API_KEY => {
                 sasl_handshake_exchange(frame, api_version, &faults, &mut state)
             }
@@ -1666,6 +1754,14 @@ fn produce_exchange(
     let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
     let request = ProduceRequest::decode(&mut frame, api_version).ok()?;
 
+    // Taken before the logs are borrowed mutably; a produce never
+    // changes which partitions were announced.
+    let txns_snapshot: HashMap<String, HashSet<(String, i32)>> = state
+        .txns
+        .iter()
+        .map(|(id, txn)| (id.clone(), txn.partitions.clone()))
+        .collect();
+
     let mut responses = Vec::new();
     for topic in &request.topic_data {
         // v13+ addresses by id; earlier versions by name.
@@ -1700,6 +1796,28 @@ fn produce_exchange(
                 .map(|b| i64::from(b.last_offset_delta) + 1)
                 .sum();
             let mut base_offset = log.next_offset;
+            // A transactional write joins the transaction, announced or
+            // not: this subject adopts the partition the way Kafka's
+            // own leader does rather than refusing, so the records are
+            // covered by whatever marker ends the transaction. Under
+            // TxnUnannouncedWriteEscapes it does neither, and they are
+            // covered by nothing.
+            if request.transactional_id.is_some() {
+                let producer_id = records::decode_set(&mut set.clone())
+                    .ok()?
+                    .first()
+                    .map_or(-1, |batch| batch.producer_id);
+                let announced = state_txn_has_partition(
+                    &txns_snapshot,
+                    request.transactional_id.as_deref(),
+                    name,
+                    partition.index,
+                );
+                let escapes = !announced && faults.contains(&Fault::TxnUnannouncedWriteEscapes);
+                if producer_id >= 0 && !escapes {
+                    log.open.entry(producer_id).or_insert(base_offset);
+                }
+            }
             log.bytes.extend_from_slice(&set);
             log.next_offset += appended;
             if faults.contains(&Fault::ProduceWrongBaseOffset) {
@@ -1779,7 +1897,7 @@ fn fetch_exchange(
                             data.partition_index = p.partition;
                             data.error_code = ErrorCode::OFFSET_OUT_OF_RANGE.0;
                             data.high_watermark = log.next_offset;
-                            data.last_stable_offset = log.next_offset;
+                            data.last_stable_offset = stable_offset(log, faults);
                             data.log_start_offset = 0;
                             data
                         }
@@ -1796,8 +1914,25 @@ fn fetch_exchange(
                             data.partition_index = p.partition;
                             data.error_code = 0;
                             data.high_watermark = log.next_offset;
-                            data.last_stable_offset = log.next_offset;
+                            data.last_stable_offset = stable_offset(log, faults);
                             data.log_start_offset = 0;
+                            // Aborted records are returned like any
+                            // others, with a list of what to disown:
+                            // dropping them is the reader's job, and it
+                            // cannot do it without being told.
+                            if request.isolation_level == READ_COMMITTED {
+                                data.aborted_transactions = Some(
+                                    log.aborted
+                                        .iter()
+                                        .map(|(producer_id, first_offset)| {
+                                            let mut entry = AbortedTransaction::default();
+                                            entry.producer_id = *producer_id;
+                                            entry.first_offset = *first_offset;
+                                            entry
+                                        })
+                                        .collect(),
+                                );
+                            }
                             data.records = Some(bytes.freeze());
                             data
                         }
@@ -1828,4 +1963,243 @@ fn fetch_exchange(
         |out| resp.encode(out, api_version).unwrap(),
         faults.contains(&Fault::FetchTrailingGarbage),
     )
+}
+
+// ---- transactions ---------------------------------------------------
+
+/// Claim a transactional id: hand out a producer id, and a *higher*
+/// epoch every time the id changes hands.
+///
+/// The epoch bump is the whole mechanism. It is what lets the
+/// coordinator tell the producer holding the id now from the one that
+/// held it a moment ago, so a half-dead predecessor cannot write into
+/// its successor's transaction.
+fn init_producer_id_exchange(
+    mut frame: Bytes,
+    api_version: i16,
+    faults: &[Fault],
+    state: &mut ConnState,
+) -> Option<BytesMut> {
+    if !(InitProducerIdRequest::MIN_VERSION..=InitProducerIdRequest::MAX_VERSION)
+        .contains(&api_version)
+    {
+        return None;
+    }
+    let hv = header::request_header_version(InitProducerIdRequest::API_KEY, api_version)?;
+    let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
+    let request = InitProducerIdRequest::decode(&mut frame, api_version).ok()?;
+
+    let mut resp = InitProducerIdResponse::default();
+    match &request.transactional_id {
+        None => {
+            // No id to fence: the plain idempotent case, where an id
+            // scoped to the session is all anyone asked for.
+            state.next_producer_id += 1;
+            resp.producer_id = state.next_producer_id;
+            resp.producer_epoch = 0;
+        }
+        Some(id) => {
+            let next_id = state.next_producer_id + 1;
+            let txn = state.txns.entry(id.clone()).or_insert_with(|| TxnState {
+                producer_id: next_id,
+                // Pre-first: the first claim bumps it to 0, so every
+                // handover including the first one moves the epoch.
+                epoch: -1,
+                ..Default::default()
+            });
+            if txn.producer_id == next_id {
+                state.next_producer_id = next_id;
+            }
+            if faults.contains(&Fault::TxnInitReusesEpoch) {
+                // Same epoch for the successor: the predecessor is now
+                // indistinguishable from it and stays able to write.
+                txn.epoch = txn.epoch.max(0);
+            } else {
+                txn.epoch += 1;
+            }
+            // Taking over the id ends whatever the predecessor left
+            // open; the announced partitions go with it.
+            txn.partitions.clear();
+            resp.producer_id = txn.producer_id;
+            resp.producer_epoch = txn.epoch;
+        }
+    }
+    resp.error_code = ErrorCode::NONE.0;
+    frame_response(
+        req_header.correlation_id,
+        response_header_version(InitProducerIdRequest::API_KEY, api_version),
+        |out| resp.encode(out, api_version).unwrap(),
+        false,
+    )
+}
+
+/// Announce partitions to an open transaction.
+fn add_partitions_to_txn_exchange(
+    mut frame: Bytes,
+    api_version: i16,
+    faults: &[Fault],
+    state: &mut ConnState,
+) -> Option<BytesMut> {
+    if !(AddPartitionsToTxnRequest::MIN_VERSION..=AddPartitionsToTxnRequest::MAX_VERSION)
+        .contains(&api_version)
+    {
+        return None;
+    }
+    let hv = header::request_header_version(AddPartitionsToTxnRequest::API_KEY, api_version)?;
+    let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
+    let request = AddPartitionsToTxnRequest::decode(&mut frame, api_version).ok()?;
+
+    let id = request.v3_and_below_transactional_id.clone();
+    let epoch = request.v3_and_below_producer_epoch;
+    let code = txn_epoch_check(state, &id, epoch, faults);
+    if code.is_ok() {
+        if let Some(txn) = state.txns.get_mut(&id) {
+            for topic in &request.v3_and_below_topics {
+                for partition in &topic.partitions {
+                    txn.partitions.insert((topic.name.clone(), *partition));
+                }
+            }
+        }
+    }
+
+    let mut resp = AddPartitionsToTxnResponse::default();
+    resp.results_by_topic_v3_and_below = request
+        .v3_and_below_topics
+        .iter()
+        .map(|topic| {
+            let mut result = AddPartitionsToTxnTopicResult::default();
+            result.name = topic.name.clone();
+            result.results_by_partition = topic
+                .partitions
+                .iter()
+                .map(|partition| {
+                    let mut entry = AddPartitionsToTxnPartitionResult::default();
+                    entry.partition_index = *partition;
+                    entry.partition_error_code = code.0;
+                    entry
+                })
+                .collect();
+            result
+        })
+        .collect();
+    frame_response(
+        req_header.correlation_id,
+        response_header_version(AddPartitionsToTxnRequest::API_KEY, api_version),
+        |out| resp.encode(out, api_version).unwrap(),
+        false,
+    )
+}
+
+/// Finish a transaction, marking every partition it touched.
+fn end_txn_exchange(
+    mut frame: Bytes,
+    api_version: i16,
+    faults: &[Fault],
+    state: &mut ConnState,
+) -> Option<BytesMut> {
+    if !(EndTxnRequest::MIN_VERSION..=EndTxnRequest::MAX_VERSION).contains(&api_version) {
+        return None;
+    }
+    let hv = header::request_header_version(EndTxnRequest::API_KEY, api_version)?;
+    let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
+    let request = EndTxnRequest::decode(&mut frame, api_version).ok()?;
+
+    let code = txn_epoch_check(
+        state,
+        &request.transactional_id,
+        request.producer_epoch,
+        faults,
+    );
+    if code.is_ok() {
+        let producer_id = state
+            .txns
+            .get(&request.transactional_id)
+            .map_or(-1, |txn| txn.producer_id);
+        // Every partition the producer wrote to under this id, not only
+        // the announced ones: a broker that adopted an unannounced
+        // write owes it a marker like any other.
+        let touched: Vec<(String, i32)> = state
+            .logs
+            .iter()
+            .filter(|(_, log)| log.open.contains_key(&producer_id))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in touched {
+            let Some(log) = state.logs.get_mut(&key) else {
+                continue;
+            };
+            let Some(first_offset) = log.open.remove(&producer_id) else {
+                continue;
+            };
+            // The marker is a record of its own, which is why the
+            // stable offset ends up past the transaction's records
+            // rather than at them.
+            log.next_offset += 1;
+            if !request.committed && !faults.contains(&Fault::TxnAbortListOmitted) {
+                log.aborted.push((producer_id, first_offset));
+            }
+        }
+        if let Some(txn) = state.txns.get_mut(&request.transactional_id) {
+            txn.partitions.clear();
+        }
+    }
+
+    let mut resp = EndTxnResponse::default();
+    resp.error_code = code.0;
+    frame_response(
+        req_header.correlation_id,
+        response_header_version(EndTxnRequest::API_KEY, api_version),
+        |out| resp.encode(out, api_version).unwrap(),
+        false,
+    )
+}
+
+/// Whether the epoch on a transaction request is the current one.
+///
+/// A superseded epoch means the producer has been fenced: another one
+/// took the id. Honouring it anyway would let both write into the same
+/// transaction, which is the failure transactions exist to prevent.
+fn txn_epoch_check(
+    state: &ConnState,
+    transactional_id: &str,
+    epoch: i16,
+    faults: &[Fault],
+) -> ErrorCode {
+    let Some(txn) = state.txns.get(transactional_id) else {
+        return ErrorCode::INVALID_PRODUCER_ID_MAPPING;
+    };
+    if faults.contains(&Fault::TxnIgnoresProducerEpoch) || epoch == txn.epoch {
+        ErrorCode::NONE
+    } else {
+        ErrorCode::PRODUCER_FENCED
+    }
+}
+
+/// The fetch isolation level that filters uncommitted data.
+const READ_COMMITTED: i8 = 1;
+
+/// Whether `partition` was announced for the transaction `id` names.
+fn state_txn_has_partition(
+    snapshot: &HashMap<String, HashSet<(String, i32)>>,
+    transactional_id: Option<&str>,
+    topic: &str,
+    partition: i32,
+) -> bool {
+    transactional_id
+        .and_then(|id| snapshot.get(id))
+        .is_some_and(|partitions| partitions.contains(&(topic.to_owned(), partition)))
+}
+
+/// The last stable offset this partition reports.
+///
+/// Under `TxnStableOffsetIgnoresOpenTxn` it is simply the end of the
+/// log, which offers every `read_committed` consumer the records of
+/// transactions that have not finished — records that may yet be
+/// aborted, and that the consumer asked specifically not to see.
+fn stable_offset(log: &PartitionLog, faults: &[Fault]) -> i64 {
+    if faults.contains(&Fault::TxnStableOffsetIgnoresOpenTxn) {
+        log.next_offset
+    } else {
+        log.last_stable_offset()
+    }
 }

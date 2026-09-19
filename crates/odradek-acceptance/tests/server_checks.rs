@@ -81,6 +81,20 @@ const SENSITIVITY: &[(Fault, &str)] = &[
     (Fault::FetchCorruptBatch, "fetch/batch-integrity"),
     (Fault::ProduceTopicIdUnknown, "produce/topic-id"),
     (Fault::FetchWrongTopicId, "fetch/topic-id"),
+    (Fault::TxnInitReusesEpoch, "txn/init-bumps-the-epoch"),
+    (Fault::TxnIgnoresProducerEpoch, "txn/stale-epoch-is-fenced"),
+    (
+        Fault::TxnUnannouncedWriteEscapes,
+        "txn/unannounced-write-stays-in-the-transaction",
+    ),
+    (
+        Fault::TxnStableOffsetIgnoresOpenTxn,
+        "txn/open-transaction-holds-the-stable-offset",
+    ),
+    (
+        Fault::TxnAbortListOmitted,
+        "txn/abort-is-reported-to-readers",
+    ),
     (
         Fault::ListOffsetsWrongEarliest,
         "list-offsets/earliest-latest",

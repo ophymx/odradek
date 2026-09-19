@@ -13,18 +13,26 @@
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use odradek_protocol::messages::add_partitions_to_txn_request::{
+    AddPartitionsToTxnRequest, AddPartitionsToTxnTopic,
+};
+use odradek_protocol::messages::add_partitions_to_txn_response::AddPartitionsToTxnResponse;
 use odradek_protocol::messages::api_versions_request::ApiVersionsRequest;
 use odradek_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
 use odradek_protocol::messages::consumer_group_heartbeat_request::ConsumerGroupHeartbeatRequest;
 use odradek_protocol::messages::consumer_group_heartbeat_response::ConsumerGroupHeartbeatResponse;
 use odradek_protocol::messages::create_topics_request::{CreatableTopic, CreateTopicsRequest};
 use odradek_protocol::messages::create_topics_response::CreateTopicsResponse;
+use odradek_protocol::messages::end_txn_request::EndTxnRequest;
+use odradek_protocol::messages::end_txn_response::EndTxnResponse;
 use odradek_protocol::messages::fetch_request::{FetchPartition, FetchRequest, FetchTopic};
 use odradek_protocol::messages::fetch_response::FetchResponse;
 use odradek_protocol::messages::find_coordinator_request::FindCoordinatorRequest;
 use odradek_protocol::messages::find_coordinator_response::FindCoordinatorResponse;
 use odradek_protocol::messages::heartbeat_request::HeartbeatRequest;
 use odradek_protocol::messages::heartbeat_response::HeartbeatResponse;
+use odradek_protocol::messages::init_producer_id_request::InitProducerIdRequest;
+use odradek_protocol::messages::init_producer_id_response::InitProducerIdResponse;
 use odradek_protocol::messages::join_group_request::{JoinGroupRequest, JoinGroupRequestProtocol};
 use odradek_protocol::messages::join_group_response::JoinGroupResponse;
 use odradek_protocol::messages::list_offsets_request::{
@@ -258,6 +266,41 @@ pub static SERVER_CHECKS: &[Check] = &[
         requirement: "completes a SCRAM exchange with a server signature that \
                       verifies, proving it holds the account's key material",
         runner: Runner::Server(|ctx| Box::pin(scram_server_proves_itself(ctx))),
+    },
+    Check {
+        id: "txn/init-bumps-the-epoch",
+        requirement: "hands a producer re-taking a transactional id a higher \
+                      epoch than its predecessor, which is the only thing that \
+                      tells the two apart",
+        runner: Runner::Server(|ctx| Box::pin(txn_init_bumps_the_epoch(ctx))),
+    },
+    Check {
+        id: "txn/stale-epoch-is-fenced",
+        requirement: "refuses a transaction request carrying a superseded \
+                      producer epoch, rather than letting a fenced producer \
+                      write into its successor's transaction",
+        runner: Runner::Server(|ctx| Box::pin(txn_stale_epoch_is_fenced(ctx))),
+    },
+    Check {
+        id: "txn/unannounced-write-stays-in-the-transaction",
+        requirement: "either refuses a transactional produce to a partition the \
+                      client never announced, or brings that partition into the \
+                      transaction itself — never writes the records outside it",
+        runner: Runner::Server(|ctx| Box::pin(txn_unannounced_write_stays_in_the_transaction(ctx))),
+    },
+    Check {
+        id: "txn/open-transaction-holds-the-stable-offset",
+        requirement: "keeps the last stable offset below the high watermark \
+                      while a transaction is open, so read_committed consumers \
+                      are not shown records that may yet be aborted",
+        runner: Runner::Server(|ctx| Box::pin(txn_open_transaction_holds_the_stable_offset(ctx))),
+    },
+    Check {
+        id: "txn/abort-is-reported-to-readers",
+        requirement: "names the aborted transaction in a read_committed fetch \
+                      over its records, which is the only way a client can tell \
+                      they were thrown away",
+        runner: Runner::Server(|ctx| Box::pin(txn_abort_is_reported_to_readers(ctx))),
     },
 ];
 
@@ -3497,4 +3540,851 @@ fn batch_integrity(sent: &Bytes, got: &Bytes) -> Verdict {
         ));
     }
     Verdict::Pass
+}
+
+// ---- transactions ---------------------------------------------------
+//
+// A transaction is an agreement between a producer and its coordinator
+// that a set of writes lands all together or not at all. Four things
+// have to hold for that to mean anything, and each is a check below:
+// the id can be taken over (fencing), a partition cannot be written to
+// without being announced, an open transaction withholds its records
+// from committed readers, and an abandoned one is reported to them as
+// abandoned rather than quietly left in the log looking like data.
+
+/// AddPartitionsToTxn versions a client may speak; v4+ is the
+/// broker-to-broker batching shape, which the schema reserves outright.
+const ADD_PARTITIONS_CLIENT_MAX: i16 = 3;
+/// InitProducerId below v6 (2PC, marked unstable upstream).
+const TXN_INIT_MAX: i16 = 5;
+/// EndTxn below v5, which bumps the epoch on every transaction and
+/// hands back a new one the client must adopt.
+const END_TXN_MAX: i16 = 4;
+/// The fetch isolation level that filters uncommitted data.
+const READ_COMMITTED: i8 = 1;
+/// The record batch attribute marking a batch as transactional.
+const TRANSACTIONAL_ATTR: i16 = 1 << 4;
+
+/// Negotiated versions for one transaction check.
+struct TxnVersions {
+    init: i16,
+    add: i16,
+    end: i16,
+    produce: i16,
+    fetch: i16,
+}
+
+fn txn_versions(ctx: &ServerCtx) -> Result<TxnVersions, Verdict> {
+    Ok(TxnVersions {
+        init: negotiate(
+            "InitProducerId",
+            ctx.range(InitProducerIdRequest::API_KEY)?,
+            InitProducerIdRequest::MIN_VERSION,
+            TXN_INIT_MAX,
+        )?,
+        add: negotiate(
+            "AddPartitionsToTxn",
+            ctx.range(AddPartitionsToTxnRequest::API_KEY)?,
+            AddPartitionsToTxnRequest::MIN_VERSION,
+            ADD_PARTITIONS_CLIENT_MAX,
+        )?,
+        end: negotiate(
+            "EndTxn",
+            ctx.range(EndTxnRequest::API_KEY)?,
+            EndTxnRequest::MIN_VERSION,
+            END_TXN_MAX,
+        )?,
+        produce: negotiate(
+            "Produce",
+            ctx.range(ProduceRequest::API_KEY)?,
+            ProduceRequest::MIN_VERSION,
+            PRODUCE_NAME_MAX,
+        )?,
+        fetch: negotiate(
+            "Fetch",
+            ctx.range(FetchRequest::API_KEY)?,
+            FetchRequest::MIN_VERSION,
+            FETCH_NAME_MAX,
+        )?,
+    })
+}
+
+/// Who is acting, and on which transaction.
+///
+/// The three travel together because they are checked together: the id
+/// names the transaction, and the producer id and epoch are what prove
+/// this is the producer entitled to it.
+#[derive(Debug, Clone, Copy)]
+struct TxnActor<'a> {
+    transactional_id: &'a str,
+    producer_id: i64,
+    producer_epoch: i16,
+}
+
+impl<'a> TxnActor<'a> {
+    fn new(transactional_id: &'a str, identity: &InitProducerIdResponse) -> TxnActor<'a> {
+        TxnActor {
+            transactional_id,
+            producer_id: identity.producer_id,
+            producer_epoch: identity.producer_epoch,
+        }
+    }
+
+    /// The same actor at a different epoch — a superseded one, in the
+    /// only check that wants it.
+    fn at_epoch(self, producer_epoch: i16) -> TxnActor<'a> {
+        TxnActor {
+            producer_epoch,
+            ..self
+        }
+    }
+}
+
+/// A transactional id nothing else will use.
+fn unique_transactional_id(tag: &str) -> String {
+    format!("odradek-txn-{tag}-{}", unique_topic(tag))
+}
+
+/// Discover the transaction coordinator for `transactional_id`.
+///
+/// Not optional, and not only because a multi-broker cluster needs to
+/// know which broker to ask. Brokers materialize their transaction log
+/// on this call: Redpanda 25.2 answers InitProducerId with *silence* —
+/// no response frame at all — until a FindCoordinator has created
+/// `kafka_internal/tx`, while Kafka 4.1 answers either way. A suite
+/// that skipped the step would report Redpanda as broken rather than
+/// report itself as impatient.
+async fn await_txn_coordinator(
+    ctx: &ServerCtx,
+    conn: &mut RawConnection,
+    transactional_id: &str,
+    correlation: i32,
+) -> Result<(), CheckError> {
+    let advertised = match ctx.range(FindCoordinatorRequest::API_KEY) {
+        Ok(a) => a,
+        // Nothing to ask; let InitProducerId report what it reports.
+        Err(_) => return Ok(()),
+    };
+    let Ok(version) = negotiate(
+        "FindCoordinator",
+        advertised,
+        FindCoordinatorRequest::MIN_VERSION,
+        FindCoordinatorRequest::MAX_VERSION,
+    ) else {
+        return Ok(());
+    };
+    let mut request = FindCoordinatorRequest::default();
+    request.key_type = 1; // transaction coordinator
+    if version >= FIND_COORDINATOR_BATCHED {
+        request.coordinator_keys = vec![transactional_id.to_owned()];
+    } else {
+        request.key = transactional_id.to_owned();
+    }
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding FindCoordinator: {e}")))?;
+
+    for attempt in 0..ctx.config.settle_attempts() {
+        if attempt > 0 {
+            tokio::time::sleep(ctx.config.settle_delay).await;
+        }
+        let resp: FindCoordinatorResponse = api_call(
+            conn,
+            FindCoordinatorRequest::API_KEY,
+            version,
+            correlation + i32::try_from(attempt).unwrap_or(0),
+            &body,
+        )
+        .await?;
+        if !is_coordinator_settling(coordinator_error(&resp, version)) {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// Claim a transactional id, riding out a coordinator that is still
+/// loading.
+///
+/// A cluster that has never hosted a transaction creates its
+/// transaction log on the first ask and answers
+/// COORDINATOR_LOAD_IN_PROGRESS until that log's partitions have
+/// leaders — retriable, not a wrong answer, and a suite that treated it
+/// as one would fail every transaction check on a fresh broker.
+async fn init_producer_id(
+    ctx: &ServerCtx,
+    conn: &mut RawConnection,
+    version: i16,
+    transactional_id: &str,
+    correlation: i32,
+) -> Result<InitProducerIdResponse, CheckError> {
+    await_txn_coordinator(ctx, conn, transactional_id, correlation - 1).await?;
+    let mut request = InitProducerIdRequest::default();
+    request.transactional_id = Some(transactional_id.to_owned());
+    request.transaction_timeout_ms = 60_000;
+    request.producer_id = -1;
+    request.producer_epoch = -1;
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding InitProducerId: {e}")))?;
+
+    let mut last = ErrorCode(0);
+    for attempt in 0..ctx.config.settle_attempts() {
+        if attempt > 0 {
+            tokio::time::sleep(ctx.config.settle_delay).await;
+            // Ask again where the coordinator is: on a broker that has
+            // never hosted a transaction, this is the call that creates
+            // the log, and a NOT_COORDINATOR means the partition it
+            // lives on has no leader yet.
+            await_txn_coordinator(ctx, conn, transactional_id, correlation - 1).await?;
+        }
+        let resp: InitProducerIdResponse = api_call(
+            conn,
+            InitProducerIdRequest::API_KEY,
+            version,
+            correlation + i32::try_from(attempt).unwrap_or(0),
+            &body,
+        )
+        .await?;
+        last = ErrorCode(resp.error_code);
+        if last.is_ok() {
+            return Ok(resp);
+        }
+        // Coordinator-settling codes are a wait, not an answer: the
+        // transaction log is being created and its partitions are
+        // electing leaders. A suite that stopped here would report
+        // every broker as broken on its first ever transaction.
+        if !retriable(last)
+            && !txn_coordinator_settling(last)
+            && last != ErrorCode::CONCURRENT_TRANSACTIONS
+        {
+            break;
+        }
+    }
+    Err(CheckError::Violation(format!(
+        "InitProducerId for {transactional_id} never succeeded: {last}"
+    )))
+}
+
+/// Codes that mean the transaction log is still coming up, rather than
+/// an answer about this request.
+///
+/// NOT_COORDINATOR normally means a client asked the wrong broker,
+/// which is a real answer worth reporting — which is why the group
+/// path's [`is_coordinator_settling`] excludes it. On the first
+/// transaction against a fresh cluster it means something else: the
+/// transaction log has only just been created, the partition this id
+/// hashes to has no leader yet, and the broker that is about to
+/// coordinate it does not know that yet either.
+fn txn_coordinator_settling(code: ErrorCode) -> bool {
+    is_coordinator_settling(code) || code == ErrorCode::NOT_COORDINATOR
+}
+
+/// Announce one partition to the transaction, returning the per-partition
+/// error code the coordinator answered with.
+async fn add_partitions_to_txn(
+    conn: &mut RawConnection,
+    version: i16,
+    actor: TxnActor<'_>,
+    topic: &str,
+    partition: i32,
+    correlation: i32,
+) -> Result<ErrorCode, CheckError> {
+    let mut topic_entry = AddPartitionsToTxnTopic::default();
+    topic_entry.name = topic.to_owned();
+    topic_entry.partitions = vec![partition];
+    let mut request = AddPartitionsToTxnRequest::default();
+    request.v3_and_below_transactional_id = actor.transactional_id.to_owned();
+    request.v3_and_below_producer_id = actor.producer_id;
+    request.v3_and_below_producer_epoch = actor.producer_epoch;
+    request.v3_and_below_topics = vec![topic_entry];
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding AddPartitionsToTxn: {e}")))?;
+    let resp: AddPartitionsToTxnResponse = api_call(
+        conn,
+        AddPartitionsToTxnRequest::API_KEY,
+        version,
+        correlation,
+        &body,
+    )
+    .await?;
+    // At v3 and below the per-partition results are the whole answer;
+    // the top-level error code does not exist until v4.
+    Ok(resp
+        .results_by_topic_v3_and_below
+        .first()
+        .and_then(|t| t.results_by_partition.first())
+        .map_or(ErrorCode::NONE, |p| ErrorCode(p.partition_error_code)))
+}
+
+/// Finish the transaction, returning the coordinator's answer.
+async fn end_txn(
+    conn: &mut RawConnection,
+    version: i16,
+    actor: TxnActor<'_>,
+    committed: bool,
+    correlation: i32,
+) -> Result<ErrorCode, CheckError> {
+    let mut request = EndTxnRequest::default();
+    request.transactional_id = actor.transactional_id.to_owned();
+    request.producer_id = actor.producer_id;
+    request.producer_epoch = actor.producer_epoch;
+    request.committed = committed;
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding EndTxn: {e}")))?;
+    let resp: EndTxnResponse =
+        api_call(conn, EndTxnRequest::API_KEY, version, correlation, &body).await?;
+    Ok(ErrorCode(resp.error_code))
+}
+
+/// Produce one transactional batch, returning the partition's error code
+/// and base offset.
+async fn produce_transactional(
+    conn: &mut RawConnection,
+    version: i16,
+    actor: TxnActor<'_>,
+    topic: &str,
+    partition: i32,
+    base_sequence: i32,
+    correlation: i32,
+) -> Result<(ErrorCode, i64), CheckError> {
+    let mut batch = probe_batch();
+    // The three fields plus the attribute bit are what make this a
+    // transactional write rather than a plain one.
+    batch.attributes |= TRANSACTIONAL_ATTR;
+    batch.producer_id = actor.producer_id;
+    batch.producer_epoch = actor.producer_epoch;
+    batch.base_sequence = base_sequence;
+    let mut set = BytesMut::new();
+    batch
+        .encode(&mut set)
+        .map_err(|e| CheckError::Infra(format!("encoding transactional batch: {e}")))?;
+
+    let mut partition_data = PartitionProduceData::default();
+    partition_data.index = partition;
+    partition_data.records = Some(set.freeze());
+    let mut topic_data = TopicProduceData::default();
+    topic_data.name = topic.to_owned();
+    topic_data.partition_data = vec![partition_data];
+    let mut request = ProduceRequest::default();
+    request.transactional_id = Some(actor.transactional_id.to_owned());
+    // Transactional produce requires the full ISR; anything less and the
+    // broker refuses on grounds that have nothing to do with the check.
+    request.acks = -1;
+    request.timeout_ms = 10_000;
+    request.topic_data = vec![topic_data];
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding Produce: {e}")))?;
+    let resp: ProduceResponse =
+        api_call(conn, ProduceRequest::API_KEY, version, correlation, &body).await?;
+    let entry = resp
+        .responses
+        .first()
+        .and_then(|t| t.partition_responses.first())
+        .ok_or_else(|| CheckError::Violation("Produce response names no partitions".into()))?;
+    Ok((ErrorCode(entry.error_code), entry.base_offset))
+}
+
+/// One partition's fetch response at the given isolation level.
+async fn fetch_partition(
+    conn: &mut RawConnection,
+    version: i16,
+    topic: &str,
+    partition: i32,
+    offset: i64,
+    isolation_level: i8,
+    correlation: i32,
+) -> Result<odradek_protocol::messages::fetch_response::PartitionData, CheckError> {
+    let mut fetch_partition = FetchPartition::default();
+    fetch_partition.partition = partition;
+    fetch_partition.current_leader_epoch = -1;
+    fetch_partition.fetch_offset = offset;
+    fetch_partition.last_fetched_epoch = -1;
+    fetch_partition.log_start_offset = -1;
+    fetch_partition.partition_max_bytes = 1 << 20;
+    let mut fetch_topic = FetchTopic::default();
+    fetch_topic.topic = topic.to_owned();
+    fetch_topic.partitions = vec![fetch_partition];
+    let mut request = FetchRequest::default();
+    request.max_wait_ms = 500;
+    request.min_bytes = 0;
+    request.max_bytes = 1 << 22;
+    request.isolation_level = isolation_level;
+    request.session_id = 0;
+    request.session_epoch = -1;
+    request.topics = vec![fetch_topic];
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding Fetch: {e}")))?;
+    let resp: FetchResponse =
+        api_call(conn, FetchRequest::API_KEY, version, correlation, &body).await?;
+    resp.responses
+        .first()
+        .and_then(|t| t.partitions.first())
+        .cloned()
+        .ok_or_else(|| CheckError::Violation("Fetch response names no partitions".into()))
+}
+
+/// Taking over a transactional id must hand out a *newer* epoch.
+///
+/// The epoch is the only thing that distinguishes the producer holding
+/// the id now from the one that held it before. If a second
+/// InitProducerId returns the same epoch, a half-dead predecessor's
+/// writes are indistinguishable from its successor's and can be
+/// interleaved into a transaction the successor commits — the failure
+/// transactions exist to prevent.
+async fn txn_init_bumps_the_epoch(ctx: &ServerCtx) -> Verdict {
+    let versions = match txn_versions(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let mut conn = match connect(&ctx.addr).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
+    let id = unique_transactional_id("epoch");
+
+    let first = match init_producer_id(ctx, &mut conn, versions.init, &id, 400).await {
+        Ok(r) => r,
+        Err(e) => return e.context("InitProducerId (first)").into_verdict(),
+    };
+    let second = match init_producer_id(ctx, &mut conn, versions.init, &id, 420).await {
+        Ok(r) => r,
+        Err(e) => return e.context("InitProducerId (second)").into_verdict(),
+    };
+
+    if second.producer_id != first.producer_id {
+        // Not automatically wrong — a coordinator may issue a new id —
+        // but then the old one must be fenced, which the epoch check
+        // below cannot speak to. Report rather than guess.
+        return Verdict::Fail {
+            details: format!(
+                "re-initializing {id} changed the producer id ({} to {}); the epoch is what \
+                 should have moved",
+                first.producer_id, second.producer_id
+            ),
+        };
+    }
+    if second.producer_epoch <= first.producer_epoch {
+        return Verdict::Fail {
+            details: format!(
+                "re-initializing {id} returned epoch {} again (was {}), so the previous \
+                 producer is not fenced",
+                second.producer_epoch, first.producer_epoch
+            ),
+        };
+    }
+    Verdict::Pass
+}
+
+/// The fenced producer must actually be refused.
+///
+/// A higher epoch handed to the successor is only half of fencing; the
+/// other half is that the predecessor's requests stop working. A
+/// coordinator that bumps the epoch and then keeps honouring the old one
+/// has described fencing without doing it.
+async fn txn_stale_epoch_is_fenced(ctx: &ServerCtx) -> Verdict {
+    let versions = match txn_versions(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let produced = match produce_flow(ctx, "txnfence", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    let mut conn = produced.conn;
+    let id = unique_transactional_id("fence");
+
+    let first = match init_producer_id(ctx, &mut conn, versions.init, &id, 440).await {
+        Ok(r) => r,
+        Err(e) => return e.context("InitProducerId (first)").into_verdict(),
+    };
+    let second = match init_producer_id(ctx, &mut conn, versions.init, &id, 460).await {
+        Ok(r) => r,
+        Err(e) => return e.context("InitProducerId (second)").into_verdict(),
+    };
+    if second.producer_epoch <= first.producer_epoch {
+        return Verdict::Skipped {
+            reason: "the epoch never advanced, so there is no stale epoch to refuse \
+                     (txn/init-bumps-the-epoch reports that)"
+                .into(),
+        };
+    }
+
+    match add_partitions_to_txn(
+        &mut conn,
+        versions.add,
+        TxnActor::new(&id, &second).at_epoch(first.producer_epoch),
+        &produced.topic,
+        0,
+        480,
+    )
+    .await
+    {
+        Ok(code) if is_fenced(code) => Verdict::Pass,
+        Ok(code) if code.is_ok() => Verdict::Fail {
+            details: format!(
+                "AddPartitionsToTxn at the superseded epoch {} was accepted; the producer \
+                 holding {id} is epoch {}",
+                first.producer_epoch, second.producer_epoch
+            ),
+        },
+        Ok(code) => Verdict::Fail {
+            details: format!(
+                "AddPartitionsToTxn at the superseded epoch {} answered {code}, which does \
+                 not tell the caller it has been fenced",
+                first.producer_epoch
+            ),
+        },
+        Err(e) => e.context("AddPartitionsToTxn").into_verdict(),
+    }
+}
+
+/// A transactional write must never land outside its transaction.
+///
+/// The coordinator finishes a transaction by writing a marker into every
+/// partition it knows the transaction touched. A record written to a
+/// partition it does not know about would be covered by no marker at
+/// all: visible to committed readers even when the transaction is
+/// thrown away, or blocking the partition's stable offset forever.
+///
+/// There are two safe answers and the check accepts either, because
+/// brokers really do differ: refuse the write, or bring the partition
+/// into the transaction on the producer's behalf. Apache Kafka 4.1 does
+/// the latter — the partition leader verifies membership with the
+/// coordinator and adds what is missing, so an unannounced write is
+/// simply part of the transaction and an abort disowns it like any
+/// other. What the check rules out is the third answer, where the
+/// record is written and belongs to nothing.
+async fn txn_unannounced_write_stays_in_the_transaction(ctx: &ServerCtx) -> Verdict {
+    let versions = match txn_versions(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let produced = match produce_flow(ctx, "txnunannounced", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    let topic = produced.topic.clone();
+    let mut conn = produced.conn;
+    let id = unique_transactional_id("unannounced");
+
+    let identity = match init_producer_id(ctx, &mut conn, versions.init, &id, 500).await {
+        Ok(r) => r,
+        Err(e) => return e.context("InitProducerId").into_verdict(),
+    };
+
+    // No AddPartitionsToTxn: straight to the write.
+    let actor = TxnActor::new(&id, &identity);
+    let base_offset =
+        match produce_transactional(&mut conn, versions.produce, actor, &topic, 0, 0, 520).await {
+            // Refusing is the other safe answer: nothing was written, so
+            // nothing can be orphaned.
+            Ok((code, _)) if !code.is_ok() => return Verdict::Pass,
+            Ok((_, base_offset)) => base_offset,
+            Err(e) => return e.context("Produce").into_verdict(),
+        };
+
+    // It was accepted. Then the transaction had better own it — which
+    // an abort is the sharpest way to ask: if these records survive
+    // being thrown away, they were never in the transaction.
+    match end_txn(&mut conn, versions.end, actor, false, 530).await {
+        Ok(code) if code.is_ok() => {}
+        Ok(code) => {
+            return Verdict::Fail {
+                details: format!(
+                    "the unannounced write was accepted at offset {base_offset}, then aborting \
+                     the transaction answered {code}; those records are covered by nothing"
+                ),
+            };
+        }
+        Err(e) => return e.context("EndTxn").into_verdict(),
+    }
+
+    match await_abort_marker(
+        ctx,
+        &mut conn,
+        versions.fetch,
+        AbortedRun {
+            topic: &topic,
+            first_offset: base_offset,
+            producer_id: identity.producer_id,
+        },
+        "the unannounced write was accepted, but",
+        540,
+    )
+    .await
+    {
+        Ok(()) => Verdict::Pass,
+        Err(verdict) => verdict,
+    }
+}
+
+/// An open transaction must withhold its records from committed readers.
+///
+/// The last stable offset is the promise: a `read_committed` fetch stops
+/// there, because nothing past it is decided yet. A broker that lets the
+/// stable offset run up to the high watermark while a transaction is
+/// open shows uncommitted records to every consumer that asked not to
+/// see them — and the records may still be aborted.
+async fn txn_open_transaction_holds_the_stable_offset(ctx: &ServerCtx) -> Verdict {
+    let versions = match txn_versions(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let produced = match produce_flow(ctx, "txnlso", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    let topic = produced.topic.clone();
+    let mut conn = produced.conn;
+    let id = unique_transactional_id("lso");
+
+    let identity = match init_producer_id(ctx, &mut conn, versions.init, &id, 540).await {
+        Ok(r) => r,
+        Err(e) => return e.context("InitProducerId").into_verdict(),
+    };
+    let actor = TxnActor::new(&id, &identity);
+    if let Err(verdict) = open_transaction(ctx, &mut conn, &versions, actor, &topic, 0, 560).await {
+        return verdict;
+    }
+
+    let data =
+        match fetch_partition(&mut conn, versions.fetch, &topic, 0, 0, READ_COMMITTED, 580).await {
+            Ok(d) => d,
+            Err(e) => return e.context("Fetch (read_committed)").into_verdict(),
+        };
+    // Whatever else happens, the transaction stays open only as long as
+    // this check needs it; an abandoned one would hold the partition
+    // back from every later check on the same broker.
+    let cleanup = end_txn(&mut conn, versions.end, actor, false, 599).await;
+
+    if data.high_watermark <= data.last_stable_offset {
+        return Verdict::Fail {
+            details: format!(
+                "with a transaction open, the stable offset ({}) has caught up to the high \
+                 watermark ({}); uncommitted records are being offered to read_committed \
+                 consumers",
+                data.last_stable_offset, data.high_watermark
+            ),
+        };
+    }
+    if let Err(e) = cleanup {
+        return e.context("EndTxn (cleanup)").into_verdict();
+    }
+    Verdict::Pass
+}
+
+/// An aborted transaction must be reported as aborted.
+///
+/// The records stay in the log — aborting does not unwrite them — so a
+/// `read_committed` fetch returns them alongside a list of the
+/// transactions that disowned them, and the reading client drops what
+/// the list names. A broker that omits the list hands every client data
+/// somebody threw away, and the client cannot tell.
+async fn txn_abort_is_reported_to_readers(ctx: &ServerCtx) -> Verdict {
+    let versions = match txn_versions(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let produced = match produce_flow(ctx, "txnabort", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    let topic = produced.topic.clone();
+    let mut conn = produced.conn;
+    let id = unique_transactional_id("abort");
+
+    let identity = match init_producer_id(ctx, &mut conn, versions.init, &id, 600).await {
+        Ok(r) => r,
+        Err(e) => return e.context("InitProducerId").into_verdict(),
+    };
+    let actor = TxnActor::new(&id, &identity);
+    let first_offset =
+        match open_transaction(ctx, &mut conn, &versions, actor, &topic, 0, 620).await {
+            Ok(offset) => offset,
+            Err(verdict) => return verdict,
+        };
+    match end_txn(&mut conn, versions.end, actor, false, 640).await {
+        Ok(code) if code.is_ok() => {}
+        Ok(code) => {
+            return Verdict::Fail {
+                details: format!("aborting the transaction answered {code}"),
+            };
+        }
+        Err(e) => return e.context("EndTxn").into_verdict(),
+    }
+
+    match await_abort_marker(
+        ctx,
+        &mut conn,
+        versions.fetch,
+        AbortedRun {
+            topic: &topic,
+            first_offset,
+            producer_id: identity.producer_id,
+        },
+        "the abort was acknowledged, but",
+        660,
+    )
+    .await
+    {
+        Ok(()) => Verdict::Pass,
+        Err(verdict) => verdict,
+    }
+}
+
+/// Wait for an abort marker to land, then confirm a `read_committed`
+/// fetch over the aborted records names the transaction that disowned
+/// them.
+///
+/// Two claims, and they are the same claim from two sides. The stable
+/// offset must move past the records, or the partition stays blocked on
+/// a transaction that has already finished. And the aborted list must
+/// name the producer, or a reading client has no way to tell those
+/// records from data — the broker still returns them, because aborting
+/// does not unwrite anything.
+///
+/// The marker is written after EndTxn answers, so both happen a moment
+/// later; reading immediately would find nothing and prove nothing.
+async fn await_abort_marker(
+    ctx: &ServerCtx,
+    conn: &mut RawConnection,
+    fetch_version: i16,
+    run: AbortedRun<'_>,
+    context: &str,
+    correlation: i32,
+) -> Result<(), Verdict> {
+    let AbortedRun {
+        topic,
+        first_offset,
+        producer_id,
+    } = run;
+    let mut data = None;
+    for attempt in 0..ctx.config.settle_attempts() {
+        if attempt > 0 {
+            tokio::time::sleep(ctx.config.settle_delay).await;
+        }
+        let got = match fetch_partition(
+            conn,
+            fetch_version,
+            topic,
+            0,
+            first_offset,
+            READ_COMMITTED,
+            correlation + i32::try_from(attempt).unwrap_or(0),
+        )
+        .await
+        {
+            Ok(d) => d,
+            Err(e) => return Err(e.context("Fetch (read_committed)").into_verdict()),
+        };
+        let settled = got.last_stable_offset > first_offset;
+        data = Some(got);
+        if settled {
+            break;
+        }
+    }
+    let data = data.ok_or(Verdict::Error {
+        details: "no fetch attempts were made".into(),
+    })?;
+
+    if data.last_stable_offset <= first_offset {
+        return Err(Verdict::Fail {
+            details: format!(
+                "{context} the stable offset never moved past {first_offset} (still {}), so the \
+                 partition stays blocked on a transaction that has already finished",
+                data.last_stable_offset
+            ),
+        });
+    }
+    let aborted = data.aborted_transactions.unwrap_or_default();
+    if !aborted.iter().any(|entry| entry.producer_id == producer_id) {
+        return Err(Verdict::Fail {
+            details: format!(
+                "{context} a read_committed fetch over the aborted records named {} aborted \
+                 transaction(s), none of them producer {}; a client reading this partition has \
+                 no way to know those records were thrown away",
+                aborted.len(),
+                producer_id
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// One aborted transaction's footprint on one partition.
+#[derive(Debug, Clone, Copy)]
+struct AbortedRun<'a> {
+    topic: &'a str,
+    first_offset: i64,
+    producer_id: i64,
+}
+
+/// Announce a partition and write one transactional batch to it,
+/// returning the base offset the transaction starts at.
+async fn open_transaction(
+    ctx: &ServerCtx,
+    conn: &mut RawConnection,
+    versions: &TxnVersions,
+    actor: TxnActor<'_>,
+    topic: &str,
+    partition: i32,
+    correlation: i32,
+) -> Result<i64, Verdict> {
+    match add_partitions_to_txn(conn, versions.add, actor, topic, partition, correlation).await {
+        Ok(code) if code.is_ok() => {}
+        Ok(code) => {
+            return Err(Verdict::Fail {
+                details: format!("AddPartitionsToTxn answered {code}"),
+            });
+        }
+        Err(e) => return Err(e.context("AddPartitionsToTxn").into_verdict()),
+    }
+    // A transaction coordinator that has just accepted the partition may
+    // not have told the partition leader yet; the leader answers
+    // CONCURRENT_TRANSACTIONS until it has.
+    let mut last = ErrorCode(0);
+    for attempt in 0..ctx.config.settle_attempts() {
+        if attempt > 0 {
+            tokio::time::sleep(ctx.config.settle_delay).await;
+        }
+        match produce_transactional(
+            conn,
+            versions.produce,
+            actor,
+            topic,
+            partition,
+            0,
+            correlation + 10 + i32::try_from(attempt).unwrap_or(0),
+        )
+        .await
+        {
+            Ok((code, base_offset)) if code.is_ok() => return Ok(base_offset),
+            Ok((code, _)) => {
+                last = code;
+                if !retriable(code) && code != ErrorCode::CONCURRENT_TRANSACTIONS {
+                    break;
+                }
+            }
+            Err(e) => return Err(e.context("Produce (transactional)").into_verdict()),
+        }
+    }
+    Err(Verdict::Fail {
+        details: format!("a transactional produce to an announced partition failed with {last}"),
+    })
+}
+
+/// True when this code tells a producer it has been superseded.
+fn is_fenced(code: ErrorCode) -> bool {
+    code == ErrorCode::PRODUCER_FENCED || code == ErrorCode::INVALID_PRODUCER_EPOCH
 }

@@ -101,8 +101,8 @@ Early but functional end to end:
   partition has gone stable so the broker is not simply withholding
   them.
 - `odradek-acceptance`: conformance checks for **both roles** over raw
-  connections, independent of the client crate. 30 server checks across
-  13 APIs plus 9 client checks, each one proven by an injected fault to
+  connections, independent of the client crate. 35 server checks across
+  18 APIs plus 9 client checks, each one proven by an injected fault to
   detect what it claims — a check nothing can trip fails calibration.
   `cargo xtask conformance` runs them against Apache Kafka and Redpanda
   in Docker and enforces the baselines committed in

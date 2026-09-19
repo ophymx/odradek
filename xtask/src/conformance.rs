@@ -87,6 +87,15 @@ const SUBJECTS: &[Subject] = &[
             "KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093",
             "-e",
             "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1",
+            // Same reason as the offsets topic above, for the log the
+            // transaction coordinator keeps its state in: the default
+            // asks for three replicas, a one-node cluster cannot give
+            // them, and the coordinator then answers NOT_COORDINATOR
+            // forever for a partition that was never created.
+            "-e",
+            "KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1",
+            "-e",
+            "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1",
         ],
         sasl_listener: true,
         // SCRAM credentials live in the metadata log, so they are added

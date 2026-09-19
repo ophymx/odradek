@@ -31,6 +31,11 @@
     "sasl/refusal-names-mechanisms": "pass",
     "sasl/scram-iteration-floor": "pass",
     "sasl/scram-nonce-extends-client": "pass",
-    "sasl/scram-server-proves-itself": "pass"
+    "sasl/scram-server-proves-itself": "pass",
+    "txn/abort-is-reported-to-readers": "pass",
+    "txn/init-bumps-the-epoch": "pass",
+    "txn/open-transaction-holds-the-stable-offset": "pass",
+    "txn/stale-epoch-is-fenced": "pass",
+    "txn/unannounced-write-stays-in-the-transaction": "pass"
   }
 }
