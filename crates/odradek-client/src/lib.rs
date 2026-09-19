@@ -77,11 +77,12 @@ mod retry;
 pub mod sasl;
 #[cfg(feature = "tls")]
 pub mod tls;
+pub mod txn;
 
 pub use admin::{ConfigEntry, GroupDescription, GroupListing, GroupMemberDescription};
 pub use cluster::Cluster;
 pub use conn::Connection;
-pub use consumer::{ConsumedRecord, Consumer, ConsumerConfig, FetchResult};
+pub use consumer::{ConsumedRecord, Consumer, ConsumerConfig, FetchResult, IsolationLevel};
 pub use consumer_group::{ConsumerGroupConfig, ConsumerGroupMember, GroupEvent};
 pub use error::{ClientError, ErrorCategory};
 pub use group::{GroupConfig, GroupMember, HeartbeatStatus};
@@ -90,11 +91,12 @@ pub use odradek_protocol as protocol;
 /// The record vocabulary users hand to [`Producer`] and get back from
 /// [`Consumer`], re-exported from the protocol crate.
 pub use odradek_protocol::records::{Compression, Record, RecordHeader};
-pub use producer::{Delivery, Producer, ProducerConfig};
+pub use producer::{Delivery, Producer, ProducerConfig, TransactionState};
 #[cfg(feature = "sasl")]
 pub use sasl::{Mechanism, SaslConfig};
 #[cfg(feature = "tls")]
 pub use tls::Tls;
+pub use txn::TransactionalOffset;
 
 /// Configuration shared by every entry point of the client.
 ///

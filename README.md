@@ -42,7 +42,8 @@ Early but functional end to end:
 - `odradek-protocol`: wire primitives; message types generated from the
   Kafka 4.1.0 schemas vendored in `crates/odradek-protocol/schemas/`
   (headers, ApiVersions, Metadata, Produce, Fetch, CreateTopics,
-  ListOffsets, FindCoordinator, OffsetCommit/Fetch) via
+  ListOffsets, FindCoordinator, OffsetCommit/Fetch, group membership
+  both classic and KIP-848, SASL, admin, and the transaction APIs) via
   `cargo xtask codegen`;
   header-version selection including the ApiVersions response-header quirk;
   record batch (v2) encoding with CRC-32C validation — compressed and
@@ -88,6 +89,17 @@ Early but functional end to end:
   alongside `produce_consume`, `group_join`, and `group848_join`, which
   exercise the pieces on their own (the last one covering live
   incremental reconciliation on Kafka 4.1's new coordinator).
+  Transactions close the loop: writes grouped so a `read_committed`
+  reader sees all of them or none, consumed offsets committed inside
+  the transaction that produced the output they came from, and
+  producer fencing on `init_transactions` so a crashed producer's
+  successor rolls back what it left open. The reading half is the part
+  that is easy to get wrong — the broker still returns aborted
+  records and expects the client to drop them — so the `transactions`
+  example proves it from both sides: aborted records present under
+  `read_uncommitted`, absent under `read_committed`, after the
+  partition has gone stable so the broker is not simply withholding
+  them.
 - `odradek-acceptance`: conformance checks for **both roles** over raw
   connections, independent of the client crate. 30 server checks across
   13 APIs plus 9 client checks, each one proven by an injected fault to

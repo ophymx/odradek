@@ -27,7 +27,7 @@
 //! `batch_max_bytes` large enough that the trigger rarely fires and
 //! drives the wire from [`Producer::flush`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -44,8 +44,10 @@ use crate::cluster::Cluster;
 use crate::compression::compress;
 use crate::conn;
 use crate::error::ClientError;
+use crate::group::GroupMember;
 use crate::join::join_all;
 use crate::retry::{Attempt, or_mark_stale, retry_loop};
+use crate::txn::TransactionalOffset;
 
 /// Produce versions this producer speaks: name-addressed (v13+ switches
 /// to topic ids).
@@ -84,6 +86,34 @@ pub struct ProducerConfig {
     /// the sequence. A producer configured otherwise refuses to start
     /// rather than silently offering a guarantee it cannot keep.
     pub idempotent: bool,
+    /// Produce transactionally under this id (default: none).
+    ///
+    /// Setting it turns the producer into a transactional one: writes
+    /// are grouped between [`Producer::begin_transaction`] and
+    /// [`Producer::commit_transaction`], and a `read_committed`
+    /// consumer sees either all of them or none.
+    ///
+    /// The id is a *name*, not a handle, and it must be stable across
+    /// restarts of the same logical producer. That is the whole point:
+    /// on [`Producer::init_transactions`] the coordinator fences
+    /// whoever last held the name and aborts the transaction they left
+    /// open, so a producer that crashed mid-transaction is cleaned up
+    /// by its own successor. Two live producers sharing one id fence
+    /// each other in a loop; two instances of one job need two ids.
+    ///
+    /// Implies [`ProducerConfig::idempotent`] and therefore
+    /// `acks = -1`.
+    pub transactional_id: Option<String>,
+    /// How long the coordinator waits for a transaction to finish
+    /// before aborting it (default: 60s).
+    ///
+    /// The bound is on a *stalled* producer, not a slow one: a
+    /// transaction that goes this long without progress is assumed
+    /// dead and rolled back, releasing the partitions it was holding
+    /// back from `read_committed` consumers. Brokers cap it at
+    /// `transaction.max.timeout.ms` (15 minutes by default) and refuse
+    /// anything larger with `INVALID_TRANSACTION_TIMEOUT`.
+    pub transaction_timeout_ms: i32,
 }
 
 impl Default for ProducerConfig {
@@ -97,6 +127,24 @@ impl Default for ProducerConfig {
             compression: Compression::None,
             batch_max_bytes: 16 * 1024,
             idempotent: true,
+            transactional_id: None,
+            transaction_timeout_ms: 60_000,
+        }
+    }
+}
+
+impl ProducerConfig {
+    /// A transactional producer under `transactional_id`, with the
+    /// acknowledgement level transactions require.
+    ///
+    /// See [`ProducerConfig::transactional_id`] for what the id means
+    /// and why it must be stable.
+    pub fn transactional(transactional_id: impl Into<String>) -> ProducerConfig {
+        ProducerConfig {
+            acks: ACKS_ALL,
+            idempotent: true,
+            transactional_id: Some(transactional_id.into()),
+            ..ProducerConfig::default()
         }
     }
 }
@@ -129,6 +177,41 @@ pub struct Producer {
     identity: Option<ProducerIdentity>,
     /// The next sequence number owed per partition.
     sequences: HashMap<(String, i32), i32>,
+    /// Where this producer is in the transaction state machine.
+    txn_state: TransactionState,
+    /// Partitions already announced to the coordinator for the open
+    /// transaction; cleared when it ends.
+    txn_partitions: HashSet<(String, i32)>,
+}
+
+/// Where a producer is in the transaction state machine.
+///
+/// Worth reading as a sequence: a transactional producer goes
+/// `Uninitialized` → `Ready` → `Open` → `Ready` → … and leaves that
+/// path only by failing. [`TransactionState::Abortable`] is the
+/// important one — the transaction cannot be committed, but the
+/// producer is still usable once it has been aborted. `Fenced` is not
+/// recoverable at all: another producer owns the id now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TransactionState {
+    /// No transactional id is configured; the transaction methods are
+    /// errors and produce works as usual.
+    Disabled,
+    /// Configured, but [`Producer::init_transactions`] has not run.
+    Uninitialized,
+    /// Initialized, with no transaction open.
+    Ready,
+    /// A transaction is open and healthy.
+    Open,
+    /// A transaction is open and has failed. Committing would claim a
+    /// guarantee this producer cannot give, so only
+    /// [`Producer::abort_transaction`] is allowed.
+    Abortable,
+    /// Another producer took this transactional id and this one is
+    /// fenced out. Nothing it sends will be accepted again; the
+    /// transaction it had open, if any, is the coordinator's to abort.
+    Fenced,
 }
 
 /// The acknowledgement level idempotence requires: every in-sync
@@ -150,6 +233,99 @@ fn check_idempotent_acks(acks: i16) -> Result<(), ClientError> {
     )))
 }
 
+/// The state a [`Producer::begin_transaction`] leaves behind, or why it
+/// cannot happen.
+fn after_begin(state: TransactionState) -> Result<TransactionState, ClientError> {
+    match state {
+        TransactionState::Ready => Ok(TransactionState::Open),
+        TransactionState::Uninitialized => Err(ClientError::Transaction(
+            "call Producer::init_transactions before beginning a transaction".into(),
+        )),
+        TransactionState::Disabled => Err(ClientError::Transaction(
+            "this producer has no transactional id; set ProducerConfig::transactional_id".into(),
+        )),
+        state => Err(ClientError::Transaction(format!(
+            "a transaction is already underway ({state:?})"
+        ))),
+    }
+}
+
+/// Refuse a produce the transaction state does not allow.
+///
+/// Separate from [`require_open`] because the two ask different
+/// questions of the same state: a producer with no transactional id may
+/// always produce and may never commit, so `Disabled` is the answer
+/// "yes" here and "you have no transaction" there.
+fn require_producible(state: TransactionState) -> Result<(), ClientError> {
+    match state {
+        TransactionState::Disabled => Ok(()),
+        state => require_open(state, "produce inside"),
+    }
+}
+
+/// Refuse a transaction operation the state does not allow, naming what
+/// would make it legal.
+fn require_open(state: TransactionState, verb: &str) -> Result<(), ClientError> {
+    match state {
+        TransactionState::Open => Ok(()),
+        TransactionState::Disabled => Err(ClientError::Transaction(format!(
+            "cannot {verb} a transaction: this producer has no transactional id"
+        ))),
+        TransactionState::Uninitialized => Err(ClientError::Transaction(format!(
+            "cannot {verb} a transaction before Producer::init_transactions"
+        ))),
+        TransactionState::Ready => Err(ClientError::Transaction(format!(
+            "cannot {verb} a transaction before Producer::begin_transaction"
+        ))),
+        TransactionState::Abortable => Err(ClientError::Transaction(format!(
+            "cannot {verb} a transaction that has already failed; abort it"
+        ))),
+        TransactionState::Fenced => Err(ClientError::Transaction(format!(
+            "cannot {verb} a transaction: this producer was fenced by another holding the \
+             same transactional id"
+        ))),
+    }
+}
+
+/// What a failure does to the open transaction.
+///
+/// Anything that fails inside a transaction makes it unsafe to commit —
+/// the failed write may still land, so "all or nothing" is no longer
+/// something this producer can promise — and the only honest resolution
+/// is an abort. Fencing is worse than that: the id belongs to someone
+/// else now, and no call this producer makes will be accepted again.
+///
+/// Pure, because these rules decide whether a caller is told to abort
+/// or told it may carry on, and they should be readable and testable
+/// without a cluster to fail against.
+fn after_failure(state: TransactionState, e: &ClientError) -> TransactionState {
+    match state {
+        TransactionState::Disabled => TransactionState::Disabled,
+        _ if is_fencing(e) => TransactionState::Fenced,
+        TransactionState::Open => TransactionState::Abortable,
+        state => state,
+    }
+}
+
+/// True when this failure means the transactional id now belongs to
+/// someone else.
+///
+/// All three codes say the same thing from different angles: a producer
+/// with a newer epoch took the id (`PRODUCER_FENCED`), this producer's
+/// epoch is stale (`INVALID_PRODUCER_EPOCH`), or it is not allowed the
+/// id at all. None of them improve with another attempt, and retrying
+/// through one would write into a transaction another producer now
+/// owns.
+fn is_fencing(e: &ClientError) -> bool {
+    matches!(
+        e,
+        ClientError::Broker(code)
+            if *code == ErrorCode::PRODUCER_FENCED
+                || *code == ErrorCode::INVALID_PRODUCER_EPOCH
+                || *code == ErrorCode::TRANSACTIONAL_ID_AUTHORIZATION_FAILED
+    )
+}
+
 /// Claim the next sequence range for one partition.
 ///
 /// Split out from the identity handshake so the arithmetic is testable
@@ -160,6 +336,7 @@ fn next_stamp(
     sequences: &mut HashMap<(String, i32), i32>,
     key: &(String, i32),
     records: usize,
+    transactional: bool,
 ) -> BatchStamp {
     let base_sequence = *sequences.get(key).unwrap_or(&0);
     let count = i32::try_from(records).unwrap_or(i32::MAX);
@@ -170,6 +347,7 @@ fn next_stamp(
         producer_id: identity.id,
         producer_epoch: identity.epoch,
         base_sequence,
+        transactional,
     }
 }
 
@@ -185,6 +363,11 @@ struct BatchStamp {
     producer_id: i64,
     producer_epoch: i16,
     base_sequence: i32,
+    /// Set on the batch as the transactional attribute bit. Without it
+    /// the broker treats the records as ordinary idempotent writes and
+    /// no marker will ever cover them, so a `read_committed` consumer
+    /// reads them immediately — the opposite of what was asked for.
+    transactional: bool,
 }
 
 /// What the broker knows this producer as.
@@ -193,9 +376,9 @@ struct BatchStamp {
 /// re-initializes gets a higher one, and batches carrying the old epoch
 /// are refused rather than interleaved with the new producer's.
 #[derive(Debug, Clone, Copy)]
-struct ProducerIdentity {
-    id: i64,
-    epoch: i16,
+pub(crate) struct ProducerIdentity {
+    pub(crate) id: i64,
+    pub(crate) epoch: i16,
 }
 
 impl Producer {
@@ -204,6 +387,11 @@ impl Producer {
     }
 
     pub fn with_config(cluster: Cluster, config: ProducerConfig) -> Producer {
+        let txn_state = if config.transactional_id.is_some() {
+            TransactionState::Uninitialized
+        } else {
+            TransactionState::Disabled
+        };
         Producer {
             cluster,
             config,
@@ -211,12 +399,226 @@ impl Producer {
             next_round_robin: 0,
             identity: None,
             sequences: HashMap::new(),
+            txn_state,
+            txn_partitions: HashSet::new(),
         }
     }
 
     /// The underlying cluster, e.g. for metadata queries.
     pub fn cluster(&self) -> &Cluster {
         &self.cluster
+    }
+
+    /// Where this producer is in the transaction state machine.
+    pub fn transaction_state(&self) -> TransactionState {
+        self.txn_state
+    }
+
+    /// Claim this producer's transactional id, once, before anything
+    /// else.
+    ///
+    /// The coordinator fences every earlier producer holding the id and
+    /// aborts the transaction they left open, then issues this one a
+    /// fresh epoch. Both halves matter: the fencing is what stops a
+    /// half-dead predecessor from writing into a transaction this
+    /// producer is going to commit, and the rollback is what releases
+    /// the partitions its interrupted transaction was holding back from
+    /// `read_committed` consumers.
+    ///
+    /// Blocks until that cleanup is done, which for a predecessor that
+    /// died mid-transaction means waiting out the rest of its
+    /// [`ProducerConfig::transaction_timeout_ms`].
+    pub async fn init_transactions(&mut self) -> Result<(), ClientError> {
+        let transactional_id = self.transactional_id()?.to_owned();
+        match self.txn_state {
+            TransactionState::Uninitialized => {}
+            state => {
+                return Err(ClientError::Transaction(format!(
+                    "init_transactions is for a new producer; this one is already {state:?}"
+                )));
+            }
+        }
+        check_idempotent_acks(self.config.acks)?;
+        let identity = init_producer_id(&self.cluster, &self.config).await?;
+        self.identity = Some(identity);
+        // A new epoch restarts every sequence at zero, and the broker
+        // expects exactly that; keeping the old counters would make the
+        // first batch of the new epoch look like a gap.
+        self.sequences.clear();
+        self.txn_partitions.clear();
+        self.txn_state = TransactionState::Ready;
+        let _ = transactional_id;
+        Ok(())
+    }
+
+    /// Open a transaction.
+    ///
+    /// Local, and deliberately so: there is no "begin" on the wire. The
+    /// coordinator learns a transaction has started when the first
+    /// partition is announced to it, which happens on the first
+    /// produce. So this cannot fail for any reason but being called at
+    /// the wrong time, and a transaction that is begun and never
+    /// written to costs nothing.
+    pub fn begin_transaction(&mut self) -> Result<(), ClientError> {
+        self.txn_state = after_begin(self.txn_state)?;
+        Ok(())
+    }
+
+    /// Flush anything buffered, then commit.
+    ///
+    /// Returning means the coordinator has durably decided to commit —
+    /// not that every commit marker has been written, so a
+    /// `read_committed` consumer may need a moment longer to see the
+    /// records.
+    ///
+    /// A failure here leaves the transaction
+    /// [`TransactionState::Abortable`] (or [`TransactionState::Fenced`]);
+    /// it is never silently half-committed, because the coordinator
+    /// decides for the whole transaction at once.
+    pub async fn commit_transaction(&mut self) -> Result<(), ClientError> {
+        self.require_open("commit")?;
+        // Buffered records belong to this transaction; committing
+        // without them would commit a subset of what the caller wrote.
+        if let Err(e) = self.flush().await {
+            self.poison(&e);
+            return Err(e);
+        }
+        self.end_transaction(true).await
+    }
+
+    /// Abandon the transaction: every record written under it is
+    /// discarded, and so is anything still buffered.
+    ///
+    /// The only way out of [`TransactionState::Abortable`], and always
+    /// available while a transaction is open.
+    pub async fn abort_transaction(&mut self) -> Result<(), ClientError> {
+        match self.txn_state {
+            TransactionState::Open | TransactionState::Abortable => {}
+            state => {
+                return Err(ClientError::Transaction(format!(
+                    "no transaction to abort ({state:?})"
+                )));
+            }
+        }
+        // Buffered records were destined for a transaction that is
+        // being thrown away; delivering them now would write them
+        // outside it.
+        self.pending.clear();
+        self.end_transaction(false).await
+    }
+
+    /// Commit consumed positions as part of this transaction, so that
+    /// "what was read" and "what was written" commit together or not at
+    /// all.
+    ///
+    /// This is the half of exactly-once that a consume-transform-produce
+    /// loop needs: without it, a crash between producing and committing
+    /// offsets reprocesses the input and writes the output twice. The
+    /// offsets are the positions to *resume* from, one past the last
+    /// record processed.
+    ///
+    /// Takes the [`GroupMember`] rather than the three ids it needs
+    /// because they have to agree: the coordinator checks the
+    /// generation, so a member that has been rebalanced out cannot
+    /// commit offsets its successor now owns.
+    pub async fn send_offsets_to_transaction(
+        &mut self,
+        member: &GroupMember,
+        offsets: &[TransactionalOffset],
+    ) -> Result<(), ClientError> {
+        self.require_open("send offsets to")?;
+        let txn = self.txn()?;
+        let group_id = member.group_id().to_owned();
+        let result = async {
+            crate::txn::add_offsets(&txn, &group_id).await?;
+            crate::txn::offset_commit(
+                &txn,
+                &group_id,
+                member.generation_id(),
+                member.member_id(),
+                offsets,
+            )
+            .await
+        }
+        .await;
+        if let Err(e) = result {
+            self.poison(&e);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Commit or abort, and return the producer to
+    /// [`TransactionState::Ready`].
+    async fn end_transaction(&mut self, committed: bool) -> Result<(), ClientError> {
+        let txn = self.txn()?;
+        if let Err(e) = crate::txn::end_txn(&txn, committed).await {
+            self.poison(&e);
+            return Err(e);
+        }
+        self.txn_partitions.clear();
+        self.txn_state = TransactionState::Ready;
+        Ok(())
+    }
+
+    /// The transaction context the wire calls need.
+    fn txn(&self) -> Result<crate::txn::Txn<'_>, ClientError> {
+        Ok(crate::txn::Txn {
+            cluster: &self.cluster,
+            config: &self.config,
+            transactional_id: self.transactional_id()?,
+            identity: self.identity.ok_or_else(|| {
+                ClientError::Transaction(
+                    "this producer has no id yet; call Producer::init_transactions".into(),
+                )
+            })?,
+        })
+    }
+
+    fn transactional_id(&self) -> Result<&str, ClientError> {
+        self.config.transactional_id.as_deref().ok_or_else(|| {
+            ClientError::Transaction(
+                "this producer has no transactional id; set ProducerConfig::transactional_id"
+                    .into(),
+            )
+        })
+    }
+
+    fn require_open(&self, verb: &str) -> Result<(), ClientError> {
+        require_open(self.txn_state, verb)
+    }
+
+    fn poison(&mut self, e: &ClientError) {
+        self.txn_state = after_failure(self.txn_state, e);
+    }
+
+    /// Announce to the coordinator any of `keys` this transaction has
+    /// not claimed yet, in one request.
+    ///
+    /// A no-op for a non-transactional producer, and for partitions
+    /// already announced — the coordinator only needs to be told once
+    /// per transaction, and [`Producer::flush`] would otherwise pay a
+    /// round trip per partition for something it already knows.
+    async fn claim_partitions(&mut self, keys: &[(String, i32)]) -> Result<(), ClientError> {
+        if self.txn_state == TransactionState::Disabled {
+            return Ok(());
+        }
+        require_producible(self.txn_state)?;
+        let fresh: Vec<(String, i32)> = keys
+            .iter()
+            .filter(|key| !self.txn_partitions.contains(*key))
+            .cloned()
+            .collect();
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        let txn = self.txn()?;
+        if let Err(e) = crate::txn::add_partitions(&txn, &fresh).await {
+            self.poison(&e);
+            return Err(e);
+        }
+        self.txn_partitions.extend(fresh);
+        Ok(())
     }
 
     /// Buffer one record for `topic[partition]`. Delivers the partition's
@@ -303,6 +705,19 @@ impl Producer {
             return Ok(Vec::new());
         }
 
+        // One announcement for every partition in the flush, for the
+        // same reason the deliveries go out together: the coordinator
+        // takes the whole list in one request, and asking per partition
+        // would spend a round trip each on what a flush exists to
+        // avoid.
+        let keys: Vec<(String, i32)> = batches.iter().map(|(key, _)| key.clone()).collect();
+        if let Err(e) = self.claim_partitions(&keys).await {
+            for (key, pending) in batches {
+                self.restore(key, pending);
+            }
+            return Err(e);
+        }
+
         // Stamps are reserved here, before anything is sent: these
         // deliveries run concurrently and `batch_stamp` needs the
         // producer, so the sequence for every partition is claimed up
@@ -369,6 +784,11 @@ impl Producer {
             }
         }
         if let Some((_, e)) = failure {
+            // A partition that failed may still have landed — the
+            // acknowledgement is what went missing, not necessarily the
+            // write — so this transaction can no longer promise all or
+            // nothing.
+            self.poison(&e);
             return Err(e);
         }
         deliveries.sort_by(|a, b| (&a.topic, a.partition).cmp(&(&b.topic, b.partition)));
@@ -383,6 +803,10 @@ impl Producer {
         let key = (topic.to_owned(), partition);
         let pending = self.pending.remove(&key).unwrap_or_default();
         let count = pending.records.len();
+        if let Err(e) = self.claim_partitions(std::slice::from_ref(&key)).await {
+            self.restore(key, pending);
+            return Err(e);
+        }
         // The identity is taken once and kept: a new one would restart
         // every sequence, which is exactly what makes a retry look like
         // a new write.
@@ -417,6 +841,7 @@ impl Producer {
                     self.sequences.insert(key.clone(), stamp.base_sequence);
                 }
                 self.restore(key, pending);
+                self.poison(&e);
                 Err(e)
             }
         }
@@ -439,6 +864,11 @@ impl Producer {
         }
         check_idempotent_acks(self.config.acks)?;
         if self.identity.is_none() {
+            // A transactional producer takes its id from
+            // init_transactions, which also fences its predecessor;
+            // quietly taking a plain one here would produce outside any
+            // transaction under an id nothing will ever commit.
+            require_producible(self.txn_state)?;
             self.identity = Some(init_producer_id(&self.cluster, &self.config).await?);
         }
         let identity = self.identity.expect("set immediately above");
@@ -447,6 +877,7 @@ impl Producer {
             &mut self.sequences,
             key,
             records,
+            self.txn_state != TransactionState::Disabled,
         )))
     }
 
@@ -470,6 +901,7 @@ impl Producer {
         records: Vec<Record>,
     ) -> Result<i64, ClientError> {
         let key = (topic.to_owned(), partition);
+        self.claim_partitions(std::slice::from_ref(&key)).await?;
         let stamp = self.batch_stamp(&key, records.len()).await?;
         let outcome = deliver(
             &self.cluster,
@@ -480,19 +912,24 @@ impl Producer {
             stamp,
         )
         .await;
-        if outcome.is_err() {
+        if let Err(e) = &outcome {
             // Hand the sequence back: a retry has to reuse it.
             if let Some(stamp) = stamp {
                 self.sequences.insert(key, stamp.base_sequence);
             }
+            self.poison(e);
         }
         outcome
     }
 }
 
-/// InitProducerId versions this client speaks. v0 is enough for the
-/// idempotent case; the later ones add transactional fields.
-const INIT_PRODUCER_ID_SUPPORTED: (i16, i16) = (0, InitProducerIdRequest::MAX_VERSION);
+/// InitProducerId versions this client speaks.
+///
+/// v0 is enough for the idempotent case; the later ones add
+/// transactional fields. Capped below v6, which is 2PC (KIP-939) and
+/// is marked unstable upstream — a version this client has no way to
+/// honour is not one to negotiate.
+const INIT_PRODUCER_ID_SUPPORTED: (i16, i16) = (0, 5);
 
 /// Take an id from the broker, once, for this producer.
 ///
@@ -516,7 +953,7 @@ async fn init_producer_id(
         |cluster| {
             let cluster: &Cluster = cluster;
             Box::pin(async move {
-                match init_producer_id_once(cluster).await {
+                match init_producer_id_once(cluster, config).await {
                     Ok(identity) => Attempt::Done(identity),
                     // `is_retriable` already knows the coordinator codes;
                     // nothing here is partition-scoped, so no metadata to
@@ -530,8 +967,17 @@ async fn init_producer_id(
     .await
 }
 
-async fn init_producer_id_once(cluster: &Cluster) -> Result<ProducerIdentity, ClientError> {
-    let broker = cluster.control_broker().await?;
+async fn init_producer_id_once(
+    cluster: &Cluster,
+    config: &ProducerConfig,
+) -> Result<ProducerIdentity, ClientError> {
+    // A transactional id is coordinator-scoped state, so the request
+    // has to reach the broker that owns it; the plain idempotent case
+    // has no such state and any broker will issue an id.
+    let broker = match &config.transactional_id {
+        Some(id) => cluster.transaction_coordinator(id).await?,
+        None => cluster.control_broker().await?,
+    };
     let version = broker
         .ranges
         .pick(InitProducerIdRequest::API_KEY, INIT_PRODUCER_ID_SUPPORTED)
@@ -546,11 +992,18 @@ async fn init_producer_id_once(cluster: &Cluster) -> Result<ProducerIdentity, Cl
             )
         })?;
     let mut request = InitProducerIdRequest::default();
-    // No transactional id: this is the idempotent producer, not the
-    // transactional one. The broker issues an id scoped to the session
-    // rather than one it will recover after a restart.
-    request.transactional_id = None;
-    request.transaction_timeout_ms = -1;
+    // With no transactional id the broker issues one scoped to this
+    // session, which is all the idempotent producer needs; with one, it
+    // fences the previous holder and recovers state the id already has.
+    request.transactional_id = config.transactional_id.clone();
+    request.transaction_timeout_ms = match &config.transactional_id {
+        Some(_) => config.transaction_timeout_ms,
+        // Ignored by the broker without a transactional id, and -1
+        // says so rather than implying a timeout nothing enforces.
+        None => -1,
+    };
+    // -1/-1 asks for a new id rather than resuming a known one; this
+    // producer has nothing to resume, having just been created.
     request.producer_id = -1;
     request.producer_epoch = -1;
     let mut body = BytesMut::new();
@@ -626,7 +1079,10 @@ async fn try_once(
     topic_data.name = topic.to_owned();
     topic_data.partition_data = vec![partition_data];
     let mut request = ProduceRequest::default();
-    request.transactional_id = None;
+    // Named on every transactional produce: the partition leader checks
+    // it against what the coordinator told it, which is what stops a
+    // write to a partition the transaction never announced.
+    request.transactional_id = config.transactional_id.clone();
     request.acks = config.acks;
     request.timeout_ms = config.request_timeout_ms;
     request.topic_data = vec![topic_data];
@@ -714,6 +1170,15 @@ fn murmur2(data: &[u8]) -> i32 {
     i32::from_le_bytes(h.to_le_bytes())
 }
 
+/// The record batch's transactional attribute (bit 4), set when this
+/// batch belongs to a transaction.
+fn transactional_bit(stamp: Option<BatchStamp>) -> i16 {
+    match stamp {
+        Some(stamp) if stamp.transactional => 1 << 4,
+        _ => 0,
+    }
+}
+
 /// Rough wire footprint of one record, for the batch-size trigger.
 fn estimate_record_size(record: &Record) -> usize {
     let payload = record.key.as_ref().map_or(0, |k| k.len())
@@ -766,7 +1231,7 @@ fn encode_batch(
     };
     let batch = RecordBatch {
         base_offset: 0,
-        attributes: codec.attribute_bits(),
+        attributes: codec.attribute_bits() | transactional_bit(stamp),
         last_offset_delta: i32::try_from(last).unwrap_or(i32::MAX),
         base_timestamp: now_ms,
         max_timestamp: now_ms + max_delta,
@@ -874,6 +1339,7 @@ mod idempotence_tests {
             producer_id: 4242,
             producer_epoch: 7,
             base_sequence: 19,
+            transactional: false,
         };
         let set = encode_batch(
             vec![record("a"), record("b")],
@@ -901,17 +1367,17 @@ mod idempotence_tests {
         let key = ("t".to_owned(), 0);
 
         assert_eq!(
-            next_stamp(identity, &mut sequences, &key, 3).base_sequence,
+            next_stamp(identity, &mut sequences, &key, 3, false).base_sequence,
             0
         );
         assert_eq!(
-            next_stamp(identity, &mut sequences, &key, 2).base_sequence,
+            next_stamp(identity, &mut sequences, &key, 2, false).base_sequence,
             3
         );
         // Per partition, not per producer: another partition starts over.
         let other = ("t".to_owned(), 1);
         assert_eq!(
-            next_stamp(identity, &mut sequences, &other, 1).base_sequence,
+            next_stamp(identity, &mut sequences, &other, 1, false).base_sequence,
             0
         );
     }
@@ -926,14 +1392,14 @@ mod idempotence_tests {
         let mut sequences = HashMap::new();
         let key = ("t".to_owned(), 0);
 
-        let attempt = next_stamp(identity, &mut sequences, &key, 4);
+        let attempt = next_stamp(identity, &mut sequences, &key, 4, false);
         // What the failure path does.
         sequences.insert(key.clone(), attempt.base_sequence);
-        let retry = next_stamp(identity, &mut sequences, &key, 4);
+        let retry = next_stamp(identity, &mut sequences, &key, 4, false);
         assert_eq!(retry.base_sequence, attempt.base_sequence);
 
         // And the batch after the successful retry continues from there.
-        let next = next_stamp(identity, &mut sequences, &key, 1);
+        let next = next_stamp(identity, &mut sequences, &key, 1, false);
         assert_eq!(next.base_sequence, 4);
     }
 
@@ -956,5 +1422,136 @@ mod idempotence_tests {
         let config = ProducerConfig::default();
         assert!(config.idempotent);
         assert!(check_idempotent_acks(config.acks).is_ok());
+    }
+
+    /// The sequence a transactional producer is meant to follow, and
+    /// the refusals that keep it on it. Each error names the call that
+    /// would have been legal, because "invalid state" tells a caller
+    /// nothing it can act on.
+    #[test]
+    fn the_transaction_sequence_is_enforced() {
+        // Nothing before init.
+        assert!(after_begin(TransactionState::Uninitialized).is_err());
+        assert!(require_producible(TransactionState::Uninitialized).is_err());
+        // Nothing between transactions.
+        assert!(require_producible(TransactionState::Ready).is_err());
+        // And then the happy path.
+        assert_eq!(
+            after_begin(TransactionState::Ready).unwrap(),
+            TransactionState::Open
+        );
+        assert!(require_producible(TransactionState::Open).is_ok());
+        // One at a time.
+        assert!(after_begin(TransactionState::Open).is_err());
+    }
+
+    /// A producer with no transactional id is not held to any of this:
+    /// the checks have to be invisible to the ordinary producer, or
+    /// every plain produce would fail.
+    #[test]
+    fn a_plain_producer_is_unaffected() {
+        assert!(require_producible(TransactionState::Disabled).is_ok());
+        assert!(
+            require_open(TransactionState::Disabled, "commit").is_err(),
+            "but it still has nothing to commit"
+        );
+        assert_eq!(
+            after_failure(TransactionState::Disabled, &ClientError::ConnectionClosed),
+            TransactionState::Disabled
+        );
+        assert!(after_begin(TransactionState::Disabled).is_err());
+    }
+
+    /// A failed write inside a transaction cannot be committed over.
+    /// The batch may have landed even though the acknowledgement did
+    /// not, so "all or nothing" is no longer on offer and the only
+    /// honest answer is an abort.
+    #[test]
+    fn a_failure_inside_a_transaction_forces_an_abort() {
+        let state = after_failure(TransactionState::Open, &ClientError::ConnectionClosed);
+        assert_eq!(state, TransactionState::Abortable);
+        assert!(require_open(state, "commit").is_err());
+        // Still the caller's to abort, not a state that heals.
+        assert_eq!(
+            after_failure(state, &ClientError::ConnectionClosed),
+            TransactionState::Abortable
+        );
+    }
+
+    /// Fencing is worse than a failed write: the id belongs to another
+    /// producer now, so even aborting is that producer's business, not
+    /// this one's.
+    #[test]
+    fn fencing_is_terminal() {
+        for code in [
+            ErrorCode::PRODUCER_FENCED,
+            ErrorCode::INVALID_PRODUCER_EPOCH,
+            ErrorCode::TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
+        ] {
+            let e = ClientError::Broker(code);
+            assert_eq!(
+                after_failure(TransactionState::Open, &e),
+                TransactionState::Fenced,
+                "{code} should fence"
+            );
+            // Even from a state that would otherwise be recoverable.
+            assert_eq!(
+                after_failure(TransactionState::Abortable, &e),
+                TransactionState::Fenced
+            );
+        }
+        assert!(require_open(TransactionState::Fenced, "commit").is_err());
+    }
+
+    /// An ordinary broker error is not fencing. Treating one as fatal
+    /// would strand a producer that only needed to retry.
+    #[test]
+    fn ordinary_errors_do_not_fence() {
+        let e = ClientError::Broker(ErrorCode::NOT_LEADER_OR_FOLLOWER);
+        assert_eq!(
+            after_failure(TransactionState::Open, &e),
+            TransactionState::Abortable
+        );
+    }
+
+    /// The attribute bit is what tells the broker these records need a
+    /// marker. Without it they are ordinary idempotent writes that a
+    /// read_committed consumer returns immediately — a transaction in
+    /// name only.
+    #[test]
+    fn a_transactional_batch_sets_the_attribute_bit() {
+        let stamp = BatchStamp {
+            producer_id: 9,
+            producer_epoch: 2,
+            base_sequence: 0,
+            transactional: true,
+        };
+        assert_eq!(transactional_bit(Some(stamp)), 1 << 4);
+        assert_eq!(
+            transactional_bit(Some(BatchStamp {
+                transactional: false,
+                ..stamp
+            })),
+            0
+        );
+        assert_eq!(transactional_bit(None), 0);
+
+        let set = encode_batch(vec![record("a")], Compression::None, Some(stamp)).unwrap();
+        let mut bytes = set.clone();
+        let batches = odradek_protocol::records::decode_set(&mut bytes).unwrap();
+        assert!(batches[0].is_transactional());
+        assert!(!batches[0].is_control());
+    }
+
+    /// A transactional producer's config implies the acknowledgement
+    /// level transactions need; a caller who overrides it is refused
+    /// rather than quietly given less than it asked for.
+    #[test]
+    fn the_transactional_config_is_coherent() {
+        let config = ProducerConfig::transactional("orders");
+        assert_eq!(config.transactional_id.as_deref(), Some("orders"));
+        assert!(config.idempotent);
+        assert!(check_idempotent_acks(config.acks).is_ok());
+        assert!(check_idempotent_acks(1).is_err());
     }
 }

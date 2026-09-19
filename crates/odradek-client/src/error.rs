@@ -70,6 +70,18 @@ pub enum ClientError {
     /// can fix it.
     #[error("{0}")]
     Config(String),
+
+    /// A transactional producer was asked for something its current
+    /// state does not allow — producing before `begin_transaction`,
+    /// committing a transaction that already failed, or anything at all
+    /// after being fenced.
+    ///
+    /// Distinct from [`ClientError::Config`] because the remedy is
+    /// different: the configuration is fine, the sequence of calls is
+    /// not. [`crate::producer::Producer::transaction_state`] says which
+    /// call is legal next.
+    #[error("{0}")]
+    Transaction(String),
 }
 
 /// The session-level classification of a [`ClientError`]: what kind of
@@ -106,6 +118,7 @@ impl ClientError {
                 ErrorCode::TOPIC_AUTHORIZATION_FAILED
                 | ErrorCode::GROUP_AUTHORIZATION_FAILED
                 | ErrorCode::SASL_AUTHENTICATION_FAILED
+                | ErrorCode::TRANSACTIONAL_ID_AUTHORIZATION_FAILED
                 | ErrorCode::UNSUPPORTED_SASL_MECHANISM => ErrorCategory::Auth,
                 _ => ErrorCategory::Other,
             },
@@ -139,6 +152,10 @@ impl ClientError {
                     || *code == ErrorCode::NOT_CONTROLLER
                     || *code == ErrorCode::REQUEST_TIMED_OUT
                     || *code == ErrorCode::KAFKA_STORAGE_ERROR
+                    // The coordinator is still finishing the previous
+                    // transaction for this id. Strictly a wait, not a
+                    // failure: the next attempt is the same request.
+                    || *code == ErrorCode::CONCURRENT_TRANSACTIONS
             }
             _ => false,
         }

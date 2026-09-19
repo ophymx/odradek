@@ -30,12 +30,13 @@
 //! default) over at most 64 MiB of record bytes, from a response that
 //! was itself at most 64 MiB on the wire.
 
+use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use odradek_protocol::ErrorCode;
 use odradek_protocol::messages::fetch_request::{FetchPartition, FetchRequest, FetchTopic};
-use odradek_protocol::messages::fetch_response::FetchResponse;
+use odradek_protocol::messages::fetch_response::{AbortedTransaction, FetchResponse};
 use odradek_protocol::messages::list_offsets_request::{
     ListOffsetsPartition, ListOffsetsRequest, ListOffsetsTopic,
 };
@@ -124,6 +125,44 @@ pub struct ConsumerConfig {
     /// records per fetch; the default is already ~7x what a 1 MiB
     /// partition fetch of minimum-size records could hold uncompressed.
     pub max_fetch_records: usize,
+    /// Whether to read records belonging to open or aborted
+    /// transactions (default: [`IsolationLevel::ReadUncommitted`],
+    /// matching Kafka's own default).
+    pub isolation_level: IsolationLevel,
+}
+
+/// How much of a partition a fetch is allowed to see.
+///
+/// The names are Kafka's and they describe the *floor*, not a
+/// guarantee about anything else: `read_uncommitted` returns every
+/// record that has been written, including records of transactions
+/// that have not finished and transactions that were thrown away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum IsolationLevel {
+    /// Everything in the log, transactional or not, committed or not.
+    #[default]
+    ReadUncommitted,
+    /// Only records of committed transactions, plus non-transactional
+    /// records.
+    ///
+    /// Costs latency, unavoidably: the broker will not return anything
+    /// past the *last stable offset* — the first offset belonging to a
+    /// transaction that has not finished — because it does not yet
+    /// know whether those records will exist. A consumer reading a
+    /// partition with a long-running transaction in it waits for that
+    /// transaction, however much newer committed data sits behind it.
+    ReadCommitted,
+}
+
+impl IsolationLevel {
+    /// The wire value: 0 read_uncommitted, 1 read_committed.
+    fn wire(self) -> i8 {
+        match self {
+            IsolationLevel::ReadUncommitted => 0,
+            IsolationLevel::ReadCommitted => 1,
+        }
+    }
 }
 
 impl Default for ConsumerConfig {
@@ -137,6 +176,7 @@ impl Default for ConsumerConfig {
             max_attempts: 20,
             retry_backoff: Duration::from_millis(250),
             max_fetch_records: 1 << 20,
+            isolation_level: IsolationLevel::ReadUncommitted,
         }
     }
 }
@@ -167,6 +207,13 @@ pub struct FetchResult<R = ConsumedRecord> {
     /// Where the next fetch should start.
     pub next_offset: i64,
     pub high_watermark: i64,
+    /// The first offset belonging to a transaction that has not
+    /// finished, or the high watermark when none has started.
+    ///
+    /// A `read_committed` fetch cannot return anything at or past this
+    /// point, so the gap between it and `high_watermark` is exactly the
+    /// data being withheld by transactions still in flight.
+    pub last_stable_offset: i64,
 }
 
 /// A consumer over a connected [`Cluster`].
@@ -355,6 +402,7 @@ impl Consumer {
         request.max_bytes = self.config.partition_max_bytes.saturating_mul(4);
         request.session_id = 0;
         request.session_epoch = -1; // sessionless full fetch
+        request.isolation_level = self.config.isolation_level.wire();
         request.topics = vec![fetch_topic];
         let mut body = BytesMut::new();
         request.encode(&mut body, version)?;
@@ -406,11 +454,19 @@ impl Consumer {
             records_left: self.config.max_fetch_records,
             decompressed_left: MAX_FETCH_DECOMPRESSED,
         };
+        // The broker returns aborted data below the last stable offset
+        // along with a list of what to throw away; applying it is the
+        // client's job, and not doing it is invisible until someone
+        // aborts a transaction in production.
+        let mut filter = BatchFilter::new(
+            self.config.isolation_level,
+            entry.aborted_transactions.as_deref(),
+        );
         let mut next_offset = offset;
         for batch in &batches {
             next_offset =
                 next_offset.max(batch.base_offset + i64::from(batch.last_offset_delta) + 1);
-            if batch.is_control() {
+            if !filter.keeps(batch) {
                 continue;
             }
             match &batch.records {
@@ -437,6 +493,7 @@ impl Consumer {
             records,
             next_offset,
             high_watermark: entry.high_watermark,
+            last_stable_offset: entry.last_stable_offset,
         })
     }
 
@@ -460,7 +517,10 @@ impl Consumer {
         request_topic.partitions = vec![request_partition];
         let mut request = ListOffsetsRequest::default();
         request.replica_id = -1;
-        request.isolation_level = 0;
+        // Matched to the fetch: under read_committed, "latest" has to
+        // mean the last stable offset, or a consumer would be told to
+        // seek to a position its own fetches refuse to return.
+        request.isolation_level = self.config.isolation_level.wire();
         request.topics = vec![request_topic];
         let mut body = BytesMut::new();
         request.encode(&mut body, version)?;
@@ -571,6 +631,96 @@ fn decode_compressed<R>(
     }
     Ok(())
 }
+
+/// Decides, batch by batch in offset order, which batches a fetch
+/// surfaces.
+///
+/// Stateful because the answer depends on what came before: the
+/// aborted-transaction list says *from which offset* each producer's
+/// records are disowned, and an abort marker says where that run ends.
+/// Walking the batches in order is what turns those two into a
+/// per-batch answer, which is why this is a struct and not a predicate.
+struct BatchFilter {
+    /// Aborted runs not yet reached, nearest first.
+    aborted: VecDeque<AbortedTransaction>,
+    /// Producers whose records are currently disowned.
+    disowned: HashSet<i64>,
+    read_committed: bool,
+}
+
+impl BatchFilter {
+    /// The aborted list is sorted rather than trusted: it is supposed
+    /// to arrive in offset order, and a filter that assumed so would
+    /// stop consuming entries at the first one out of order — silently
+    /// surfacing records somebody aborted. Sorting an already-sorted
+    /// list costs nothing.
+    fn new(isolation_level: IsolationLevel, aborted: Option<&[AbortedTransaction]>) -> BatchFilter {
+        let read_committed = isolation_level == IsolationLevel::ReadCommitted;
+        let mut entries = if read_committed {
+            aborted.unwrap_or_default().to_vec()
+        } else {
+            Vec::new()
+        };
+        entries.sort_by_key(|entry| entry.first_offset);
+        BatchFilter {
+            aborted: entries.into(),
+            disowned: HashSet::new(),
+            read_committed,
+        }
+    }
+
+    /// Whether this batch's records should be surfaced. Must be called
+    /// for every batch, in offset order, including the ones it rejects:
+    /// the rejected ones are what move the state along.
+    fn keeps(&mut self, batch: &odradek_protocol::records::RecordBatch) -> bool {
+        if self.read_committed && batch.producer_id >= 0 {
+            // A run applies from its first offset onward, so every one
+            // that starts at or before this batch ends is now in force.
+            let batch_last = batch.base_offset + i64::from(batch.last_offset_delta);
+            while self
+                .aborted
+                .front()
+                .is_some_and(|entry| entry.first_offset <= batch_last)
+            {
+                let entry = self.aborted.pop_front().expect("front was just checked");
+                self.disowned.insert(entry.producer_id);
+            }
+        }
+        if batch.is_control() {
+            // The marker ends the run it closes; what that producer
+            // writes after it belongs to a new transaction. Markers
+            // themselves are never surfaced under either isolation
+            // level — they are bookkeeping, not data.
+            if self.read_committed && is_abort_marker(batch) {
+                self.disowned.remove(&batch.producer_id);
+            }
+            return false;
+        }
+        !(self.read_committed
+            && batch.is_transactional()
+            && self.disowned.contains(&batch.producer_id))
+    }
+}
+
+/// True when this control batch is an abort marker.
+///
+/// A control batch holds one record whose key is a four-byte header:
+/// a version, then the marker type — `0` abort, `1` commit. Anything
+/// that does not parse as that is not a marker this client acts on,
+/// and guessing would be worse than ignoring it: treating an unknown
+/// marker as an abort would drop committed records.
+fn is_abort_marker(batch: &odradek_protocol::records::RecordBatch) -> bool {
+    let odradek_protocol::records::Records::Plain(records) = &batch.records else {
+        return false;
+    };
+    let Some(key) = records.first().and_then(|record| record.key.as_ref()) else {
+        return false;
+    };
+    key.len() >= 4 && i16::from_be_bytes([key[2], key[3]]) == ABORT_MARKER
+}
+
+/// The control-record type of an abort marker.
+const ABORT_MARKER: i16 = 0;
 
 /// Give `record` its absolute coordinates and keep it, unless it
 /// predates the requested offset.
@@ -764,5 +914,156 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ClientError::ProtocolViolation(_)));
+    }
+
+    /// Transactional bit (4) and control bit (5) of the batch
+    /// attributes, as the filter reads them.
+    const TRANSACTIONAL: i16 = 1 << 4;
+    const CONTROL: i16 = 1 << 5;
+
+    fn batch(base_offset: i64, producer_id: i64, attributes: i16, count: i64) -> RecordBatch {
+        RecordBatch {
+            base_offset,
+            attributes,
+            last_offset_delta: i32::try_from(count - 1).unwrap(),
+            producer_id,
+            records: Records::Plain(
+                (0..count)
+                    .map(|_| Record {
+                        value: Some(Bytes::from_static(b"x")),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    /// A control batch holding one marker record: version 0, then the
+    /// type — 0 abort, 1 commit.
+    fn marker(base_offset: i64, producer_id: i64, kind: i16) -> RecordBatch {
+        let mut key = BytesMut::new();
+        key.extend_from_slice(&0i16.to_be_bytes());
+        key.extend_from_slice(&kind.to_be_bytes());
+        RecordBatch {
+            base_offset,
+            attributes: TRANSACTIONAL | CONTROL,
+            last_offset_delta: 0,
+            producer_id,
+            records: Records::Plain(vec![Record {
+                key: Some(key.freeze()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }
+    }
+
+    fn aborted(producer_id: i64, first_offset: i64) -> AbortedTransaction {
+        let mut entry = AbortedTransaction::default();
+        entry.producer_id = producer_id;
+        entry.first_offset = first_offset;
+        entry
+    }
+
+    /// Markers are never data, whatever the isolation level: a consumer
+    /// that surfaced them would hand its caller a record with an empty
+    /// value and a four-byte key that means nothing to it.
+    #[test]
+    fn control_batches_are_never_surfaced() {
+        for level in [
+            IsolationLevel::ReadUncommitted,
+            IsolationLevel::ReadCommitted,
+        ] {
+            let mut filter = BatchFilter::new(level, None);
+            assert!(!filter.keeps(&marker(0, 7, 1)));
+            assert!(!filter.keeps(&marker(1, 7, 0)));
+        }
+    }
+
+    /// read_uncommitted means what it says: an aborted transaction's
+    /// records are still records, and the list of what was aborted is
+    /// not even requested.
+    #[test]
+    fn read_uncommitted_keeps_aborted_records() {
+        let mut filter = BatchFilter::new(IsolationLevel::ReadUncommitted, Some(&[aborted(7, 0)]));
+        assert!(filter.keeps(&batch(0, 7, TRANSACTIONAL, 2)));
+    }
+
+    /// The core of read_committed: an aborted producer's batches are
+    /// dropped from where the abort list says, and only that producer's.
+    #[test]
+    fn read_committed_drops_the_aborted_producer_only() {
+        let mut filter = BatchFilter::new(IsolationLevel::ReadCommitted, Some(&[aborted(7, 0)]));
+        assert!(!filter.keeps(&batch(0, 7, TRANSACTIONAL, 2)), "aborted");
+        assert!(
+            filter.keeps(&batch(2, 9, TRANSACTIONAL, 2)),
+            "a different producer"
+        );
+        assert!(
+            filter.keeps(&batch(4, -1, 0, 1)),
+            "not transactional at all"
+        );
+    }
+
+    /// The abort marker ends the run it closes. A producer that aborts
+    /// one transaction and commits the next must have the second one
+    /// surfaced, or a single abort would silently swallow everything
+    /// that producer ever writes again.
+    #[test]
+    fn an_abort_marker_ends_the_run() {
+        let mut filter = BatchFilter::new(IsolationLevel::ReadCommitted, Some(&[aborted(7, 0)]));
+        assert!(!filter.keeps(&batch(0, 7, TRANSACTIONAL, 2)));
+        assert!(!filter.keeps(&marker(2, 7, 0)), "the abort marker itself");
+        assert!(
+            filter.keeps(&batch(3, 7, TRANSACTIONAL, 2)),
+            "the same producer's next transaction was committed"
+        );
+    }
+
+    /// A run only applies from its first offset: records that producer
+    /// wrote and committed earlier in the same response are still data.
+    #[test]
+    fn a_run_starts_where_the_list_says() {
+        let mut filter = BatchFilter::new(IsolationLevel::ReadCommitted, Some(&[aborted(7, 10)]));
+        assert!(
+            filter.keeps(&batch(0, 7, TRANSACTIONAL, 2)),
+            "before the run"
+        );
+        assert!(!filter.keeps(&batch(10, 7, TRANSACTIONAL, 2)), "inside it");
+    }
+
+    /// The list is supposed to arrive in offset order. A filter that
+    /// assumed so would stop at the first entry out of order and
+    /// surface everything after it — so the order is imposed, not
+    /// trusted.
+    #[test]
+    fn an_out_of_order_abort_list_still_filters() {
+        let mut filter = BatchFilter::new(
+            IsolationLevel::ReadCommitted,
+            Some(&[aborted(9, 10), aborted(7, 0)]),
+        );
+        assert!(!filter.keeps(&batch(0, 7, TRANSACTIONAL, 2)));
+        assert!(!filter.keeps(&batch(10, 9, TRANSACTIONAL, 2)));
+    }
+
+    /// An unknown control-record type is not an abort. Guessing the
+    /// other way would drop committed records on a marker this client
+    /// does not recognize.
+    #[test]
+    fn an_unknown_marker_is_not_an_abort() {
+        let mut filter = BatchFilter::new(IsolationLevel::ReadCommitted, Some(&[aborted(7, 0)]));
+        assert!(!filter.keeps(&batch(0, 7, TRANSACTIONAL, 1)));
+        assert!(!filter.keeps(&marker(1, 7, 99)), "still a control batch");
+        assert!(
+            !filter.keeps(&batch(2, 7, TRANSACTIONAL, 1)),
+            "the run was not closed by a marker nobody understands"
+        );
+    }
+
+    #[test]
+    fn the_wire_values_are_kafkas() {
+        assert_eq!(IsolationLevel::ReadUncommitted.wire(), 0);
+        assert_eq!(IsolationLevel::ReadCommitted.wire(), 1);
+        assert_eq!(IsolationLevel::default(), IsolationLevel::ReadUncommitted);
     }
 }

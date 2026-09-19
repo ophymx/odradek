@@ -195,6 +195,23 @@ pub(crate) fn or_forget_coordinator<T>(
     }
 }
 
+/// [`or_forget_coordinator`] for the transaction coordinator, which is
+/// a separate discovery with its own cache entry.
+pub(crate) fn or_forget_txn_coordinator<T>(
+    cluster: &Cluster,
+    transactional_id: &str,
+    result: Result<T, ClientError>,
+) -> Attempt<T> {
+    match result {
+        Ok(v) => Attempt::Done(v),
+        Err(e) if e.is_retriable() => {
+            cluster.forget_transaction_coordinator(transactional_id);
+            Attempt::Retry(e)
+        }
+        Err(e) => Attempt::Fatal(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -20,6 +20,20 @@ one exception).
   broker would reject everything after. It requires `acks = -1`, and a
   configuration that asks for both idempotence and weaker acks is
   refused rather than silently given neither.
+- **Transactions**: a set of writes across partitions that a
+  `read_committed` reader sees all of or none of, plus
+  `send_offsets_to_transaction` to commit consumed positions in the
+  same transaction as the output they produced — the exactly-once
+  consume-transform-produce loop. `init_transactions` fences whoever
+  last held the transactional id and rolls back what they left open,
+  which is what makes a crashed producer recoverable by its
+  successor. A failure inside a transaction moves the producer to
+  `TransactionState::Abortable` rather than letting it commit
+  something it cannot guarantee.
+- **Read isolation**: `IsolationLevel::ReadCommitted` filters out the
+  records of aborted transactions, which the broker still returns —
+  applying the abort list is the client's job, and a client that skips
+  it looks correct until someone aborts.
 - **Connections**: framed, correlation-id pipelined, ApiVersions
   negotiation with the `UNSUPPORTED_VERSION` downgrade path; plaintext
   or TLS (Mozilla roots, custom CA, or caller-built config), with
@@ -70,6 +84,12 @@ forty lines, assembled and running against a real broker:
 join, resume from the group's committed offsets, read, commit,
 rebalance. [`examples/group848_consume.rs`](examples/group848_consume.rs)
 is the same loop on the newer protocol, with a header on what changes.
+
+[`examples/transactions.rs`](examples/transactions.rs) does the same
+for exactly-once: it aborts a transaction and shows the records still
+in the log under `read_uncommitted` and gone under `read_committed`,
+commits across two partitions, then runs a consume-transform-produce
+loop that commits its input position inside its output transaction.
 
 See [`examples/`](examples/) for those, plus produce/consume,
 group-membership mechanics on their own, and TLS/SASL smoke tests.

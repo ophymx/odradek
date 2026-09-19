@@ -180,6 +180,13 @@ struct State {
     blocking: HashMap<i32, BlockingPool>,
     /// Group id → coordinator node id, as last discovered.
     coordinators: HashMap<String, i32>,
+    /// Transactional id → coordinator node id.
+    ///
+    /// Kept apart from `coordinators` because the two namespaces are
+    /// independent: the same string can name a group and a
+    /// transactional id, they are hashed onto their own internal topics,
+    /// and nothing makes them land on the same broker.
+    txn_coordinators: HashMap<String, i32>,
 }
 
 #[derive(Debug)]
@@ -582,6 +589,48 @@ impl Cluster {
 /// (v4+ switches to batched keys).
 const FIND_COORDINATOR_SUPPORTED: (i16, i16) = (0, 3);
 
+/// Which coordinator a FindCoordinator is asking about.
+///
+/// The wire calls this `key_type`, and the two values name two
+/// unrelated services that happen to share a request: the group
+/// coordinator owns offsets and rebalances, the transaction
+/// coordinator owns producer ids and transaction state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoordinatorKind {
+    Group,
+    Transaction,
+}
+
+impl CoordinatorKind {
+    fn key_type(self) -> i8 {
+        match self {
+            CoordinatorKind::Group => 0,
+            CoordinatorKind::Transaction => 1,
+        }
+    }
+
+    fn cached(self, state: &State, key: &str) -> Option<i32> {
+        match self {
+            CoordinatorKind::Group => state.coordinators.get(key).copied(),
+            CoordinatorKind::Transaction => state.txn_coordinators.get(key).copied(),
+        }
+    }
+
+    fn record(self, state: &mut State, key: &str, node_id: i32) {
+        match self {
+            CoordinatorKind::Group => state.coordinators.insert(key.to_owned(), node_id),
+            CoordinatorKind::Transaction => state.txn_coordinators.insert(key.to_owned(), node_id),
+        };
+    }
+
+    fn forget(self, state: &mut State, key: &str) -> Option<i32> {
+        match self {
+            CoordinatorKind::Group => state.coordinators.remove(key),
+            CoordinatorKind::Transaction => state.txn_coordinators.remove(key),
+        }
+    }
+}
+
 impl Cluster {
     /// A negotiated connection to `group`'s coordinator, discovering it
     /// via FindCoordinator on first use.
@@ -595,17 +644,42 @@ impl Cluster {
     }
 
     pub async fn coordinator(&self, group: &str) -> Result<Broker, ClientError> {
-        let cached = self.state().coordinators.get(group).copied();
+        self.coordinator_of(CoordinatorKind::Group, group).await
+    }
+
+    /// A negotiated connection to the coordinator for `transactional_id`
+    /// — the broker that owns this producer's transaction state, and the
+    /// only one InitProducerId, AddPartitionsToTxn, AddOffsetsToTxn,
+    /// TxnOffsetCommit and EndTxn may be sent to.
+    ///
+    /// A different lookup from [`Cluster::coordinator`], not just a
+    /// different argument: the transaction log and the offsets log are
+    /// separate internal topics, so the same name can coordinate on
+    /// different brokers depending on which question is asked.
+    pub async fn transaction_coordinator(
+        &self,
+        transactional_id: &str,
+    ) -> Result<Broker, ClientError> {
+        self.coordinator_of(CoordinatorKind::Transaction, transactional_id)
+            .await
+    }
+
+    async fn coordinator_of(
+        &self,
+        kind: CoordinatorKind,
+        key: &str,
+    ) -> Result<Broker, ClientError> {
+        let cached = kind.cached(&self.state(), key);
         let node_id = match cached {
             Some(node_id) => node_id,
             None => {
                 // A dead control connection fails over like metadata does.
                 let broker = self.control_broker().await?;
-                match self.find_coordinator(&broker, group).await {
+                match self.find_coordinator(&broker, kind, key).await {
                     Err(e) if is_control_failure(&e) => {
                         self.forget_control();
                         let broker = self.control_broker().await?;
-                        self.find_coordinator(&broker, group).await?
+                        self.find_coordinator(&broker, kind, key).await?
                     }
                     other => other?,
                 }
@@ -614,13 +688,18 @@ impl Cluster {
         self.broker(node_id).await
     }
 
-    async fn find_coordinator(&self, broker: &Broker, group: &str) -> Result<i32, ClientError> {
+    async fn find_coordinator(
+        &self,
+        broker: &Broker,
+        kind: CoordinatorKind,
+        key: &str,
+    ) -> Result<i32, ClientError> {
         let version = broker
             .ranges
             .pick(FindCoordinatorRequest::API_KEY, FIND_COORDINATOR_SUPPORTED)?;
         let mut request = FindCoordinatorRequest::default();
-        request.key = group.to_owned();
-        request.key_type = 0; // group coordinator
+        request.key = key.to_owned();
+        request.key_type = kind.key_type();
         let mut body = BytesMut::new();
         request.encode(&mut body, version)?;
         let mut resp = broker
@@ -643,15 +722,24 @@ impl Cluster {
                 port: resp.port,
             },
         );
-        state.coordinators.insert(group.to_owned(), resp.node_id);
+        kind.record(&mut state, key, resp.node_id);
         Ok(resp.node_id)
     }
 
     /// Forget `group`'s discovered coordinator — e.g. after
     /// NOT_COORDINATOR — so the next use rediscovers it.
     pub fn forget_coordinator(&self, group: &str) {
+        self.forget_coordinator_of(CoordinatorKind::Group, group);
+    }
+
+    /// Forget the discovered coordinator for `transactional_id`.
+    pub fn forget_transaction_coordinator(&self, transactional_id: &str) {
+        self.forget_coordinator_of(CoordinatorKind::Transaction, transactional_id);
+    }
+
+    fn forget_coordinator_of(&self, kind: CoordinatorKind, key: &str) {
         let mut state = self.state();
-        if let Some(node_id) = state.coordinators.remove(group) {
+        if let Some(node_id) = kind.forget(&mut state, key) {
             state.conns.remove(&node_id);
             if let Some(pool) = state.blocking.get_mut(&node_id) {
                 pool.idle.clear();
