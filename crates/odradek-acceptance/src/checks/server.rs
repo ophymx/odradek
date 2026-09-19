@@ -37,6 +37,8 @@ use odradek_protocol::messages::init_producer_id_request::InitProducerIdRequest;
 use odradek_protocol::messages::init_producer_id_response::InitProducerIdResponse;
 use odradek_protocol::messages::join_group_request::{JoinGroupRequest, JoinGroupRequestProtocol};
 use odradek_protocol::messages::join_group_response::JoinGroupResponse;
+use odradek_protocol::messages::leave_group_request::{LeaveGroupRequest, MemberIdentity};
+use odradek_protocol::messages::leave_group_response::LeaveGroupResponse;
 use odradek_protocol::messages::list_offsets_request::{
     ListOffsetsPartition, ListOffsetsRequest, ListOffsetsTopic,
 };
@@ -268,6 +270,27 @@ pub static SERVER_CHECKS: &[Check] = &[
         requirement: "completes a SCRAM exchange with a server signature that \
                       verifies, proving it holds the account's key material",
         runner: Runner::Server(|ctx| Box::pin(scram_server_proves_itself(ctx))),
+    },
+    Check {
+        id: "offsets/metadata-round-trips",
+        requirement: "returns the metadata string a commit carried exactly as it \
+                      was given, rather than dropping or altering it beside an \
+                      offset that reads back fine",
+        runner: Runner::Server(|ctx| Box::pin(offsets_metadata_round_trips(ctx))),
+    },
+    Check {
+        id: "create-topics/impossible-replication",
+        requirement: "refuses a replication factor the cluster cannot satisfy \
+                      rather than creating the topic with fewer replicas than \
+                      were asked for",
+        runner: Runner::Server(|ctx| Box::pin(create_topics_impossible_replication(ctx))),
+    },
+    Check {
+        id: "groups/leave-unregisters-the-member",
+        requirement: "stops accepting heartbeats from a member that has left, so \
+                      its partitions are reassigned instead of being held by a \
+                      member that is gone",
+        runner: Runner::Server(|ctx| Box::pin(groups_leave_unregisters_the_member(ctx))),
     },
     Check {
         id: "list-offsets/by-timestamp",
@@ -4960,4 +4983,435 @@ async fn metadata_of_topic(
         .encode(&mut body, version)
         .map_err(|e| CheckError::Infra(format!("encoding Metadata: {e}")))?;
     api_call(conn, MetadataRequest::API_KEY, version, correlation, &body).await
+}
+
+/// Commit metadata must come back exactly as it was given.
+///
+/// The string is the client's, and the broker has no business in it:
+/// consumers put processing state, a schema version, a shard id in
+/// there. Same property the group assignment check guards — opaque
+/// bytes reach their owner unexamined — but on the durable path, where
+/// a broker that drops or truncates it loses something no retry will
+/// bring back, and the offset beside it comes back fine so nothing
+/// looks wrong.
+async fn offsets_metadata_round_trips(ctx: &ServerCtx) -> Verdict {
+    let (commit_version, fetch_version) = match offsets_versions(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let produced = match produce_flow(ctx, "commitmeta", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    if let Some(skip) = skip_without_topic_id(&produced, commit_version) {
+        return skip;
+    }
+    let topic = produced.topic.clone();
+    let topic_id = produced.topic_id;
+    let mut conn = produced.conn;
+    let group = check_group("commitmeta");
+    if let Err(e) = await_coordinator(ctx, &group).await {
+        return e.into_verdict();
+    }
+
+    // Shaped to catch the ways a string gets mangled in transit:
+    // non-ASCII, an embedded quote, and enough length to notice a
+    // truncation.
+    let metadata = "odradek:\u{e9}\"state\"/shard-7";
+
+    let mut partition = OffsetCommitRequestPartition::default();
+    partition.partition_index = 0;
+    partition.committed_offset = 11;
+    partition.committed_leader_epoch = -1;
+    partition.committed_metadata = Some(metadata.to_owned());
+    let mut req_topic = OffsetCommitRequestTopic::default();
+    if commit_version >= OFFSETS_BY_TOPIC_ID {
+        req_topic.topic_id = topic_id;
+    } else {
+        req_topic.name = topic.clone();
+    }
+    req_topic.partitions = vec![partition];
+    let mut request = OffsetCommitRequest::default();
+    request.group_id = group.clone();
+    request.generation_id_or_member_epoch = -1;
+    request.member_id = String::new();
+    request.retention_time_ms = -1;
+    request.topics = vec![req_topic];
+    let mut body = BytesMut::new();
+    if let Err(e) = request.encode(&mut body, commit_version) {
+        return Verdict::Error {
+            details: format!("encoding OffsetCommit: {e}"),
+        };
+    }
+    let resp: OffsetCommitResponse = match api_call(
+        &mut conn,
+        OffsetCommitRequest::API_KEY,
+        commit_version,
+        820,
+        &body,
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(e) => return e.context("OffsetCommit").into_verdict(),
+    };
+    let code = resp
+        .topics
+        .first()
+        .and_then(|t| t.partitions.first())
+        .map_or(ErrorCode::NONE, |p| ErrorCode(p.error_code));
+    if !code.is_ok() {
+        return Verdict::Fail {
+            details: format!("committing an offset with metadata answered {code}"),
+        };
+    }
+
+    match fetch_committed_metadata(&mut conn, fetch_version, &group, &topic, topic_id, 830).await {
+        Ok(Some(got)) if got == metadata => Verdict::Pass,
+        Ok(Some(got)) => Verdict::Fail {
+            details: format!(
+                "committed metadata {metadata:?} came back as {got:?}; the string is the \
+                 client's and nothing in the round trip should touch it"
+            ),
+        },
+        Ok(None) => Verdict::Fail {
+            details: format!(
+                "committed metadata {metadata:?} came back absent, while the offset beside \
+                 it came back fine — so nothing about the read looks wrong"
+            ),
+        },
+        Err(e) => e.context("OffsetFetch").into_verdict(),
+    }
+}
+
+/// The committed metadata for partition 0, as OffsetFetch reports it.
+async fn fetch_committed_metadata(
+    conn: &mut RawConnection,
+    version: i16,
+    group: &str,
+    topic: &str,
+    topic_id: [u8; 16],
+    correlation: i32,
+) -> Result<Option<String>, CheckError> {
+    let mut request = OffsetFetchRequest::default();
+    if version >= OFFSET_FETCH_BATCHED {
+        let mut req_topic = OffsetFetchRequestTopics::default();
+        if version >= OFFSETS_BY_TOPIC_ID {
+            req_topic.topic_id = topic_id;
+        } else {
+            req_topic.name = topic.to_owned();
+        }
+        req_topic.partition_indexes = vec![0];
+        let mut req_group = OffsetFetchRequestGroup::default();
+        req_group.group_id = group.to_owned();
+        req_group.topics = Some(vec![req_topic]);
+        request.groups = vec![req_group];
+    } else {
+        let mut req_topic = OffsetFetchRequestTopic::default();
+        req_topic.name = topic.to_owned();
+        req_topic.partition_indexes = vec![0];
+        request.group_id = group.to_owned();
+        request.topics = Some(vec![req_topic]);
+    }
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding OffsetFetch: {e}")))?;
+    let resp: OffsetFetchResponse = api_call(
+        conn,
+        OffsetFetchRequest::API_KEY,
+        version,
+        correlation,
+        &body,
+    )
+    .await?;
+    if version >= OFFSET_FETCH_BATCHED {
+        Ok(resp
+            .groups
+            .first()
+            .and_then(|g| g.topics.first())
+            .and_then(|t| t.partitions.first())
+            .and_then(|p| p.metadata.clone()))
+    } else {
+        Ok(resp
+            .topics
+            .first()
+            .and_then(|t| t.partitions.first())
+            .and_then(|p| p.metadata.clone()))
+    }
+}
+
+/// A replication factor the cluster cannot satisfy must be refused.
+///
+/// The wrong answer here is not an error, it is a *success*: creating
+/// the topic with however many replicas are available. The caller asked
+/// for a durability level and would be told it got one, and the
+/// difference only ever surfaces as data loss on a broker failure that
+/// the topic was supposed to survive.
+async fn create_topics_impossible_replication(ctx: &ServerCtx) -> Verdict {
+    let version = match negotiate(
+        "CreateTopics",
+        match ctx.range(CreateTopicsRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        CreateTopicsRequest::MIN_VERSION,
+        CreateTopicsRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let mut conn = match connect(&ctx.addr).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
+    // More replicas than any test cluster has brokers, and more than
+    // the protocol's own i16 could describe a plausible cluster of.
+    let asked = 32_767i16;
+    let topic = unique_topic("overreplicated");
+    let mut creatable = CreatableTopic::default();
+    creatable.name = topic.clone();
+    creatable.num_partitions = 1;
+    creatable.replication_factor = asked;
+    let mut request = CreateTopicsRequest::default();
+    request.topics = vec![creatable];
+    request.timeout_ms = 30_000;
+    request.validate_only = false;
+    let mut body = BytesMut::new();
+    if let Err(e) = request.encode(&mut body, version) {
+        return Verdict::Error {
+            details: format!("encoding CreateTopics: {e}"),
+        };
+    }
+    let resp: CreateTopicsResponse =
+        match api_call(&mut conn, CreateTopicsRequest::API_KEY, version, 840, &body).await {
+            Ok(resp) => resp,
+            Err(e) => return e.context("CreateTopics").into_verdict(),
+        };
+    let code = resp
+        .topics
+        .first()
+        .map_or(ErrorCode::NONE, |t| ErrorCode(t.error_code));
+    if code == ErrorCode::INVALID_REPLICATION_FACTOR {
+        return Verdict::Pass;
+    }
+    if !code.is_ok() {
+        // Some other refusal is still a refusal; the point is that the
+        // topic was not quietly created with fewer replicas.
+        return Verdict::Pass;
+    }
+    Verdict::Fail {
+        details: format!(
+            "asked for {asked} replicas of {topic} and was told it was created; a caller \
+             that asked for a durability level it cannot have should be refused, not given \
+             a weaker one under the same name"
+        ),
+    }
+}
+
+/// A member that has left must stop being a member.
+///
+/// Leaving is how a consumer hands its partitions back without waiting
+/// out the session timeout. A coordinator that keeps honouring the
+/// departed member's heartbeats believes it still owns them, so they
+/// are not reassigned and the partitions go unread — quietly, because
+/// every request involved succeeds.
+async fn groups_leave_unregisters_the_member(ctx: &ServerCtx) -> Verdict {
+    let (join_version, sync_version) = match group_versions(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let leave_version = match negotiate(
+        "LeaveGroup",
+        match ctx.range(LeaveGroupRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        LeaveGroupRequest::MIN_VERSION,
+        LeaveGroupRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let heartbeat_version = match negotiate(
+        "Heartbeat",
+        match ctx.range(HeartbeatRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        HeartbeatRequest::MIN_VERSION,
+        HeartbeatRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let mut conn = match connect(&ctx.addr).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
+    let group = check_group("leaving");
+    if let Err(e) = await_coordinator(ctx, &group).await {
+        return e.into_verdict();
+    }
+    let (member_id, generation) =
+        match join_as_leader(ctx, &mut conn, join_version, &group, 850).await {
+            Ok(v) => v,
+            Err(e) => return e.into_verdict(),
+        };
+
+    // Sync first, so the group is settled rather than mid-rebalance:
+    // a heartbeat into an unsettled group is answered
+    // REBALANCE_IN_PROGRESS by some brokers and NONE by others, and
+    // either way it says nothing about membership. Without this the
+    // check could only pass vacuously.
+    if let Err(verdict) =
+        sync_as_leader(&mut conn, sync_version, &group, &member_id, generation, 855).await
+    {
+        return verdict;
+    }
+
+    // Now the precondition means something: the member is live before
+    // it leaves, so a later refusal is the leave taking effect rather
+    // than the join never having.
+    match heartbeat_code(
+        &mut conn,
+        heartbeat_version,
+        &group,
+        &member_id,
+        generation,
+        860,
+    )
+    .await
+    {
+        Ok(code) if code.is_ok() => {}
+        Ok(code) => {
+            return Verdict::Fail {
+                details: format!(
+                    "a heartbeat from a synced member answered {code} before it left, so \
+                     nothing after the leave would prove anything"
+                ),
+            };
+        }
+        Err(e) => return e.context("Heartbeat (before leaving)").into_verdict(),
+    }
+
+    let mut identity = MemberIdentity::default();
+    identity.member_id = member_id.clone();
+    let mut request = LeaveGroupRequest::default();
+    request.group_id = group.clone();
+    request.member_id = member_id.clone();
+    request.members = vec![identity];
+    let mut body = BytesMut::new();
+    if let Err(e) = request.encode(&mut body, leave_version) {
+        return Verdict::Error {
+            details: format!("encoding LeaveGroup: {e}"),
+        };
+    }
+    let resp: LeaveGroupResponse = match api_call(
+        &mut conn,
+        LeaveGroupRequest::API_KEY,
+        leave_version,
+        870,
+        &body,
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(e) => return e.context("LeaveGroup").into_verdict(),
+    };
+    let code = ErrorCode(resp.error_code);
+    if !code.is_ok() {
+        return Verdict::Fail {
+            details: format!("leaving the group answered {code}"),
+        };
+    }
+
+    match heartbeat_code(
+        &mut conn,
+        heartbeat_version,
+        &group,
+        &member_id,
+        generation,
+        880,
+    )
+    .await
+    {
+        Ok(code) if code == ErrorCode::UNKNOWN_MEMBER_ID => Verdict::Pass,
+        Ok(code) if code.is_ok() => Verdict::Fail {
+            details: format!(
+                "a heartbeat from {member_id} was still accepted after it left; the \
+                 coordinator believes a departed member owns its partitions, so nothing \
+                 reassigns them"
+            ),
+        },
+        Ok(code) => Verdict::Fail {
+            details: format!(
+                "a heartbeat after leaving answered {code} rather than UNKNOWN_MEMBER_ID"
+            ),
+        },
+        Err(e) => e.context("Heartbeat (after leaving)").into_verdict(),
+    }
+}
+
+/// One Heartbeat, reduced to the code it answered with.
+async fn heartbeat_code(
+    conn: &mut RawConnection,
+    version: i16,
+    group: &str,
+    member_id: &str,
+    generation: i32,
+    correlation: i32,
+) -> Result<ErrorCode, CheckError> {
+    let mut request = HeartbeatRequest::default();
+    request.group_id = group.to_owned();
+    request.generation_id = generation;
+    request.member_id = member_id.to_owned();
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding Heartbeat: {e}")))?;
+    let resp: HeartbeatResponse =
+        api_call(conn, HeartbeatRequest::API_KEY, version, correlation, &body).await?;
+    Ok(ErrorCode(resp.error_code))
+}
+
+/// SyncGroup as the group's only member, supplying itself an
+/// assignment, to settle the group out of its post-join rebalance.
+async fn sync_as_leader(
+    conn: &mut RawConnection,
+    version: i16,
+    group: &str,
+    member_id: &str,
+    generation: i32,
+    correlation: i32,
+) -> Result<(), Verdict> {
+    let mut assignment = SyncGroupRequestAssignment::default();
+    assignment.member_id = member_id.to_owned();
+    assignment.assignment = Bytes::from_static(&[0x00]);
+    let mut request = SyncGroupRequest::default();
+    request.group_id = group.to_owned();
+    request.generation_id = generation;
+    request.member_id = member_id.to_owned();
+    request.protocol_type = Some(GROUP_PROTOCOL_TYPE.to_owned());
+    request.protocol_name = Some("range".to_owned());
+    request.assignments = vec![assignment];
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| Verdict::Error {
+            details: format!("encoding SyncGroup: {e}"),
+        })?;
+    let resp: SyncGroupResponse =
+        match api_call(conn, SyncGroupRequest::API_KEY, version, correlation, &body).await {
+            Ok(resp) => resp,
+            Err(e) => return Err(e.context("SyncGroup").into_verdict()),
+        };
+    let code = ErrorCode(resp.error_code);
+    if code.is_ok() {
+        Ok(())
+    } else {
+        Err(Verdict::Fail {
+            details: format!("SyncGroup as the group's only member answered {code}"),
+        })
+    }
 }

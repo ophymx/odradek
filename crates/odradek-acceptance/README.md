@@ -111,6 +111,19 @@ the ones where the *wrong* answer is plausible:
 - A topic reported deleted stops existing — the mirror of
   `validate_only`, checked by asking again rather than by trusting the
   acknowledgement.
+- A replication factor the cluster cannot satisfy is *refused*. The
+  plausible wrong answer here is not an error but a success: creating
+  the topic with however many replicas are available, so a caller who
+  asked for a durability level is told it got one and finds out
+  otherwise during the broker failure the topic was meant to survive.
+- Commit metadata comes back exactly as it was given. The string is the
+  client's — processing state, a schema version, a shard id — and the
+  offset beside it reads back fine either way, so a broker that drops
+  it loses something nothing looks wrong about.
+- A member that has left stops being one. A coordinator that keeps
+  honouring a departed member's heartbeats believes it still owns its
+  partitions, so they are never reassigned and simply go unread, with
+  every request involved succeeding.
 - Re-taking a transactional id must hand out a *higher* epoch, and the
   superseded one must then be refused. Either half alone is worthless:
   an epoch nobody enforces fences nothing, and enforcement without a
@@ -153,6 +166,12 @@ unexamined — the same opacity the record-batch codec promises. In
 KIP-848, an absent assignment means "unchanged" while an empty one
 means "revoked", which is how a steady-state heartbeat is told apart
 from an unsubscribe.
+
+`groups/leave-unregisters-the-member` caught the reference subject
+reading only LeaveGroup's pre-v3 `member_id` field — v3 moved the
+departing member into a `members` array and the old field left the
+wire, so every leave was acknowledged and ignored. That is the shape of
+bug these checks exist for, and it was in the suite's own code.
 
 Transactions surfaced two more. A client must ask FindCoordinator for
 its transactional id before InitProducerId — obvious in a multi-broker

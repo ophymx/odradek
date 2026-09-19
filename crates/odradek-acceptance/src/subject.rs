@@ -206,6 +206,15 @@ pub enum Fault {
     /// Echo a different topic id than the fetch requested.
     FetchWrongTopicId,
 
+    /// Store a commit without the metadata string it carried, so the
+    /// offset reads back fine and the client's own state is gone.
+    OffsetCommitDropsMetadata,
+    /// Acknowledge a LeaveGroup and keep the member, so the coordinator
+    /// goes on believing a departed member owns its partitions.
+    LeaveGroupKeepsTheMember,
+    /// Create a topic at whatever replication factor is available
+    /// instead of refusing one the cluster cannot satisfy.
+    CreateTopicsIgnoresReplicationFactor,
     /// Answer a timestamp lookup with the log end instead of searching,
     /// so a consumer seeking past the last record is told it is caught
     /// up rather than that there is nothing there.
@@ -261,6 +270,9 @@ impl Fault {
         Fault::FetchCorruptBatch,
         Fault::ProduceTopicIdUnknown,
         Fault::FetchWrongTopicId,
+        Fault::OffsetCommitDropsMetadata,
+        Fault::LeaveGroupKeepsTheMember,
+        Fault::CreateTopicsIgnoresReplicationFactor,
         Fault::ListOffsetsTimestampReturnsLogEnd,
         Fault::DeleteTopicsKeepsTheTopic,
         Fault::ProduceAppendsIdempotentRetries,
@@ -509,7 +521,7 @@ struct ConnState {
     /// Topic ids minted by CreateTopics, keyed by id.
     topic_names: HashMap<[u8; 16], String>,
     /// Committed offsets, keyed by (group, topic, partition).
-    committed: HashMap<(String, String, i32), i64>,
+    committed: HashMap<(String, String, i32), (i64, Option<String>)>,
     /// Consumer groups this connection has joined (classic protocol).
     groups: HashMap<String, GroupState>,
     /// KIP-848 members, keyed by (group, member id).
@@ -685,7 +697,9 @@ async fn handle_connection(mut stream: TcpStream, faults: Vec<Fault>) {
             FindCoordinatorRequest::API_KEY => {
                 find_coordinator_exchange(frame, api_version, local_port, &faults)
             }
-            OffsetCommitRequest::API_KEY => offset_commit_exchange(frame, api_version, &mut state),
+            OffsetCommitRequest::API_KEY => {
+                offset_commit_exchange(frame, api_version, &faults, &mut state)
+            }
             OffsetFetchRequest::API_KEY => {
                 offset_fetch_exchange(frame, api_version, &faults, &state)
             }
@@ -698,7 +712,9 @@ async fn handle_connection(mut stream: TcpStream, faults: Vec<Fault>) {
             HeartbeatRequest::API_KEY => {
                 heartbeat_exchange(frame, api_version, &faults, &mut state)
             }
-            LeaveGroupRequest::API_KEY => leave_group_exchange(frame, api_version, &mut state),
+            LeaveGroupRequest::API_KEY => {
+                leave_group_exchange(frame, api_version, &faults, &mut state)
+            }
             ConsumerGroupHeartbeatRequest::API_KEY => {
                 consumer_group_heartbeat_exchange(frame, api_version, &faults, &mut state)
             }
@@ -1231,6 +1247,7 @@ fn heartbeat_exchange(
 fn leave_group_exchange(
     mut frame: Bytes,
     api_version: i16,
+    faults: &[Fault],
     state: &mut ConnState,
 ) -> Option<BytesMut> {
     if !(LeaveGroupRequest::MIN_VERSION..=LeaveGroupRequest::MAX_VERSION).contains(&api_version) {
@@ -1240,9 +1257,24 @@ fn leave_group_exchange(
     let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
     let request = LeaveGroupRequest::decode(&mut frame, api_version).ok()?;
 
-    if let Some(group) = state.groups.get_mut(&request.group_id) {
-        group.members.retain(|id| *id != request.member_id);
-        group.assignments.remove(&request.member_id);
+    // v3 moved the departing member from a top-level id to a `members`
+    // array, and the old field stops being on the wire — so a subject
+    // that reads only one of them ignores half the leaves it is sent.
+    let mut leaving: Vec<String> = request
+        .members
+        .iter()
+        .map(|m| m.member_id.clone())
+        .collect();
+    if !request.member_id.is_empty() {
+        leaving.push(request.member_id.clone());
+    }
+    if !faults.contains(&Fault::LeaveGroupKeepsTheMember) {
+        if let Some(group) = state.groups.get_mut(&request.group_id) {
+            group.members.retain(|id| !leaving.contains(id));
+            for id in &leaving {
+                group.assignments.remove(id);
+            }
+        }
     }
     let mut resp = LeaveGroupResponse::default();
     resp.error_code = 0;
@@ -1267,11 +1299,15 @@ fn fence(
     member_id: &str,
     faults: &[Fault],
 ) -> Option<ErrorCode> {
-    if faults.contains(&Fault::GroupIgnoresGeneration) {
-        return None;
-    }
+    // Membership first, and outside the generation fault: whether the
+    // coordinator knows this member at all is a different question from
+    // whether it checks generations, and one fault should not answer
+    // both.
     if !group.members.iter().any(|id| id == member_id) {
         return Some(ErrorCode::UNKNOWN_MEMBER_ID);
+    }
+    if faults.contains(&Fault::GroupIgnoresGeneration) {
+        return None;
     }
     if generation_id != group.generation_id {
         return Some(ErrorCode::ILLEGAL_GENERATION);
@@ -1408,6 +1444,7 @@ fn find_coordinator_exchange(
 fn offset_commit_exchange(
     mut frame: Bytes,
     api_version: i16,
+    faults: &[Fault],
     state: &mut ConnState,
 ) -> Option<BytesMut> {
     if !(OffsetCommitRequest::MIN_VERSION..=OffsetCommitRequest::MAX_VERSION).contains(&api_version)
@@ -1439,9 +1476,17 @@ fn offset_commit_exchange(
                 .partitions
                 .iter()
                 .map(|p| {
+                    // The metadata is the client's string and stored
+                    // beside the offset, not instead of it: dropping it
+                    // leaves a commit that reads back looking fine.
+                    let metadata = if faults.contains(&Fault::OffsetCommitDropsMetadata) {
+                        None
+                    } else {
+                        p.committed_metadata.clone()
+                    };
                     state.committed.insert(
                         (request.group_id.clone(), name.clone(), p.partition_index),
-                        p.committed_offset,
+                        (p.committed_offset, metadata),
                     );
                     let mut out = OffsetCommitResponsePartition::default();
                     out.partition_index = p.partition_index;
@@ -1488,21 +1533,20 @@ fn offset_fetch_exchange(
             name.to_owned()
         }
     };
-    let lookup = |group: &str, topic: &str, partition: i32| -> i64 {
+    let lookup = |group: &str, topic: &str, partition: i32| -> (i64, Option<String>) {
         let stored = state
             .committed
             .get(&(group.to_owned(), topic.to_owned(), partition))
-            .copied();
+            .cloned();
         match stored {
-            Some(offset) if faults.contains(&Fault::OffsetFetchLosesCommit) => {
+            Some(_) if faults.contains(&Fault::OffsetFetchLosesCommit) => {
                 // Answer as though nothing was ever committed.
-                let _ = offset;
-                UNSET_OFFSET
+                (UNSET_OFFSET, None)
             }
-            Some(offset) => offset,
+            Some(entry) => entry,
             // The sentinel, unless told to report a plausible-looking 0.
-            None if faults.contains(&Fault::OffsetFetchUnsetIsZero) => 0,
-            None => UNSET_OFFSET,
+            None if faults.contains(&Fault::OffsetFetchUnsetIsZero) => (0, None),
+            None => (UNSET_OFFSET, None),
         }
     };
 
@@ -1529,11 +1573,13 @@ fn offset_fetch_exchange(
                             .map(|index| {
                                 let mut p = OffsetFetchResponsePartitions::default();
                                 p.partition_index = *index;
-                                p.committed_offset = lookup(
+                                let (offset, metadata) = lookup(
                                     &group.group_id,
                                     &resolve(&topic.name, &topic.topic_id),
                                     *index,
                                 );
+                                p.committed_offset = offset;
+                                p.metadata = metadata;
                                 p.committed_leader_epoch = -1;
                                 p.error_code = 0;
                                 p
@@ -1559,7 +1605,9 @@ fn offset_fetch_exchange(
                     .map(|index| {
                         let mut p = OffsetFetchResponsePartition::default();
                         p.partition_index = *index;
-                        p.committed_offset = lookup(&request.group_id, &topic.name, *index);
+                        let (offset, metadata) = lookup(&request.group_id, &topic.name, *index);
+                        p.committed_offset = offset;
+                        p.metadata = metadata;
                         p.committed_leader_epoch = -1;
                         p.error_code = 0;
                         p
@@ -1773,9 +1821,17 @@ fn create_topics_exchange(
             result.topic_id = topic_id;
             result.num_partitions = t.num_partitions.max(1);
             result.replication_factor = t.replication_factor.max(1);
+            // This subject is one broker, so anything above one replica
+            // is a durability level it cannot give — and saying yes to
+            // it anyway is the failure the check looks for: the caller
+            // would be told it has replication it does not have.
+            let overreplicated = t.replication_factor > 1
+                && !faults.contains(&Fault::CreateTopicsIgnoresReplicationFactor);
             result.error_code = if exists && !faults.contains(&Fault::CreateTopicsDuplicateSucceeds)
             {
                 ErrorCode::TOPIC_ALREADY_EXISTS.0
+            } else if overreplicated {
+                ErrorCode::INVALID_REPLICATION_FACTOR.0
             } else {
                 0
             };

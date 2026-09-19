@@ -82,6 +82,18 @@ const SENSITIVITY: &[(Fault, &str)] = &[
     (Fault::ProduceTopicIdUnknown, "produce/topic-id"),
     (Fault::FetchWrongTopicId, "fetch/topic-id"),
     (
+        Fault::OffsetCommitDropsMetadata,
+        "offsets/metadata-round-trips",
+    ),
+    (
+        Fault::LeaveGroupKeepsTheMember,
+        "groups/leave-unregisters-the-member",
+    ),
+    (
+        Fault::CreateTopicsIgnoresReplicationFactor,
+        "create-topics/impossible-replication",
+    ),
+    (
         Fault::ListOffsetsTimestampReturnsLogEnd,
         "list-offsets/by-timestamp",
     ),
