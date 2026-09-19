@@ -693,6 +693,7 @@ dependencies = [
  "crc32c",
  "criterion",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

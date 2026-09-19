@@ -63,6 +63,28 @@ crate.
 Licensed under either of [Apache License, Version
 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
 
+## The proxy guarantee, witnessed
+
+Most of this crate's design is justified by "a proxy needs this" —
+unknown tagged fields round-trip raw, record batches re-encode
+byte-identically, decoding costs O(fields) rather than O(payload).
+[`examples/proxy.rs`](examples/proxy.rs) is that argument's witness: a
+pass-through Kafka proxy in about two hundred lines of this crate and
+a socket, with no other odradek crate involved.
+
+It forwards almost everything without parsing it. Two things force it
+to look: response header versions are not carried in responses (so it
+remembers what each correlation id asked for), and Metadata advertises
+where to connect *next* (so those endpoints are decoded, rewritten to
+point at the proxy, and re-encoded).
+
+Run against Apache Kafka 4.1 with the Java console tools in front of
+it, a topic is created, produced to and consumed back through the
+proxy. More decisively, the full `odradek-acceptance` server suite —
+47 checks over 23 APIs, including byte-level batch integrity and
+compressed-batch passthrough — passes through the proxy with exactly
+the results it gets against the broker directly.
+
 The message schemas vendored in `schemas/` are copied from [Apache
 Kafka](https://github.com/apache/kafka) and remain licensed to the
 Apache Software Foundation under the Apache License, Version 2.0.

@@ -33,6 +33,9 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+# For the proxy example only. The crate itself is sans-I/O and stays
+# that way; a proxy is the one demonstration that needs a socket.
+tokio = { workspace = true }
 
 [[bench]]
 name = "codec"
