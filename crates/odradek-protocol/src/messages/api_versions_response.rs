@@ -318,6 +318,9 @@ impl crate::Message for ApiVersionsResponse {
     ) -> Result<Self, DecodeError> {
         ApiVersionsResponse::decode_with_limits(buf, version, limits)
     }
+    fn throttle_time_ms(&self) -> Option<i32> {
+        Some(self.throttle_time_ms)
+    }
 }
 
 /// `ApiVersion` (nested in [`ApiVersionsResponse`]).

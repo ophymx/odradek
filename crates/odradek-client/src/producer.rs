@@ -1012,7 +1012,7 @@ async fn init_producer_id_once(
         .conn
         .request(InitProducerIdRequest::API_KEY, version, &body)
         .await?;
-    let resp = conn::decode_body::<InitProducerIdResponse>(&mut resp, version)?;
+    let resp = conn::decode_body::<InitProducerIdResponse>(&broker.conn, &mut resp, version)?;
     let code = ErrorCode(resp.error_code);
     if !code.is_ok() {
         return Err(ClientError::Broker(code));
@@ -1108,7 +1108,7 @@ async fn try_once(
             return Err(e);
         }
     };
-    let resp = conn::decode_body::<ProduceResponse>(&mut resp, version)?;
+    let resp = conn::decode_body::<ProduceResponse>(&broker.conn, &mut resp, version)?;
     let entry = resp
         .responses
         .iter()

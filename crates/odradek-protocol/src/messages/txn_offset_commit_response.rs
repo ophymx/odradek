@@ -141,6 +141,9 @@ impl crate::Message for TxnOffsetCommitResponse {
     ) -> Result<Self, DecodeError> {
         TxnOffsetCommitResponse::decode_with_limits(buf, version, limits)
     }
+    fn throttle_time_ms(&self) -> Option<i32> {
+        Some(self.throttle_time_ms)
+    }
 }
 
 /// `TxnOffsetCommitResponseTopic` (nested in [`TxnOffsetCommitResponse`]).

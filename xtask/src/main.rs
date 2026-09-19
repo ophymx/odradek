@@ -847,6 +847,14 @@ fn generate_struct(w: &mut String, msg: &Message, def: &StructDef, is_top: bool)
                 def.name
             );
             let _ = writeln!(w, "    }}");
+            // Quota backoff, for the messages whose schema carries it.
+            // Generated rather than hand-listed: which responses have
+            // the field is the schemas' business, and it changes.
+            if def.fields.iter().any(|f| f.name == "ThrottleTimeMs") {
+                let _ = writeln!(w, "    fn throttle_time_ms(&self) -> Option<i32> {{");
+                let _ = writeln!(w, "        Some(self.throttle_time_ms)");
+                let _ = writeln!(w, "    }}");
+            }
             let _ = writeln!(w, "}}");
         }
     }

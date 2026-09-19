@@ -78,7 +78,7 @@ pub(crate) async fn commit_once(
         .conn
         .request(OffsetCommitRequest::API_KEY, version, &body)
         .await?;
-    let resp = conn::decode_body::<OffsetCommitResponse>(&mut resp, version)?;
+    let resp = conn::decode_body::<OffsetCommitResponse>(&broker.conn, &mut resp, version)?;
     let entry = resp
         .topics
         .iter()
@@ -121,7 +121,7 @@ pub(crate) async fn committed_once(
         .conn
         .request(OffsetFetchRequest::API_KEY, version, &body)
         .await?;
-    let resp = conn::decode_body::<OffsetFetchResponse>(&mut resp, version)?;
+    let resp = conn::decode_body::<OffsetFetchResponse>(&broker.conn, &mut resp, version)?;
     let code = ErrorCode(resp.error_code);
     if !code.is_ok() {
         return Err(ClientError::Broker(code));

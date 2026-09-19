@@ -202,6 +202,9 @@ impl crate::Message for ProduceResponse {
     ) -> Result<Self, DecodeError> {
         ProduceResponse::decode_with_limits(buf, version, limits)
     }
+    fn throttle_time_ms(&self) -> Option<i32> {
+        Some(self.throttle_time_ms)
+    }
 }
 
 /// `TopicProduceResponse` (nested in [`ProduceResponse`]).

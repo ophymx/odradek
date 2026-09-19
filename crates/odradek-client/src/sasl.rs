@@ -219,7 +219,7 @@ pub async fn authenticate(
     let mut resp = conn
         .request(SaslHandshakeRequest::API_KEY, version, &body)
         .await?;
-    let resp = conn::decode_body::<SaslHandshakeResponse>(&mut resp, version)?;
+    let resp = conn::decode_body::<SaslHandshakeResponse>(conn, &mut resp, version)?;
     let code = ErrorCode(resp.error_code);
     if !code.is_ok() {
         return Err(ClientError::Sasl(format!(
@@ -322,7 +322,7 @@ async fn sasl_round(
     let mut resp = conn
         .request(SaslAuthenticateRequest::API_KEY, version, &body)
         .await?;
-    conn::decode_body::<SaslAuthenticateResponse>(&mut resp, version)
+    conn::decode_body::<SaslAuthenticateResponse>(conn, &mut resp, version)
 }
 
 fn check_auth(resp: &SaslAuthenticateResponse) -> Result<(), ClientError> {

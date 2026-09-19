@@ -55,6 +55,23 @@ pub trait Message: Sized {
     /// that adding it broke no hand-written implementation: it ignores
     /// `limits` and decodes under that type's own default bound, which
     /// is never *less* safe than [`Message::decode`].
+    /// How long the broker wants this client to wait before sending
+    /// more, or `None` for a message that has no such field.
+    ///
+    /// Kafka's quota mechanism is advisory in the only way that
+    /// matters: the broker answers, sets this, and then stops reading
+    /// from the connection for that long. A client that ignores it does
+    /// not get faster — its next request simply sits unanswered until
+    /// the mute expires, which is indistinguishable from a hung broker
+    /// and will trip a request timeout instead of a backoff.
+    ///
+    /// Generated for every message whose schema carries the field;
+    /// defaulted here so that adding it broke no hand-written
+    /// implementation, the way [`Message::decode_with_limits`] was.
+    fn throttle_time_ms(&self) -> Option<i32> {
+        None
+    }
+
     fn decode_with_limits(
         buf: &mut impl Buf,
         version: i16,

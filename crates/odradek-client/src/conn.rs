@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -141,6 +141,14 @@ struct Inner {
     client_id: String,
     request_timeout: std::time::Duration,
     encrypted: bool,
+    /// When the broker's quota mute is expected to lift, in
+    /// milliseconds since this connection's `opened`.
+    ///
+    /// Milliseconds rather than an `Instant` so it fits an atomic and
+    /// costs nothing to read on the common path, where it is zero.
+    throttled_until_ms: AtomicI64,
+    /// The zero point `throttled_until_ms` is measured from.
+    opened: std::time::Instant,
     reader: JoinHandle<()>,
 }
 
@@ -204,6 +212,8 @@ impl Connection {
                 client_id: config.client_id.clone(),
                 request_timeout: config.request_timeout,
                 encrypted,
+                throttled_until_ms: AtomicI64::new(0),
+                opened: std::time::Instant::now(),
                 reader,
             }),
         })
@@ -245,12 +255,48 @@ impl Connection {
     /// request that blows it fails with [`ClientError::Timeout`] and closes
     /// the connection: the broker answers a connection's requests strictly
     /// in order, so everything pipelined behind a hung request is hung too.
+    /// Record a broker-requested pause before the next request.
+    ///
+    /// Called for every response that carries `throttle_time_ms`; see
+    /// [`Message::throttle_time_ms`](odradek_protocol::message::Message::throttle_time_ms)
+    /// for why ignoring it makes a client slower rather than faster.
+    pub(crate) fn note_throttle(&self, ms: i32) {
+        if ms <= 0 {
+            return;
+        }
+        let until = i64::try_from(self.inner.opened.elapsed().as_millis()).unwrap_or(i64::MAX)
+            + i64::from(ms);
+        // Keep the furthest-out pause: two responses in flight can each
+        // carry one, and the later deadline is the one that holds.
+        self.inner
+            .throttled_until_ms
+            .fetch_max(until, Ordering::Relaxed);
+    }
+
+    /// How long is left of a broker-requested pause, if any.
+    fn throttle_remaining(&self) -> Option<std::time::Duration> {
+        let until = self.inner.throttled_until_ms.load(Ordering::Relaxed);
+        if until == 0 {
+            return None;
+        }
+        let now = i64::try_from(self.inner.opened.elapsed().as_millis()).unwrap_or(i64::MAX);
+        (until > now)
+            .then(|| std::time::Duration::from_millis(u64::try_from(until - now).unwrap_or(0)))
+    }
+
     pub async fn request(
         &self,
         api_key: i16,
         api_version: i16,
         body: &[u8],
     ) -> Result<Bytes, ClientError> {
+        // Wait out any quota pause before the clock on the request
+        // timeout starts: the broker has stopped reading this
+        // connection, so a request sent now would spend that timeout
+        // sitting in a socket buffer.
+        if let Some(pause) = self.throttle_remaining() {
+            tokio::time::sleep(pause).await;
+        }
         match tokio::time::timeout(
             self.inner.request_timeout,
             self.request_unbounded(api_key, api_version, body),
@@ -413,10 +459,18 @@ async fn reader_loop(mut read_half: ReadHalf, shared: Arc<Shared>) {
 /// be handed a buffer holding more than one thing — the response header
 /// and the body that follows it, here.
 pub(crate) fn decode_body<M: odradek_protocol::message::Message>(
+    conn: &Connection,
     body: &mut Bytes,
     version: i16,
 ) -> Result<M, ClientError> {
     let message = M::decode(body, version)?;
+    // Quota backoff, noted here because this is the one place every
+    // response passes through. The broker has already stopped reading
+    // from this connection for that long, so the next request would sit
+    // unanswered rather than go faster.
+    if let Some(ms) = message.throttle_time_ms() {
+        conn.note_throttle(ms);
+    }
     if !body.is_empty() {
         return Err(ClientError::ProtocolViolation(format!(
             "api key {} v{version} response leaves {} undecoded byte(s)",

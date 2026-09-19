@@ -102,7 +102,7 @@ Early but functional end to end:
   them.
 - `odradek-acceptance`: conformance checks for **both roles** over raw
   connections, independent of the client crate. 45 server checks across
-  20 APIs plus 9 client checks, each one proven by an injected fault to
+  20 APIs plus 10 client checks, each one proven by an injected fault to
   detect what it claims — a check nothing can trip fails calibration.
   `cargo xtask conformance` runs them against Apache Kafka and Redpanda
   in Docker and enforces the baselines committed in

@@ -36,6 +36,7 @@ const CITED: &[&str] = &[
     "client/recovers-from-leader-change",
     "client/heeds-sasl-rejection",
     "client/acknowledges-sasl-rejection",
+    "client/honours-throttle-time",
 ];
 
 #[test]
@@ -108,6 +109,7 @@ async fn odradek_client_passes_the_client_checks() {
     // means a new check cannot slip in as a silent skip.
     const FAULT_GATED: &[&str] = &[
         "client/recovers-from-leader-change",
+        "client/honours-throttle-time",
         "client/heeds-sasl-rejection",
         "client/acknowledges-sasl-rejection",
     ];
@@ -419,5 +421,87 @@ async fn a_client_that_ignores_a_sasl_refusal_is_caught() {
             Some(Verdict::Fail { .. })
         ),
         "an unacknowledged refusal must be caught:\n{report}"
+    );
+}
+
+/// The odradek client waits out a throttle.
+///
+/// The check that found this gap: before it, the client read
+/// `throttle_time_ms` from exactly nothing and pushed straight on into
+/// a broker that had stopped reading.
+#[tokio::test]
+async fn odradek_client_waits_out_a_throttle() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let harness = tokio::spawn(async move {
+        let mut config = config();
+        config.fault = Some(HarnessFault::Throttle);
+        run(&listener, &config).await
+    });
+
+    let mut client_config = ClientConfig::default();
+    client_config.bootstrap_servers = vec![addr];
+    client_config.client_id = "odradek".into();
+    // Connecting refreshes metadata, and that answer carries the
+    // throttle. The second refresh rides the same control connection,
+    // so it is the one that has to wait — a produce would not do, since
+    // it opens its own connection to the partition leader and a pause
+    // is per connection.
+    let cluster = Cluster::connect(client_config).await.unwrap();
+    // Twice, because the first refresh after connecting opens the
+    // control connection rather than reusing the bootstrap one — so it
+    // is the second that follows a throttle on a connection the client
+    // is still using.
+    cluster.refresh_metadata(&[ROUTING_TOPIC]).await.unwrap();
+    cluster.refresh_metadata(&[ROUTING_TOPIC]).await.unwrap();
+    drop(cluster);
+
+    let report = harness.await.unwrap().expect("harness ran");
+    assert!(
+        matches!(
+            report.verdict("client/honours-throttle-time"),
+            Some(Verdict::Pass)
+        ),
+        "{report}"
+    );
+}
+
+/// And a client that ignores the throttle is caught.
+#[tokio::test]
+async fn a_client_that_ignores_a_throttle_is_caught() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let harness = tokio::spawn(async move {
+        let mut config = config();
+        config.fault = Some(HarnessFault::Throttle);
+        run(&listener, &config).await
+    });
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    send_frame(&mut stream, &request_frame(18, 0, 1, &[])).await;
+    // Metadata v9 naming no topics: an empty compact array, the
+    // auto-create flag, and the tagged-field section.
+    send_frame(
+        &mut stream,
+        &request_frame(3, 9, 2, &[0x01, 0x00, 0x00, 0x00]),
+    )
+    .await;
+    // Straight on without pausing, which is the sin.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    send_frame(
+        &mut stream,
+        &request_frame(3, 9, 3, &[0x01, 0x00, 0x00, 0x00]),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(stream);
+
+    let report = harness.await.unwrap().expect("harness ran");
+    assert!(
+        matches!(
+            report.verdict("client/honours-throttle-time"),
+            Some(Verdict::Fail { .. })
+        ),
+        "ignoring a throttle must be caught:\n{report}"
     );
 }

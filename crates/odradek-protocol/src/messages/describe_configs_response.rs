@@ -140,6 +140,9 @@ impl crate::Message for DescribeConfigsResponse {
     ) -> Result<Self, DecodeError> {
         DescribeConfigsResponse::decode_with_limits(buf, version, limits)
     }
+    fn throttle_time_ms(&self) -> Option<i32> {
+        Some(self.throttle_time_ms)
+    }
 }
 
 /// `DescribeConfigsResult` (nested in [`DescribeConfigsResponse`]).

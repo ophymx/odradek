@@ -290,7 +290,7 @@ impl Cluster {
             .conn
             .request(MetadataRequest::API_KEY, version, &body)
             .await?;
-        let resp = conn::decode_body::<MetadataResponse>(&mut resp, version)?;
+        let resp = conn::decode_body::<MetadataResponse>(&broker.conn, &mut resp, version)?;
 
         let brokers: HashMap<i32, BrokerInfo> = resp
             .brokers
@@ -706,7 +706,7 @@ impl Cluster {
             .conn
             .request(FindCoordinatorRequest::API_KEY, version, &body)
             .await?;
-        let resp = conn::decode_body::<FindCoordinatorResponse>(&mut resp, version)?;
+        let resp = conn::decode_body::<FindCoordinatorResponse>(&broker.conn, &mut resp, version)?;
         let code = ErrorCode(resp.error_code);
         if !code.is_ok() {
             return Err(ClientError::Broker(code));
@@ -824,7 +824,7 @@ impl Cluster {
             .conn
             .request(CreateTopicsRequest::API_KEY, version, &body)
             .await?;
-        let resp = conn::decode_body::<CreateTopicsResponse>(&mut resp, version)?;
+        let resp = conn::decode_body::<CreateTopicsResponse>(&broker.conn, &mut resp, version)?;
         let entry = resp.topics.iter().find(|t| t.name == name).ok_or_else(|| {
             ClientError::ProtocolViolation(format!("create topics response omits {name}"))
         })?;

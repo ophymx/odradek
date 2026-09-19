@@ -264,7 +264,7 @@ impl GroupMember {
             .conn
             .request(SyncGroupRequest::API_KEY, sync_version, &body)
             .await?;
-        let resp = conn::decode_body::<SyncGroupResponse>(&mut resp, sync_version)?;
+        let resp = conn::decode_body::<SyncGroupResponse>(&broker.conn, &mut resp, sync_version)?;
         let code = ErrorCode(resp.error_code);
         if !code.is_ok() {
             return Err(ClientError::Broker(code));
@@ -287,7 +287,7 @@ impl GroupMember {
             .conn
             .request(JoinGroupRequest::API_KEY, version, &body)
             .await?;
-        conn::decode_body::<JoinGroupResponse>(&mut resp, version)
+        conn::decode_body::<JoinGroupResponse>(&broker.conn, &mut resp, version)
     }
 
     /// Durably commit `offset` for `topic[partition]` under this
@@ -387,7 +387,7 @@ impl GroupMember {
                 .conn
                 .request(HeartbeatRequest::API_KEY, version, &body)
                 .await?;
-            conn::decode_body::<HeartbeatResponse>(&mut resp, version)
+            conn::decode_body::<HeartbeatResponse>(&broker.conn, &mut resp, version)
         }
         .await;
         let code = match sent {
@@ -429,7 +429,7 @@ impl GroupMember {
             .conn
             .request(LeaveGroupRequest::API_KEY, version, &body)
             .await?;
-        let resp = conn::decode_body::<LeaveGroupResponse>(&mut resp, version)?;
+        let resp = conn::decode_body::<LeaveGroupResponse>(&broker.conn, &mut resp, version)?;
         let code = ErrorCode(resp.error_code);
         // Being already forgotten is as good as having left.
         if !code.is_ok() && code != ErrorCode::UNKNOWN_MEMBER_ID {

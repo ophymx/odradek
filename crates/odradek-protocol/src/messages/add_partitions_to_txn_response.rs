@@ -191,6 +191,9 @@ impl crate::Message for AddPartitionsToTxnResponse {
     ) -> Result<Self, DecodeError> {
         AddPartitionsToTxnResponse::decode_with_limits(buf, version, limits)
     }
+    fn throttle_time_ms(&self) -> Option<i32> {
+        Some(self.throttle_time_ms)
+    }
 }
 
 /// `AddPartitionsToTxnResult` (nested in [`AddPartitionsToTxnResponse`]).

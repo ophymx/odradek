@@ -221,6 +221,9 @@ impl crate::Message for FetchResponse {
     ) -> Result<Self, DecodeError> {
         FetchResponse::decode_with_limits(buf, version, limits)
     }
+    fn throttle_time_ms(&self) -> Option<i32> {
+        Some(self.throttle_time_ms)
+    }
 }
 
 /// `FetchableTopicResponse` (nested in [`FetchResponse`]).

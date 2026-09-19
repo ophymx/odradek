@@ -114,4 +114,7 @@ impl crate::Message for AddOffsetsToTxnResponse {
     ) -> Result<Self, DecodeError> {
         AddOffsetsToTxnResponse::decode_with_limits(buf, version, limits)
     }
+    fn throttle_time_ms(&self) -> Option<i32> {
+        Some(self.throttle_time_ms)
+    }
 }

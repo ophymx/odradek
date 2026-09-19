@@ -428,8 +428,12 @@ impl Consumer {
             }
         };
         // The exchange completed; the connection is clean for reuse.
+        // Cloned before the lease goes back (an Arc bump), so the
+        // throttle the response carries is recorded against the
+        // connection it came from rather than lost with the borrow.
+        let answered_on = broker.conn.clone();
         lease.release();
-        let resp = conn::decode_body::<FetchResponse>(&mut resp, version)?;
+        let resp = conn::decode_body::<FetchResponse>(&answered_on, &mut resp, version)?;
         let code = ErrorCode(resp.error_code);
         if !code.is_ok() {
             return Err(ClientError::Broker(code));
@@ -528,7 +532,7 @@ impl Consumer {
             .conn
             .request(ListOffsetsRequest::API_KEY, version, &body)
             .await?;
-        let resp = conn::decode_body::<ListOffsetsResponse>(&mut resp, version)?;
+        let resp = conn::decode_body::<ListOffsetsResponse>(&broker.conn, &mut resp, version)?;
         let entry = resp
             .topics
             .iter()

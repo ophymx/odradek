@@ -261,7 +261,8 @@ impl ConsumerGroupMember {
             .conn
             .request(ConsumerGroupHeartbeatRequest::API_KEY, version, &body)
             .await?;
-        let resp = conn::decode_body::<ConsumerGroupHeartbeatResponse>(&mut resp, version)?;
+        let resp =
+            conn::decode_body::<ConsumerGroupHeartbeatResponse>(&broker.conn, &mut resp, version)?;
         let code = ErrorCode(resp.error_code);
         // Being already forgotten is as good as having left.
         if !code.is_ok() && code != ErrorCode::UNKNOWN_MEMBER_ID {
@@ -318,7 +319,7 @@ impl ConsumerGroupMember {
                 .conn
                 .request(ConsumerGroupHeartbeatRequest::API_KEY, version, &body)
                 .await?;
-            conn::decode_body::<ConsumerGroupHeartbeatResponse>(&mut resp, version)
+            conn::decode_body::<ConsumerGroupHeartbeatResponse>(&broker.conn, &mut resp, version)
         }
         .await;
         let resp: ConsumerGroupHeartbeatResponse = match sent {

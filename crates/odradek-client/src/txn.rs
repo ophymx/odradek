@@ -176,7 +176,7 @@ async fn add_partitions_once(
         .conn
         .request(AddPartitionsToTxnRequest::API_KEY, version, &body)
         .await?;
-    let resp = conn::decode_body::<AddPartitionsToTxnResponse>(&mut resp, version)?;
+    let resp = conn::decode_body::<AddPartitionsToTxnResponse>(&broker.conn, &mut resp, version)?;
     // The error is per partition, and each one matters: a transaction
     // missing one of its partitions is not a transaction, so the first
     // refusal is the answer.
@@ -235,7 +235,7 @@ async fn add_offsets_once(
         .conn
         .request(AddOffsetsToTxnRequest::API_KEY, version, &body)
         .await?;
-    let resp = conn::decode_body::<AddOffsetsToTxnResponse>(&mut resp, version)?;
+    let resp = conn::decode_body::<AddOffsetsToTxnResponse>(&broker.conn, &mut resp, version)?;
     let code = ErrorCode(resp.error_code);
     if code.is_ok() {
         Ok(())
@@ -355,7 +355,7 @@ async fn offset_commit_once(
         .conn
         .request(TxnOffsetCommitRequest::API_KEY, version, &body)
         .await?;
-    let resp = conn::decode_body::<TxnOffsetCommitResponse>(&mut resp, version)?;
+    let resp = conn::decode_body::<TxnOffsetCommitResponse>(&broker.conn, &mut resp, version)?;
     for topic in &resp.topics {
         for partition in &topic.partitions {
             let code = ErrorCode(partition.error_code);
@@ -410,7 +410,7 @@ async fn end_txn_once(
         .conn
         .request(EndTxnRequest::API_KEY, version, &body)
         .await?;
-    let resp = conn::decode_body::<EndTxnResponse>(&mut resp, version)?;
+    let resp = conn::decode_body::<EndTxnResponse>(&broker.conn, &mut resp, version)?;
     let code = ErrorCode(resp.error_code);
     if code.is_ok() {
         Ok(())

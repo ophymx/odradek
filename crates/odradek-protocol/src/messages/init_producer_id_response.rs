@@ -142,4 +142,7 @@ impl crate::Message for InitProducerIdResponse {
     ) -> Result<Self, DecodeError> {
         InitProducerIdResponse::decode_with_limits(buf, version, limits)
     }
+    fn throttle_time_ms(&self) -> Option<i32> {
+        Some(self.throttle_time_ms)
+    }
 }

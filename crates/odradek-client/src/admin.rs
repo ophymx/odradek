@@ -154,7 +154,7 @@ impl Cluster {
                 .conn
                 .request(ListGroupsRequest::API_KEY, version, &body)
                 .await?;
-            let resp = conn::decode_body::<ListGroupsResponse>(&mut resp, version)?;
+            let resp = conn::decode_body::<ListGroupsResponse>(&broker.conn, &mut resp, version)?;
             let code = ErrorCode(resp.error_code);
             if !code.is_ok() {
                 return Err(ClientError::Broker(code));
@@ -210,7 +210,8 @@ impl Cluster {
                 .conn
                 .request(DescribeGroupsRequest::API_KEY, version, &body)
                 .await?;
-            let resp = conn::decode_body::<DescribeGroupsResponse>(&mut resp, version)?;
+            let resp =
+                conn::decode_body::<DescribeGroupsResponse>(&broker.conn, &mut resp, version)?;
             for group in resp.groups {
                 let code = ErrorCode(group.error_code);
                 if !code.is_ok() {
@@ -284,7 +285,7 @@ impl Cluster {
             .conn
             .request(DeleteTopicsRequest::API_KEY, version, &body)
             .await?;
-        let resp = conn::decode_body::<DeleteTopicsResponse>(&mut resp, version)?;
+        let resp = conn::decode_body::<DeleteTopicsResponse>(&broker.conn, &mut resp, version)?;
         for result in &resp.responses {
             let code = ErrorCode(result.error_code);
             if !code.is_ok() {
@@ -341,7 +342,7 @@ impl Cluster {
             .conn
             .request(DescribeConfigsRequest::API_KEY, version, &body)
             .await?;
-        let resp = conn::decode_body::<DescribeConfigsResponse>(&mut resp, version)?;
+        let resp = conn::decode_body::<DescribeConfigsResponse>(&broker.conn, &mut resp, version)?;
         let result = resp.results.into_iter().next().ok_or_else(|| {
             ClientError::ProtocolViolation("DescribeConfigs answered no resource".into())
         })?;

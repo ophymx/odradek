@@ -149,6 +149,9 @@ impl crate::Message for ListGroupsResponse {
     ) -> Result<Self, DecodeError> {
         ListGroupsResponse::decode_with_limits(buf, version, limits)
     }
+    fn throttle_time_ms(&self) -> Option<i32> {
+        Some(self.throttle_time_ms)
+    }
 }
 
 /// `ListedGroup` (nested in [`ListGroupsResponse`]).

@@ -162,6 +162,15 @@ watches for the lone `\x01` the RFC has the client send back, without
 which the broker is left mid-exchange and reports a timeout instead of
 the reason it already knows.
 
+`client/honours-throttle-time` found a second gap in this crate's own
+client, which read `throttle_time_ms` from nothing at all. Quota
+enforcement is not advice a client can decline: the broker answers,
+sets the field, and then stops reading that connection for that long,
+so a client that ignores it does not get its next request in sooner —
+it gets it in later, sitting in a socket buffer while its own request
+timeout runs down. The failure looks like an unreliable broker from
+the inside, which is why nobody goes looking for it in the client.
+
 Five checks sweep **every version the subject advertises** rather than
 negotiating one and stopping. Against Kafka 4.1 that is 13 Metadata
 exchanges, 12 fetches of a single produced batch, and 7

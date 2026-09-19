@@ -154,6 +154,13 @@ pub static CLIENT_CHECKS: &[Check] = &[
         runner: Runner::Client(recovers_from_leader_change),
     },
     Check {
+        id: "client/honours-throttle-time",
+        requirement: "waits out a response's throttle_time_ms before sending \
+                      again on that connection, instead of pushing into a \
+                      broker that has stopped reading",
+        runner: Runner::Client(honours_throttle_time),
+    },
+    Check {
         id: "client/heeds-sasl-rejection",
         requirement: "after a SASL token is refused, the client sends no data \
                       api on that connection — a refusal shaped like success is \
@@ -187,6 +194,16 @@ pub enum HarnessFault {
     /// this project wrote and caught against a live broker, and these
     /// checks exist to make it unrepeatable.
     RejectSaslToken,
+
+    /// Answer with a non-zero `throttle_time_ms`, the way a broker
+    /// enforcing a quota does.
+    ///
+    /// The broker then stops reading this connection for that long, so
+    /// a client that ignores the field does not go faster — its next
+    /// request sits in a socket buffer until the mute lifts, which is
+    /// indistinguishable from a hung broker and spends the request
+    /// timeout instead of a backoff.
+    Throttle,
 }
 
 /// Limits for one observation session.
@@ -228,6 +245,8 @@ struct Observation {
     conn_id: usize,
     /// Position within its connection.
     index: usize,
+    /// When the frame arrived, as milliseconds since the session began.
+    at_ms: u64,
     api_key: i16,
     api_version: i16,
     /// None when even a salvage parse could not recover a header.
@@ -243,6 +262,15 @@ struct Observation {
 
 /// The SASL apis the harness offers, so a client configured for
 /// OAUTHBEARER has something to negotiate with.
+/// The pause a throttled response asks for.
+///
+/// Long enough that a client which ignores it is unmistakable, short
+/// enough not to dominate the suite's own runtime.
+const THROTTLE_MS: i32 = 400;
+
+/// Metadata carries `throttle_time_ms` from v3.
+const METADATA_THROTTLE_MIN: i16 = 3;
+
 const SASL_HANDSHAKE_API: i16 = 17;
 const SASL_AUTHENTICATE_API: i16 = 36;
 
@@ -262,6 +290,9 @@ pub(crate) struct Session {
     events: Vec<FaultEvent>,
     /// `(connection, request index)` where a SASL token was refused.
     sasl_rejections: Vec<(usize, usize)>,
+    /// `(connection, request index, when the answer went out)` for every
+    /// throttled response.
+    throttles: Vec<(usize, usize, u64)>,
 }
 
 /// Connection bookkeeping for one session: hands out connection ordinals
@@ -308,6 +339,11 @@ struct ClusterView {
     /// Where a SASL token was refused: (connection, request index).
     /// What the client does *after* this point is the whole question.
     sasl_rejections: std::sync::Mutex<Vec<(usize, usize)>>,
+    /// `(connection, request index, when the answer went out)` for every
+    /// response that carried a throttle.
+    throttles: std::sync::Mutex<Vec<(usize, usize, u64)>>,
+    /// The session's zero point, for `at_ms`.
+    started: std::time::Instant,
 }
 
 impl ClusterView {
@@ -391,6 +427,8 @@ pub async fn run(listener: &TcpListener, config: &ObserveConfig) -> io::Result<R
         leaders: std::sync::Mutex::new((0..BROKER_COUNT).collect()),
         events: std::sync::Mutex::new(Vec::new()),
         sasl_rejections: std::sync::Mutex::new(Vec::new()),
+        throttles: std::sync::Mutex::new(Vec::new()),
+        started: std::time::Instant::now(),
     });
 
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -489,6 +527,7 @@ pub async fn run(listener: &TcpListener, config: &ObserveConfig) -> io::Result<R
         fault: config.fault,
         events,
         sasl_rejections: view.sasl_rejections.lock().unwrap().clone(),
+        throttles: view.throttles.lock().unwrap().clone(),
     };
     Ok(evaluate(&session, &format!("client {peer}")))
 }
@@ -525,7 +564,8 @@ async fn serve_conn(
         let Some(frame) = read_frame(&mut stream).await else {
             return;
         };
-        let obs = parse_request(node_id, conn_id, index, frame);
+        let at_ms = u64::try_from(view.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let obs = parse_request(node_id, conn_id, index, at_ms, frame);
         index += 1;
         if let Some(header) = &obs.header {
             respond(
@@ -554,11 +594,18 @@ async fn read_frame(stream: &mut TcpStream) -> Option<Bytes> {
     Some(Bytes::from(frame))
 }
 
-fn parse_request(node_id: i32, conn_id: usize, index: usize, frame: Bytes) -> Observation {
+fn parse_request(
+    node_id: i32,
+    conn_id: usize,
+    index: usize,
+    at_ms: u64,
+    frame: Bytes,
+) -> Observation {
     let mut obs = Observation {
         node_id,
         conn_id,
         index,
+        at_ms,
         api_key: -1,
         api_version: -1,
         header: None,
@@ -705,6 +752,17 @@ async fn respond(
             let v = api_version.clamp(MetadataRequest::MIN_VERSION, MetadataRequest::MAX_VERSION);
             let leaders = view.leaders.lock().unwrap().clone();
             let mut resp = MetadataResponse::default();
+            // Metadata carries the throttle from v3 on, and every client
+            // asks for it early and often — so it is where a quota pause
+            // is most likely to reach one.
+            if view.fault == Some(HarnessFault::Throttle) && v >= METADATA_THROTTLE_MIN {
+                resp.throttle_time_ms = THROTTLE_MS;
+                let sent_at = u64::try_from(view.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                view.throttles
+                    .lock()
+                    .unwrap()
+                    .push((conn_id, index, sent_at));
+            }
             resp.brokers = view
                 .ports
                 .iter()
@@ -1233,4 +1291,62 @@ fn recovers_from_leader_change(s: &Session) -> Verdict {
             details: unrecovered.join("; "),
         }
     }
+}
+
+/// A throttled client must pause before it sends again.
+///
+/// Quota enforcement is not advice a client can decline. The broker
+/// answers, sets `throttle_time_ms`, and then stops reading this
+/// connection for that long — so a client that ignores the field does
+/// not get its request in sooner, it gets it in *later*, sitting in a
+/// socket buffer while its own request timeout runs down. The failure
+/// looks like an unreliable broker from the inside.
+///
+/// Judged on the connection the throttle arrived on: a pause is
+/// per connection, and a client with work for another broker is right
+/// to keep going there.
+fn honours_throttle_time(session: &Session) -> Verdict {
+    if session.throttles.is_empty() {
+        return Verdict::Skipped {
+            reason: "no response carried a throttle in this session".into(),
+        };
+    }
+    // The first throttle the client actually had a chance to observe.
+    // Clients open several connections — bootstrap, control, one per
+    // partition leader — and a throttle on one the client never speaks
+    // to again says nothing, which is not the same as passing.
+    let Some((sent_at, next)) = session
+        .throttles
+        .iter()
+        .find_map(|&(conn_id, index, sent_at)| {
+            session
+                .observations
+                .iter()
+                .find(|obs| obs.conn_id == conn_id && obs.index > index)
+                .map(|next| (sent_at, next))
+        })
+    else {
+        return Verdict::Skipped {
+            reason: "every throttled connection went quiet afterwards, so there was no \
+                     pause to observe"
+                .into(),
+        };
+    };
+    // Half the window: a client that rounds, or wakes a little early,
+    // still passes, while one that never waited cannot — those come
+    // back in under a millisecond.
+    let floor = u64::try_from(THROTTLE_MS).unwrap_or(0) / 2;
+    let waited = next.at_ms.saturating_sub(sent_at);
+    if waited < floor {
+        return Verdict::Fail {
+            details: format!(
+                "answered with throttle_time_ms={THROTTLE_MS} and the next request on that \
+                 connection (api {} v{}) arrived {waited}ms later; the broker is not reading \
+                 yet, so that request waits out the mute instead of the client waiting out \
+                 the throttle",
+                next.api_key, next.api_version
+            ),
+        };
+    }
+    Verdict::Pass
 }
