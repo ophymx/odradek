@@ -11,11 +11,19 @@ description = "Sans-I/O SASL mechanisms for the odradek Kafka crates: SCRAM-SHA-
 keywords = ["sasl", "scram", "kafka", "authentication", "sans-io"]
 categories = ["authentication", "network-programming"]
 
+[features]
+default = []
+## AWS_MSK_IAM: SigV4 signing for Amazon MSK. Off by default — it is the
+## only mechanism here needing a JSON encoder, and a security crate's
+## default dependency tree is worth keeping short.
+aws-msk-iam = ["dep:serde_json"]
+
 [dependencies]
 base64 = { workspace = true }
 getrandom = { workspace = true }
 hmac = { workspace = true }
 pbkdf2 = { workspace = true }
+serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true }
 stringprep = { workspace = true }
 subtle = { workspace = true }
@@ -23,6 +31,7 @@ zeroize = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 base64 = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

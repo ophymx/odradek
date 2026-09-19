@@ -5,6 +5,7 @@
 //! cargo run -p odradek-client --example secure_smoke -- <bootstrap> \
 //!     [--ca cert.pem] [--client-cert c.pem --client-key k.pem] \
 //!     [--mechanism plain|scram256|scram512 --user u --pass p] \
+//!     [--mechanism oauthbearer --token <bearer token>] \
 //!     [--allow-plaintext-credentials]
 //! ```
 //!
@@ -31,6 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client_cert = None;
     let mut client_key = None;
     let mut mechanism = None;
+    let mut token: Option<String> = None;
     let mut user = String::new();
     let mut pass = String::new();
     let mut allow_plaintext_credentials = false;
@@ -46,9 +48,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "plain" => Mechanism::Plain,
                     "scram256" => Mechanism::ScramSha256,
                     "scram512" => Mechanism::ScramSha512,
+                    "oauthbearer" => Mechanism::OAuthBearer,
                     other => return Err(format!("unknown mechanism {other}").into()),
                 })
             }
+            "--token" => token = Some(value()?),
             "--user" => user = value()?,
             "--pass" => pass = value()?,
             other => return Err(format!("unknown flag {other}").into()),
@@ -70,7 +74,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.client_id = "odradek-secure-smoke".into();
     config.tls = tls;
     config.allow_plaintext_credentials = allow_plaintext_credentials;
-    config.sasl = mechanism.map(|mechanism| SaslConfig::new(mechanism, user, pass));
+    config.sasl = match (mechanism, token) {
+        (Some(Mechanism::OAuthBearer), Some(token)) => Some(SaslConfig::oauthbearer(token)),
+        (Some(Mechanism::OAuthBearer), None) => {
+            return Err("--mechanism oauthbearer needs --token".into());
+        }
+        (Some(mechanism), _) => Some(SaslConfig::new(mechanism, user, pass)),
+        (None, _) => None,
+    };
 
     let topic = format!(
         "odradek-secure-{}-{}",

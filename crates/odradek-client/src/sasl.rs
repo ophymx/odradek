@@ -108,6 +108,17 @@ pub struct SaslConfig {
     pub mechanism: Mechanism,
     pub username: String,
     pub password: Zeroizing<String>,
+    /// The bearer token, for [`Mechanism::OAuthBearer`]. Unused by the
+    /// username/password mechanisms.
+    ///
+    /// A token has a lifetime this client does not track: build a fresh
+    /// config when yours is refreshed, and note that connections
+    /// already authenticated stay authenticated — Kafka checks
+    /// credentials at connect, not per request.
+    pub token: Option<Zeroizing<String>>,
+    /// `key=value` pairs some OAUTHBEARER deployments require alongside
+    /// the token.
+    pub extensions: Vec<(String, String)>,
 }
 
 impl SaslConfig {
@@ -123,7 +134,34 @@ impl SaslConfig {
             mechanism,
             username: username.into(),
             password: Zeroizing::new(password.into()),
+            token: None,
+            extensions: Vec::new(),
         }
+    }
+
+    /// Authenticate with a bearer token somebody else issued (RFC 7628).
+    ///
+    /// Getting and refreshing the token is yours: this crate does not
+    /// talk to an authorization server, and a token that has expired
+    /// fails the handshake like any other bad credential.
+    pub fn oauthbearer(token: impl Into<String>) -> SaslConfig {
+        SaslConfig {
+            mechanism: Mechanism::OAuthBearer,
+            username: String::new(),
+            password: Zeroizing::new(String::new()),
+            token: Some(Zeroizing::new(token.into())),
+            extensions: Vec::new(),
+        }
+    }
+
+    /// Add an OAUTHBEARER extension, in the order the server expects.
+    pub fn with_extension(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> SaslConfig {
+        self.extensions.push((key.into(), value.into()));
+        self
     }
 }
 
@@ -218,6 +256,41 @@ pub async fn authenticate(
                 limits,
             )
             .await
+        }
+        Mechanism::OAuthBearer => {
+            let Some(token) = &sasl.token else {
+                return Err(ClientError::Config(
+                    "OAUTHBEARER needs a token; build the config with SaslConfig::oauthbearer"
+                        .into(),
+                ));
+            };
+            let extensions: Vec<(&str, &str)> = sasl
+                .extensions
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            let message =
+                odradek_sasl::oauthbearer_token(token, &extensions).map_err(scram_error)?;
+            let resp = sasl_round(conn, ranges, Bytes::copy_from_slice(&message)).await?;
+            check_auth(&resp)?;
+            // A rejected token does *not* arrive as an error code. RFC
+            // 7628 §3.1 has the server answer a bad token with a
+            // success-shaped response carrying a JSON description of
+            // what was wrong, and the client must then send a lone
+            // separator so the server can close the exchange. Treating
+            // the empty-vs-nonempty distinction as decorative means
+            // believing you authenticated when you did not, and finding
+            // out on the next request as a state error that names
+            // nothing.
+            if resp.auth_bytes.is_empty() {
+                return Ok(());
+            }
+            let reported = String::from_utf8_lossy(&resp.auth_bytes).into_owned();
+            let ack = odradek_sasl::oauthbearer_failure_ack();
+            let _ = sasl_round(conn, ranges, Bytes::copy_from_slice(&ack)).await;
+            Err(ClientError::Sasl(format!(
+                "broker rejected the bearer token: {reported}"
+            )))
         }
         // A mechanism odradek-sasl has grown and this client has not
         // wired up yet. Refusing is the only safe answer: the

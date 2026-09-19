@@ -62,8 +62,30 @@ against the RFC's worked examples, without a socket.
   built so a server never needs one, and the type makes that the only
   option. Deciding which credential belongs to which account is the
   caller's job.
-- **No GSSAPI, OAUTHBEARER, or DIGEST-MD5.** `Mechanism` is
-  `#[non_exhaustive]`, so adding one later is not a breaking change.
+- **No token acquisition.** OAUTHBEARER carries a bearer token; getting
+  one means talking to an authorization server over HTTP, which is an
+  I/O and policy concern this crate is not.
+- **No AWS credential resolution.** `AWS_MSK_IAM` (behind the
+  `aws-msk-iam` feature) signs with credentials you pass in. No
+  environment scanning, no profile parsing, no instance metadata: a
+  crate that guesses where your keys live is one that will eventually
+  pick the wrong ones.
+- **No GSSAPI or DIGEST-MD5.** `Mechanism` is `#[non_exhaustive]`, so
+  adding one later is not a breaking change.
+
+## Verification
+
+SCRAM is checked against RFC 7677's worked example in both directions,
+and the client role is exercised against Apache Kafka on every CI run.
+OAUTHBEARER is verified against a real broker: a valid token
+authenticates, and a rejected one is reported as a rejection rather than
+as success.
+
+`AWS_MSK_IAM` is the exception and says so in its own docs. Its SigV4
+core is anchored to AWS's published signing-key example, but the
+MSK-specific assembly around it has **not** been run against a real MSK
+cluster, because this project has none. Treat it as unproven against
+the service.
 
 ## What SASL protects, and what it does not
 

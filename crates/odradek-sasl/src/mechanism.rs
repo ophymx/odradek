@@ -11,6 +11,12 @@ pub enum Mechanism {
     ScramSha256,
     /// SCRAM with SHA-512.
     ScramSha512,
+    /// A bearer token issued elsewhere (RFC 7628).
+    OAuthBearer,
+    /// AWS IAM, as Amazon MSK defines it. Requires the `aws-msk-iam`
+    /// feature to build a token; the variant itself always exists so a
+    /// caller can name what a broker advertised.
+    AwsMskIam,
 }
 
 impl Mechanism {
@@ -20,6 +26,8 @@ impl Mechanism {
             Mechanism::Plain => "PLAIN",
             Mechanism::ScramSha256 => "SCRAM-SHA-256",
             Mechanism::ScramSha512 => "SCRAM-SHA-512",
+            Mechanism::OAuthBearer => "OAUTHBEARER",
+            Mechanism::AwsMskIam => "AWS_MSK_IAM",
         }
     }
 
@@ -29,6 +37,8 @@ impl Mechanism {
             "PLAIN" => Some(Mechanism::Plain),
             "SCRAM-SHA-256" => Some(Mechanism::ScramSha256),
             "SCRAM-SHA-512" => Some(Mechanism::ScramSha512),
+            "OAUTHBEARER" => Some(Mechanism::OAuthBearer),
+            "AWS_MSK_IAM" => Some(Mechanism::AwsMskIam),
             _ => None,
         }
     }
@@ -40,7 +50,15 @@ impl Mechanism {
     /// no amount of care elsewhere substitutes.
     pub fn sends_password(self) -> bool {
         match self {
-            Mechanism::Plain => true,
+            // The token is not the account's password, but it is a
+            // credential that works until it expires, and anyone who
+            // reads it can use it. For the question this method exists
+            // to answer — does this need an encrypted transport — it is
+            // the same answer.
+            Mechanism::Plain | Mechanism::OAuthBearer => true,
+            // The payload is a signature, not a key: it proves the
+            // holder without carrying the secret, and it expires.
+            Mechanism::AwsMskIam => false,
             // SCRAM sends a proof derived from the password, never the
             // password.
             Mechanism::ScramSha256 | Mechanism::ScramSha512 => false,

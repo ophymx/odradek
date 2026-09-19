@@ -49,14 +49,19 @@
 //!   holds a [`ScramCredential`] — derived keys, never a password —
 //!   because RFC 5802 is built so a server never needs one; looking up
 //!   which credential belongs to which account is the caller's job.
-//! - **No GSSAPI, OAUTHBEARER, or DIGEST-MD5.** [`Mechanism`] is
-//!   `#[non_exhaustive]` so adding one is not a breaking change.
+//! - **No token acquisition.** OAUTHBEARER carries a bearer token;
+//!   getting one means talking to an authorization server over HTTP,
+//!   which is an I/O and policy concern this crate is not. Bring a
+//!   token, refresh it on your own schedule.
+//! - **No GSSAPI or DIGEST-MD5.** [`Mechanism`] is `#[non_exhaustive]`
+//!   so adding one is not a breaking change.
 //!
 //! # What SASL protects, and what it does not
 //!
 //! SASL authenticates; it does not encrypt. **PLAIN** puts the password
-//! on the wire and is refused by this crate's consumers on an
-//! unencrypted connection. **SCRAM** never sends the password, but a
+//! on the wire, and **OAUTHBEARER** puts a token on it that is a
+//! password until it expires; both are refused by this crate's
+//! consumers on an unencrypted connection. **SCRAM** never sends the password, but a
 //! passive observer of a plaintext connection still collects the
 //! username, salt, iteration count, nonces and proof — exactly the
 //! inputs to an offline dictionary attack, at the cost the iteration
@@ -66,11 +71,17 @@
 #![forbid(unsafe_code)]
 
 mod mechanism;
+#[cfg(feature = "aws-msk-iam")]
+mod msk_iam;
+mod oauthbearer;
 mod plain;
 mod prep;
 mod scram;
 
 pub use mechanism::Mechanism;
+#[cfg(feature = "aws-msk-iam")]
+pub use msk_iam::{AwsCredentials, EXPIRY_SECONDS, msk_iam_token};
+pub use oauthbearer::{oauthbearer_failure_ack, oauthbearer_token, parse_oauthbearer_token};
 pub use plain::{plain_token, verify_plain_token};
 pub use prep::saslprep;
 pub use scram::{GS2_HEADER, ScramClient, ScramCredential, ScramServer, fresh_nonce};

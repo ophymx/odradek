@@ -170,7 +170,9 @@ macro_rules! with_digest {
                 type $d = Sha512;
                 $body
             }
-            Mechanism::Plain => return Err(SaslError::NotScram),
+            // Any mechanism that is not SCRAM, including ones added
+            // after this was written.
+            _ => return Err(SaslError::NotScram),
         }
     };
 }
