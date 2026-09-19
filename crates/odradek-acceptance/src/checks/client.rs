@@ -36,6 +36,10 @@ use odradek_protocol::messages::produce_request::ProduceRequest;
 use odradek_protocol::messages::produce_response::ProduceResponse;
 use odradek_protocol::messages::request_header::RequestHeader;
 use odradek_protocol::messages::response_header::ResponseHeader;
+use odradek_protocol::messages::sasl_authenticate_request::SaslAuthenticateRequest;
+use odradek_protocol::messages::sasl_authenticate_response::SaslAuthenticateResponse;
+use odradek_protocol::messages::sasl_handshake_request::SaslHandshakeRequest;
+use odradek_protocol::messages::sasl_handshake_response::SaslHandshakeResponse;
 use odradek_protocol::{ErrorCode, Message, frame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -68,6 +72,16 @@ const ADVERTISED: &[(i16, i16, i16)] = &[
         InitProducerIdRequest::API_KEY,
         InitProducerIdRequest::MIN_VERSION,
         InitProducerIdRequest::MAX_VERSION,
+    ),
+    (
+        SaslHandshakeRequest::API_KEY,
+        SaslHandshakeRequest::MIN_VERSION,
+        SaslHandshakeRequest::MAX_VERSION,
+    ),
+    (
+        SaslAuthenticateRequest::API_KEY,
+        SaslAuthenticateRequest::MIN_VERSION,
+        SaslAuthenticateRequest::MAX_VERSION,
     ),
     (
         FetchRequest::API_KEY,
@@ -139,6 +153,19 @@ pub static CLIENT_CHECKS: &[Check] = &[
                       advertised leader",
         runner: Runner::Client(recovers_from_leader_change),
     },
+    Check {
+        id: "client/heeds-sasl-rejection",
+        requirement: "after a SASL token is refused, the client sends no data \
+                      api on that connection — a refusal shaped like success is \
+                      still a refusal",
+        runner: Runner::Client(heeds_sasl_rejection),
+    },
+    Check {
+        id: "client/acknowledges-sasl-rejection",
+        requirement: "after a SASL token is refused, the client answers once \
+                      more so the server can close the exchange (RFC 7628 §3.1)",
+        runner: Runner::Client(acknowledges_sasl_rejection),
+    },
 ];
 
 /// A deliberate misbehavior the harness can stage to observe how the
@@ -150,6 +177,16 @@ pub enum HarnessFault {
     /// broker; later metadata reflects the move. A resilient client
     /// refreshes and re-delivers to the new leader.
     LeaderMove,
+    /// Offer OAUTHBEARER and refuse whatever token arrives, the way
+    /// RFC 7628 §3.1 says to: a *success-shaped* response carrying a
+    /// JSON description of the problem, not an error code.
+    ///
+    /// The shape is the trap. A client that checks only the error code
+    /// sees zero and believes it authenticated; the failure then
+    /// surfaces later as a state error naming nothing. That is a bug
+    /// this project wrote and caught against a live broker, and these
+    /// checks exist to make it unrepeatable.
+    RejectSaslToken,
 }
 
 /// Limits for one observation session.
@@ -204,6 +241,11 @@ struct Observation {
     routes: Vec<(String, i32)>,
 }
 
+/// The SASL apis the harness offers, so a client configured for
+/// OAUTHBEARER has something to negotiate with.
+const SASL_HANDSHAKE_API: i16 = 17;
+const SASL_AUTHENTICATE_API: i16 = 36;
+
 /// A NOT_LEADER injection that actually fired.
 #[derive(Debug, Clone, Copy)]
 struct FaultEvent {
@@ -218,6 +260,8 @@ pub(crate) struct Session {
     observations: Vec<Observation>,
     fault: Option<HarnessFault>,
     events: Vec<FaultEvent>,
+    /// `(connection, request index)` where a SASL token was refused.
+    sasl_rejections: Vec<(usize, usize)>,
 }
 
 /// Connection bookkeeping for one session: hands out connection ordinals
@@ -261,6 +305,9 @@ struct ClusterView {
     leaders: std::sync::Mutex<Vec<i32>>,
     /// Leader-move injections that fired.
     events: std::sync::Mutex<Vec<FaultEvent>>,
+    /// Where a SASL token was refused: (connection, request index).
+    /// What the client does *after* this point is the whole question.
+    sasl_rejections: std::sync::Mutex<Vec<(usize, usize)>>,
 }
 
 impl ClusterView {
@@ -343,6 +390,7 @@ pub async fn run(listener: &TcpListener, config: &ObserveConfig) -> io::Result<R
         fault: config.fault,
         leaders: std::sync::Mutex::new((0..BROKER_COUNT).collect()),
         events: std::sync::Mutex::new(Vec::new()),
+        sasl_rejections: std::sync::Mutex::new(Vec::new()),
     });
 
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -440,6 +488,7 @@ pub async fn run(listener: &TcpListener, config: &ObserveConfig) -> io::Result<R
         observations,
         fault: config.fault,
         events,
+        sasl_rejections: view.sasl_rejections.lock().unwrap().clone(),
     };
     Ok(evaluate(&session, &format!("client {peer}")))
 }
@@ -479,7 +528,16 @@ async fn serve_conn(
         let obs = parse_request(node_id, conn_id, index, frame);
         index += 1;
         if let Some(header) = &obs.header {
-            respond(&mut stream, header, &view, node_id, &obs.routes).await;
+            respond(
+                &mut stream,
+                header,
+                &view,
+                node_id,
+                &obs.routes,
+                conn_id,
+                obs.index,
+            )
+            .await;
         }
         if tx.send(obs).is_err() {
             return;
@@ -632,6 +690,8 @@ async fn respond(
     view: &ClusterView,
     node_id: i32,
     routes: &[(String, i32)],
+    conn_id: usize,
+    index: usize,
 ) {
     let api_key = header.request_api_key;
     let api_version = header.request_api_version;
@@ -684,6 +744,54 @@ async fn respond(
                 response_header_version(MetadataRequest::API_KEY, v).unwrap_or(0),
             )
         }
+        SASL_HANDSHAKE_API => {
+            let v = api_version.clamp(
+                SaslHandshakeRequest::MIN_VERSION,
+                SaslHandshakeRequest::MAX_VERSION,
+            );
+            let mut resp = SaslHandshakeResponse::default();
+            resp.error_code = ErrorCode::NONE.0;
+            resp.mechanisms = vec!["OAUTHBEARER".to_owned()];
+            let mut body = BytesMut::new();
+            if resp.encode(&mut body, v).is_err() {
+                return;
+            }
+            (
+                body.freeze(),
+                response_header_version(SASL_HANDSHAKE_API, v).unwrap_or(0),
+            )
+        }
+        SASL_AUTHENTICATE_API => {
+            let v = api_version.clamp(
+                SaslAuthenticateRequest::MIN_VERSION,
+                SaslAuthenticateRequest::MAX_VERSION,
+            );
+            let mut resp = SaslAuthenticateResponse::default();
+            resp.error_code = ErrorCode::NONE.0;
+            if view.fault == Some(HarnessFault::RejectSaslToken) {
+                let already = view
+                    .sasl_rejections
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(c, _)| *c == conn_id);
+                if !already {
+                    // The RFC 7628 failure challenge: success-shaped,
+                    // carrying the reason. Recorded so the checks can
+                    // ask what the client did next.
+                    resp.auth_bytes = Bytes::from_static(b"{\"status\":\"invalid_token\"}");
+                    view.sasl_rejections.lock().unwrap().push((conn_id, index));
+                }
+            }
+            let mut body = BytesMut::new();
+            if resp.encode(&mut body, v).is_err() {
+                return;
+            }
+            (
+                body.freeze(),
+                response_header_version(SASL_AUTHENTICATE_API, v).unwrap_or(0),
+            )
+        }
         InitProducerIdRequest::API_KEY => {
             use odradek_protocol::messages::init_producer_id_response::InitProducerIdResponse;
             let v = api_version.clamp(
@@ -702,7 +810,10 @@ async fn respond(
             if resp.encode(&mut body, v).is_err() {
                 return;
             }
-            (body.freeze(), v)
+            (
+                body.freeze(),
+                response_header_version(InitProducerIdRequest::API_KEY, v).unwrap_or(0),
+            )
         }
         ProduceRequest::API_KEY => {
             use odradek_protocol::messages::produce_response::{
@@ -936,6 +1047,72 @@ fn correlation_ids_unique(s: &Session) -> Verdict {
 
 /// ApiVersions itself is exempt: the probe-and-downgrade dance happens
 /// before ranges are known.
+/// The apis a client may still send on a connection whose SASL token
+/// was refused: another SASL message, and nothing else.
+fn is_sasl_api(api_key: i16) -> bool {
+    api_key == SASL_HANDSHAKE_API
+        || api_key == SASL_AUTHENTICATE_API
+        || api_key == ApiVersionsRequest::API_KEY
+}
+
+/// A refusal shaped like success is still a refusal.
+///
+/// The client asked to authenticate and was told no. Everything it does
+/// on that connection afterwards is unauthenticated, and a client that
+/// produces anyway has not merely failed — it believes it succeeded,
+/// which is the state in which data goes somewhere nobody checked.
+fn heeds_sasl_rejection(s: &Session) -> Verdict {
+    if s.sasl_rejections.is_empty() {
+        return Verdict::Skipped {
+            reason: "no SASL token was refused in this session".into(),
+        };
+    }
+    for (conn_id, index) in &s.sasl_rejections {
+        let after: Vec<&Observation> = s
+            .observations
+            .iter()
+            .filter(|o| o.conn_id == *conn_id && o.index > *index)
+            .collect();
+        if let Some(bad) = after.iter().find(|o| !is_sasl_api(o.api_key)) {
+            return Verdict::Fail {
+                details: format!(
+                    "token refused on connection {conn_id}, then api {} was sent on it \
+                     anyway: the client read a success-shaped refusal as success",
+                    bad.api_key
+                ),
+            };
+        }
+    }
+    Verdict::Pass
+}
+
+/// RFC 7628 §3.1: answer the refusal so the server can close.
+///
+/// One more message, carrying nothing. Skip it and the server is left
+/// mid-exchange, and the failure it eventually reports is a timeout
+/// rather than the reason it already knows.
+fn acknowledges_sasl_rejection(s: &Session) -> Verdict {
+    if s.sasl_rejections.is_empty() {
+        return Verdict::Skipped {
+            reason: "no SASL token was refused in this session".into(),
+        };
+    }
+    for (conn_id, index) in &s.sasl_rejections {
+        let acked = s.observations.iter().any(|o| {
+            o.conn_id == *conn_id && o.index > *index && o.api_key == SASL_AUTHENTICATE_API
+        });
+        if !acked {
+            return Verdict::Fail {
+                details: format!(
+                    "token refused on connection {conn_id} and the client said nothing \
+                     more, leaving the exchange open"
+                ),
+            };
+        }
+    }
+    Verdict::Pass
+}
+
 fn respects_advertised_versions(s: &Session) -> Verdict {
     let mut violations = Vec::new();
     let mut applicable = 0usize;

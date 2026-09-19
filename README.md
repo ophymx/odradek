@@ -89,8 +89,8 @@ Early but functional end to end:
   exercise the pieces on their own (the last one covering live
   incremental reconciliation on Kafka 4.1's new coordinator).
 - `odradek-acceptance`: conformance checks for **both roles** over raw
-  connections, independent of the client crate. 27 server checks across
-  13 APIs plus 7 client checks, each one proven by an injected fault to
+  connections, independent of the client crate. 30 server checks across
+  13 APIs plus 9 client checks, each one proven by an injected fault to
   detect what it claims — a check nothing can trip fails calibration.
   `cargo xtask conformance` runs them against Apache Kafka and Redpanda
   in Docker and enforces the baselines committed in

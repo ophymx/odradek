@@ -34,6 +34,8 @@ const CITED: &[&str] = &[
     "client/body-decodes",
     "client/routes-to-partition-leader",
     "client/recovers-from-leader-change",
+    "client/heeds-sasl-rejection",
+    "client/acknowledges-sasl-rejection",
 ];
 
 #[test]
@@ -101,20 +103,28 @@ async fn odradek_client_passes_the_client_checks() {
         report.is_conformant(),
         "our client is nonconformant:\n{report}"
     );
-    // Every catalogued client check passes except recovers-from-leader-
-    // change, which skips when the leader-move fault is not armed.
-    assert_eq!(
-        report.passed(),
-        client_check_ids().len() - 1,
-        "expected every applicable client check to pass:\n{report}"
-    );
-    assert!(
-        matches!(
-            report.verdict("client/recovers-from-leader-change"),
-            Some(Verdict::Skipped { .. })
-        ),
-        "{report}"
-    );
+    // Every catalogued client check reports, and every one whose fault
+    // is not armed here passes. Checking the ids rather than a count
+    // means a new check cannot slip in as a silent skip.
+    const FAULT_GATED: &[&str] = &[
+        "client/recovers-from-leader-change",
+        "client/heeds-sasl-rejection",
+        "client/acknowledges-sasl-rejection",
+    ];
+    for id in client_check_ids() {
+        let verdict = report.verdict(id);
+        if FAULT_GATED.contains(&id) {
+            assert!(
+                matches!(verdict, Some(Verdict::Skipped { .. })),
+                "{id} needs its fault armed, so it should skip here:\n{report}"
+            );
+        } else {
+            assert!(
+                matches!(verdict, Some(Verdict::Pass)),
+                "{id} should pass against our own client:\n{report}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -304,4 +314,110 @@ async fn send_frame(stream: &mut TcpStream, payload: &[u8]) {
     frame.put_i32(i32::try_from(payload.len()).unwrap());
     frame.extend_from_slice(payload);
     stream.write_all(&frame).await.unwrap();
+}
+
+/// The odradek client heeds a SASL refusal.
+///
+/// The harness offers OAUTHBEARER and refuses the token the way RFC 7628
+/// says to — a success-shaped response carrying the reason. A client
+/// that reads only the error code sees zero, believes it authenticated,
+/// and produces into a connection nobody authorized. This crate shipped
+/// exactly that bug and caught it against a live broker; the check is
+/// here so the next one is caught in CI.
+#[tokio::test]
+async fn odradek_client_heeds_a_sasl_refusal() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let harness = tokio::spawn(async move {
+        let mut config = config();
+        config.fault = Some(HarnessFault::RejectSaslToken);
+        run(&listener, &config).await
+    });
+
+    let mut client_config = ClientConfig::default();
+    client_config.bootstrap_servers = vec![addr];
+    client_config.client_id = "odradek".into();
+    client_config.sasl = Some(odradek_client::SaslConfig::oauthbearer("a-token"));
+    // The harness speaks plaintext; the point here is the refusal, not
+    // the transport.
+    client_config.allow_plaintext_credentials = true;
+
+    // Connecting must fail: the token was refused.
+    let outcome = Cluster::connect(client_config).await;
+    assert!(
+        outcome.is_err(),
+        "a refused token must not produce a usable cluster handle"
+    );
+
+    let report = harness.await.unwrap().expect("harness ran");
+    assert!(
+        matches!(
+            report.verdict("client/heeds-sasl-rejection"),
+            Some(Verdict::Pass)
+        ),
+        "{report}"
+    );
+    assert!(
+        matches!(
+            report.verdict("client/acknowledges-sasl-rejection"),
+            Some(Verdict::Pass)
+        ),
+        "{report}"
+    );
+}
+
+/// And a client that ignores the refusal is caught.
+///
+/// This is the calibration: the checks above are only worth something if
+/// a client that barrels on fails them. This one authenticates, is
+/// refused, says nothing about it, and produces anyway.
+#[tokio::test]
+async fn a_client_that_ignores_a_sasl_refusal_is_caught() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let harness = tokio::spawn(async move {
+        let mut config = config();
+        config.fault = Some(HarnessFault::RejectSaslToken);
+        run(&listener, &config).await
+    });
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    // ApiVersions, so the harness sees a well-formed opening.
+    send_frame(&mut stream, &request_frame(18, 0, 1, &[])).await;
+    // SaslHandshake("OAUTHBEARER").
+    let mut handshake = Vec::new();
+    handshake.extend_from_slice(&(11i16).to_be_bytes());
+    handshake.extend_from_slice(b"OAUTHBEARER");
+    send_frame(&mut stream, &request_frame(17, 1, 2, &handshake)).await;
+    // A token, which the harness refuses.
+    let token = b"n,,\x01auth=Bearer nope\x01\x01";
+    let mut auth = Vec::new();
+    auth.extend_from_slice(&i32::try_from(token.len()).unwrap().to_be_bytes());
+    auth.extend_from_slice(token);
+    send_frame(&mut stream, &request_frame(36, 1, 3, &auth)).await;
+    // Sin: no acknowledgement, and a data api on a connection that was
+    // just told no.
+    send_frame(
+        &mut stream,
+        &request_frame(3, 12, 4, &[0x00, 0x00, 0x00, 0x00, 0x00]),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(stream);
+
+    let report = harness.await.unwrap().expect("harness ran");
+    assert!(
+        matches!(
+            report.verdict("client/heeds-sasl-rejection"),
+            Some(Verdict::Fail { .. })
+        ),
+        "producing after a refusal must be caught:\n{report}"
+    );
+    assert!(
+        matches!(
+            report.verdict("client/acknowledges-sasl-rejection"),
+            Some(Verdict::Fail { .. })
+        ),
+        "an unacknowledged refusal must be caught:\n{report}"
+    );
 }

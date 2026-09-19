@@ -93,6 +93,18 @@ the ones where the *wrong* answer is plausible:
 - A SCRAM exchange ends with a server signature, or the client has
   authenticated itself to whatever answered the socket and cannot tell.
 
+The `client/*` checks run the same idea from the other side: the
+harness plays broker, and the fault it injects is a refusal shaped like
+a success. RFC 7628 has an OAUTHBEARER server report a bad token in a
+*successful* response carrying `{"status":"invalid_token"}`, so a
+client that reads only the error code sees zero, believes it
+authenticated, and sends data on a connection nobody authorized. This
+crate's own client shipped exactly that bug and a live broker caught
+it; the check is here so the next one is caught in CI. Its twin
+watches for the lone `\x01` the RFC has the client send back, without
+which the broker is left mid-exchange and reports a timeout instead of
+the reason it already knows.
+
 Five checks sweep **every version the subject advertises** rather than
 negotiating one and stopping. Against Kafka 4.1 that is 13 Metadata
 exchanges, 12 fetches of a single produced batch, and 7
