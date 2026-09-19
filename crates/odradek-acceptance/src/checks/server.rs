@@ -280,6 +280,18 @@ pub static SERVER_CHECKS: &[Check] = &[
         runner: Runner::Server(|ctx| Box::pin(scram_server_proves_itself(ctx))),
     },
     Check {
+        id: "produce/acks-zero-is-silent",
+        requirement: "sends no response at all to an acks=0 produce, rather than \
+                      a frame the client has no correlation id outstanding for",
+        runner: Runner::Server(|ctx| Box::pin(produce_acks_zero_is_silent(ctx))),
+    },
+    Check {
+        id: "metadata/topic-id-is-stable",
+        requirement: "reports the same topic id for a topic that has not gone \
+                      away, so id-addressed requests keep working",
+        runner: Runner::Server(|ctx| Box::pin(metadata_topic_id_is_stable(ctx))),
+    },
+    Check {
         id: "produce/compressed-batch-passthrough",
         requirement: "returns a gzip-compressed batch exactly as it was \
                       produced, rather than recompressing it and rewriting \
@@ -6383,4 +6395,226 @@ async fn txn_fenced_producer_cannot_produce(ctx: &ServerCtx) -> Verdict {
         },
         Err(e) => e.context("Produce (fenced)").into_verdict(),
     }
+}
+
+/// `acks=0` means no response at all.
+///
+/// Not "an empty response" and not "a response the client can ignore":
+/// the broker sends nothing, and a client that speaks fire-and-forget
+/// has no correlation id outstanding for it. A broker that answers
+/// anyway puts a frame on the wire nobody is waiting for, and the next
+/// response the client reads is the wrong one — every reply after that
+/// is matched to the wrong request. It is the worst kind of wire bug:
+/// silent, and it corrupts everything downstream rather than failing.
+async fn produce_acks_zero_is_silent(ctx: &ServerCtx) -> Verdict {
+    let produce_version = match negotiate(
+        "Produce",
+        match ctx.range(ProduceRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        ProduceRequest::MIN_VERSION,
+        PRODUCE_NAME_MAX,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let produced = match produce_flow(ctx, "acks0", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    let topic = produced.topic.clone();
+    let mut conn = produced.conn;
+
+    let mut partition_data = PartitionProduceData::default();
+    partition_data.index = 0;
+    partition_data.records = Some(produced.sent.clone());
+    let mut topic_data = TopicProduceData::default();
+    topic_data.name = topic.clone();
+    topic_data.partition_data = vec![partition_data];
+    let mut request = ProduceRequest::default();
+    request.acks = 0;
+    request.timeout_ms = 10_000;
+    request.topic_data = vec![topic_data];
+    let mut body = BytesMut::new();
+    if let Err(e) = request.encode(&mut body, produce_version) {
+        return Verdict::Error {
+            details: format!("encoding Produce: {e}"),
+        };
+    }
+    let header_version =
+        match header::request_header_version(ProduceRequest::API_KEY, produce_version) {
+            Some(v) => v,
+            None => {
+                return Verdict::Error {
+                    details: format!("no header version for Produce v{produce_version}"),
+                };
+            }
+        };
+    let silent_correlation = 1_300;
+    let frame = match frame_request(
+        ProduceRequest::API_KEY,
+        produce_version,
+        header_version,
+        silent_correlation,
+        &body,
+    ) {
+        Ok(frame) => frame,
+        Err(details) => return Verdict::Error { details },
+    };
+    if let Err(e) = conn.send_frame(&frame).await {
+        return Verdict::Error {
+            details: format!("sending the acks=0 produce: {e}"),
+        };
+    }
+
+    // A request the broker *must* answer, sent straight after. The next
+    // frame on the wire has to be its reply; anything else is a frame
+    // nobody asked for.
+    let probe_correlation = 1_301;
+    let probe = match frame_request(
+        ApiVersionsRequest::API_KEY,
+        0,
+        header::request_header_version(ApiVersionsRequest::API_KEY, 0).unwrap_or(1),
+        probe_correlation,
+        &[],
+    ) {
+        Ok(frame) => frame,
+        Err(details) => return Verdict::Error { details },
+    };
+    if let Err(e) = conn.send_frame(&probe).await {
+        return Verdict::Error {
+            details: format!("sending the follow-up ApiVersions: {e}"),
+        };
+    }
+    let answer = match conn.read_frame().await {
+        Ok(frame) => frame,
+        Err(e) => {
+            return Verdict::Error {
+                details: format!("reading the follow-up answer: {e}"),
+            };
+        }
+    };
+    if answer.len() < 4 {
+        return Verdict::Fail {
+            details: format!(
+                "the answer after an acks=0 produce is {} byte(s)",
+                answer.len()
+            ),
+        };
+    }
+    let correlation = i32::from_be_bytes([answer[0], answer[1], answer[2], answer[3]]);
+    if correlation == probe_correlation {
+        return Verdict::Pass;
+    }
+    if correlation == silent_correlation {
+        return Verdict::Fail {
+            details: format!(
+                "answered an acks=0 produce (correlation {silent_correlation}); the client \
+                 has no id outstanding for it, so it reads that frame as the answer to its \
+                 next request and every reply after is matched to the wrong one"
+            ),
+        };
+    }
+    Verdict::Fail {
+        details: format!(
+            "after an acks=0 produce and an ApiVersions (correlation {probe_correlation}), \
+             the next frame carried correlation {correlation}"
+        ),
+    }
+}
+
+/// A topic's id must not change under it.
+///
+/// Ids exist so a client can address a topic that was deleted and
+/// recreated without silently writing to the new one. A broker that
+/// mints a fresh id for a topic that never went away breaks every
+/// id-addressed request a client already had in flight — with
+/// UNKNOWN_TOPIC_ID, which reads as "that topic is gone" and sends the
+/// client looking for a problem that is not there.
+async fn metadata_topic_id_is_stable(ctx: &ServerCtx) -> Verdict {
+    let version = match negotiate(
+        "Metadata",
+        match ctx.range(MetadataRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        // v10 is where ids reach the topics array.
+        10,
+        MetadataRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let produced = match produce_flow(ctx, "stableid", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    let topic = produced.topic.clone();
+    let mut conn = produced.conn;
+
+    let mut seen: Option<[u8; 16]> = None;
+    for attempt in 0..3 {
+        let resp = match metadata_of_topic(&mut conn, version, &topic, 1_320 + attempt).await {
+            Ok(resp) => resp,
+            Err(e) => return e.context("Metadata").into_verdict(),
+        };
+        let Some(entry) = resp
+            .topics
+            .iter()
+            .find(|t| t.name.as_deref() == Some(topic.as_str()))
+        else {
+            return Verdict::Fail {
+                details: format!("Metadata stopped naming {topic} between asks"),
+            };
+        };
+        if entry.topic_id == [0u8; 16] {
+            return Verdict::Skipped {
+                reason: format!("Metadata v{version} returned no topic id for {topic}"),
+            };
+        }
+        match seen {
+            None => seen = Some(entry.topic_id),
+            Some(first) if first == entry.topic_id => {}
+            Some(first) => {
+                return Verdict::Fail {
+                    details: format!(
+                        "{topic} was {} and is now {}; every id-addressed request already in \
+                         flight fails with UNKNOWN_TOPIC_ID, which reads as the topic being \
+                         gone",
+                        hex16(&first),
+                        hex16(&entry.topic_id)
+                    ),
+                };
+            }
+        }
+    }
+    Verdict::Pass
+}
+
+/// A topic id as hex, for a message a human has to compare two of.
+fn hex16(id: &[u8; 16]) -> String {
+    id.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// One request frame, header and body, for the checks that send
+/// without waiting for an answer.
+fn frame_request(
+    api_key: i16,
+    api_version: i16,
+    header_version: i16,
+    correlation_id: i32,
+    body: &[u8],
+) -> Result<Vec<u8>, String> {
+    let mut req_header = RequestHeader::default();
+    req_header.request_api_key = api_key;
+    req_header.request_api_version = api_version;
+    req_header.correlation_id = correlation_id;
+    req_header.client_id = Some(CLIENT_ID.into());
+    let mut out = BytesMut::new();
+    req_header
+        .encode(&mut out, header_version)
+        .map_err(|e| format!("encoding a request header: {e}"))?;
+    out.extend_from_slice(body);
+    Ok(out.to_vec())
 }

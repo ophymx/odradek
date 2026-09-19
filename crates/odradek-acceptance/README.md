@@ -153,6 +153,16 @@ the ones where the *wrong* answer is plausible:
   high watermark. A broker that lets them meet shows `read_committed`
   consumers records that may still be aborted — the one thing they
   asked not to see.
+- `acks=0` means *no response at all* — not an empty one, and not one
+  the client can ignore. A broker that answers puts a frame on the wire
+  nobody has a correlation id outstanding for, so the client reads it
+  as the reply to its next request and every reply after that is
+  matched to the wrong one. Silent, and it corrupts everything
+  downstream rather than failing.
+- A topic id does not change under a topic that never went away. Ids
+  exist so a client can tell a recreated topic from the one it meant;
+  reminting one fails every id-addressed request already in flight
+  with `UNKNOWN_TOPIC_ID`, which reads as "that topic is gone".
 - A fenced producer cannot *write*. Refusing its bookkeeping calls at
   the coordinator is only inconvenient for a zombie; the partition
   leader is different code and the one that matters, because records it
@@ -247,6 +257,9 @@ recorded rather than scored:
 - Redpanda 25.2 advertises Metadata only to v8, Produce to v7, and
   Fetch to v11, so the flexible-metadata-header and topic-id-addressed
   produce/fetch checks skip there.
+- Redpanda 25.2 advertises Metadata only to v8, which is below where
+  topic ids reach the topics array, so the id-stability check skips
+  there too.
 - Redpanda 25.2 does not implement KIP-848 at all: those four checks
   skip, which is the one place the two implementations genuinely part
   company rather than agreeing.

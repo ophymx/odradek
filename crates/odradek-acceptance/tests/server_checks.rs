@@ -81,6 +81,8 @@ const SENSITIVITY: &[(Fault, &str)] = &[
     (Fault::FetchCorruptBatch, "fetch/batch-integrity"),
     (Fault::ProduceTopicIdUnknown, "produce/topic-id"),
     (Fault::FetchWrongTopicId, "fetch/topic-id"),
+    (Fault::ProduceAnswersAcksZero, "produce/acks-zero-is-silent"),
+    (Fault::MetadataRemintsTopicId, "metadata/topic-id-is-stable"),
     (
         Fault::ProduceAcceptsFencedEpoch,
         "txn/fenced-producer-cannot-produce",

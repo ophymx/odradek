@@ -216,6 +216,12 @@ pub enum Fault {
     /// Echo a different topic id than the fetch requested.
     FetchWrongTopicId,
 
+    /// Answer an acks=0 produce, putting a frame on the wire the client
+    /// has no correlation id outstanding for.
+    ProduceAnswersAcksZero,
+    /// Report a different topic id each time for a topic that never
+    /// went away.
+    MetadataRemintsTopicId,
     /// Accept a transactional write carrying a superseded epoch at the
     /// partition leader, so a zombie's records land inside the
     /// transaction its successor commits.
@@ -305,6 +311,8 @@ impl Fault {
         Fault::FetchCorruptBatch,
         Fault::ProduceTopicIdUnknown,
         Fault::FetchWrongTopicId,
+        Fault::ProduceAnswersAcksZero,
+        Fault::MetadataRemintsTopicId,
         Fault::ProduceAcceptsFencedEpoch,
         Fault::TxnCommitMarksAborted,
         Fault::TxnOffsetsPublishImmediately,
@@ -1830,7 +1838,22 @@ fn metadata_exchange(
                 topic.name = Some(name.clone());
                 match state.created.get(name) {
                     Some(id) => {
-                        topic.topic_id = *id;
+                        // Ids exist so a client can tell a recreated
+                        // topic from the one it meant; reminting one
+                        // that never went away fails every id-addressed
+                        // request already in flight.
+                        topic.topic_id = if has(Fault::MetadataRemintsTopicId) {
+                            // A fresh id per ask, which is what makes
+                            // the failure visible at all: one that
+                            // changed once and then held still would
+                            // simply look like a different topic.
+                            let mut minted = *id;
+                            let salt = header.correlation_id.to_be_bytes();
+                            minted[12..16].copy_from_slice(&salt);
+                            minted
+                        } else {
+                            *id
+                        };
                         topic.error_code = 0;
                         let mut p = MetadataResponsePartition::default();
                         p.partition_index = 0;
@@ -2090,6 +2113,17 @@ fn produce_exchange(
         topic_resp.topic_id = topic.topic_id;
         topic_resp.partition_responses = partition_responses;
         responses.push(topic_resp);
+    }
+    // acks=0 is fire and forget, and the broker's half of that is
+    // silence. A frame here is one the client has no correlation id
+    // outstanding for, so it reads it as the answer to whatever it asks
+    // next and every reply after is matched to the wrong request.
+    if request.acks == 0 && !faults.contains(&Fault::ProduceAnswersAcksZero) {
+        // An empty buffer, not `None`: `None` means the frame was
+        // unparseable and the connection should go, whereas here the
+        // request was understood perfectly and the right answer is
+        // nothing at all.
+        return Some(BytesMut::new());
     }
     let mut resp = ProduceResponse::default();
     resp.responses = responses;
