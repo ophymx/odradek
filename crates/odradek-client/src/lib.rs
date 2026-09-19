@@ -60,6 +60,7 @@
 // local `allow` in a module nobody re-reads.
 #![forbid(unsafe_code)]
 
+pub mod admin;
 pub mod cluster;
 mod compression;
 pub mod conn;
@@ -77,6 +78,7 @@ pub mod sasl;
 #[cfg(feature = "tls")]
 pub mod tls;
 
+pub use admin::{ConfigEntry, GroupDescription, GroupListing, GroupMemberDescription};
 pub use cluster::Cluster;
 pub use conn::Connection;
 pub use consumer::{ConsumedRecord, Consumer, ConsumerConfig, FetchResult};

@@ -371,7 +371,7 @@ impl Cluster {
     }
 
     /// Drop the control-plane connection; the next use redials.
-    fn forget_control(&self) {
+    pub(crate) fn forget_control(&self) {
         self.state().control = None;
     }
 
@@ -585,6 +585,15 @@ const FIND_COORDINATOR_SUPPORTED: (i16, i16) = (0, 3);
 impl Cluster {
     /// A negotiated connection to `group`'s coordinator, discovering it
     /// via FindCoordinator on first use.
+    /// The node coordinating `group`, if this handle has looked it up.
+    ///
+    /// `None` before the first [`Cluster::coordinator`] call — this
+    /// reports what is cached rather than asking, so a caller batching
+    /// work by coordinator can do so without a round trip per group.
+    pub fn coordinator_id(&self, group: &str) -> Option<i32> {
+        self.state().coordinators.get(group).copied()
+    }
+
     pub async fn coordinator(&self, group: &str) -> Result<Broker, ClientError> {
         let cached = self.state().coordinators.get(group).copied();
         let node_id = match cached {

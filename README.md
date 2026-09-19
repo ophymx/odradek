@@ -71,6 +71,9 @@ Early but functional end to end:
   materializes records with absolute offsets,
   skipping control batches and pre-offset records, with earliest/latest
   lookup via ListOffsets and durable positions as a simple (non-member)
+  admin calls (list and describe consumer groups, describe topic and
+  broker configuration, delete topics), each routed where the protocol
+  requires;
   consumer — coordinator discovery plus offset commit/fetch under a
   group id; classic consumer-group membership (join/sync/heartbeat/
   leave, caller-driven, with leader-side range assignment matching

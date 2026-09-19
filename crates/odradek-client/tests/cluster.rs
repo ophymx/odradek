@@ -8,6 +8,7 @@ use odradek_client::{ClientConfig, ClientError, Cluster};
 use odradek_protocol::header::{request_header_version, response_header_version};
 use odradek_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
 use odradek_protocol::messages::init_producer_id_request::InitProducerIdRequest;
+use odradek_protocol::messages::list_groups_request::ListGroupsRequest;
 use odradek_protocol::messages::metadata_response::{
     MetadataResponse, MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
 };
@@ -262,6 +263,11 @@ async fn serve_conn(
                         InitProducerIdRequest::MIN_VERSION,
                         InitProducerIdRequest::MAX_VERSION,
                     ),
+                    (
+                        ListGroupsRequest::API_KEY,
+                        ListGroupsRequest::MIN_VERSION,
+                        ListGroupsRequest::MAX_VERSION,
+                    ),
                     (FetchRequest::API_KEY, FetchRequest::MIN_VERSION, 12),
                     (
                         ListOffsetsRequest::API_KEY,
@@ -323,6 +329,23 @@ async fn serve_conn(
                     v
                 })
                 .collect();
+                let mut buf = BytesMut::new();
+                resp.encode(&mut buf, api_version).unwrap();
+                buf.freeze()
+            }
+            16 => {
+                use odradek_protocol::messages::list_groups_response::{
+                    ListGroupsResponse, ListedGroup,
+                };
+                // Each broker coordinates its own group. A list that
+                // asked only one of them comes back short, which is the
+                // whole property `list_groups` has to hold.
+                let mut listed = ListedGroup::default();
+                listed.group_id = format!("group-on-node-{node_id}");
+                listed.protocol_type = "consumer".into();
+                listed.group_state = "Stable".into();
+                let mut resp = ListGroupsResponse::default();
+                resp.groups = vec![listed];
                 let mut buf = BytesMut::new();
                 resp.encode(&mut buf, api_version).unwrap();
                 buf.freeze()
@@ -1612,4 +1635,46 @@ async fn kip848_fenced_member_rejoins_with_the_same_id() {
     assert_eq!(member.heartbeat().await.unwrap(), GroupEvent::Rejoined);
     assert_eq!(member.member_id(), id, "identity survives fencing");
     assert_eq!(member.assignment(), &[(TOPIC.to_owned(), vec![0, 1, 2])]);
+}
+
+/// A group listing asks every broker, because each answers only for the
+/// groups it coordinates.
+///
+/// The fake cluster gives each broker its own group, so a listing that
+/// queried one broker and stopped comes back with one entry instead of
+/// three — a short answer indistinguishable from a true one.
+#[tokio::test]
+async fn listing_groups_asks_every_broker() {
+    let fake = spawn_fake_cluster(3, &[]).await;
+    let client = Cluster::connect(config_for(&fake)).await.unwrap();
+
+    let listed = client.list_groups().await.unwrap();
+    let ids: Vec<&str> = listed.iter().map(|g| g.group_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["group-on-node-0", "group-on-node-1", "group-on-node-2"],
+        "a group listing must cover every coordinator"
+    );
+    // Each listing names the broker that can describe it.
+    for group in &listed {
+        assert_eq!(
+            group.group_id,
+            format!("group-on-node-{}", group.coordinator_id)
+        );
+    }
+}
+
+/// And it works on a handle that has done nothing else.
+///
+/// The broker list comes from metadata, so a client that has only just
+/// connected has none cached — and iterating an empty list would return
+/// an empty listing that reads exactly like "this cluster has no
+/// groups". This is a regression test for having done precisely that.
+#[tokio::test]
+async fn listing_groups_works_before_any_other_call() {
+    let fake = spawn_fake_cluster(2, &[]).await;
+    let client = Cluster::connect(config_for(&fake)).await.unwrap();
+    // No produce, no fetch, no metadata refresh: straight to listing.
+    let listed = client.list_groups().await.unwrap();
+    assert_eq!(listed.len(), 2, "listing must fetch the brokers it needs");
 }

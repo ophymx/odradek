@@ -11,6 +11,12 @@ pub mod consumer_protocol_assignment;
 pub mod consumer_protocol_subscription;
 pub mod create_topics_request;
 pub mod create_topics_response;
+pub mod delete_topics_request;
+pub mod delete_topics_response;
+pub mod describe_configs_request;
+pub mod describe_configs_response;
+pub mod describe_groups_request;
+pub mod describe_groups_response;
 pub mod fetch_request;
 pub mod fetch_response;
 pub mod find_coordinator_request;
@@ -23,6 +29,8 @@ pub mod join_group_request;
 pub mod join_group_response;
 pub mod leave_group_request;
 pub mod leave_group_response;
+pub mod list_groups_request;
+pub mod list_groups_response;
 pub mod list_offsets_request;
 pub mod list_offsets_response;
 pub mod metadata_request;
@@ -50,6 +58,12 @@ pub use consumer_protocol_assignment::ConsumerProtocolAssignment;
 pub use consumer_protocol_subscription::ConsumerProtocolSubscription;
 pub use create_topics_request::CreateTopicsRequest;
 pub use create_topics_response::CreateTopicsResponse;
+pub use delete_topics_request::DeleteTopicsRequest;
+pub use delete_topics_response::DeleteTopicsResponse;
+pub use describe_configs_request::DescribeConfigsRequest;
+pub use describe_configs_response::DescribeConfigsResponse;
+pub use describe_groups_request::DescribeGroupsRequest;
+pub use describe_groups_response::DescribeGroupsResponse;
 pub use fetch_request::FetchRequest;
 pub use fetch_response::FetchResponse;
 pub use find_coordinator_request::FindCoordinatorRequest;
@@ -62,6 +76,8 @@ pub use join_group_request::JoinGroupRequest;
 pub use join_group_response::JoinGroupResponse;
 pub use leave_group_request::LeaveGroupRequest;
 pub use leave_group_response::LeaveGroupResponse;
+pub use list_groups_request::ListGroupsRequest;
+pub use list_groups_response::ListGroupsResponse;
 pub use list_offsets_request::ListOffsetsRequest;
 pub use list_offsets_response::ListOffsetsResponse;
 pub use metadata_request::MetadataRequest;
@@ -89,12 +105,16 @@ pub fn request_is_flexible(api_key: i16, api_version: i16) -> Option<bool> {
         18 => Some(api_versions_request::is_flexible(api_version)),
         68 => Some(consumer_group_heartbeat_request::is_flexible(api_version)),
         19 => Some(create_topics_request::is_flexible(api_version)),
+        20 => Some(delete_topics_request::is_flexible(api_version)),
+        32 => Some(describe_configs_request::is_flexible(api_version)),
+        15 => Some(describe_groups_request::is_flexible(api_version)),
         1 => Some(fetch_request::is_flexible(api_version)),
         10 => Some(find_coordinator_request::is_flexible(api_version)),
         12 => Some(heartbeat_request::is_flexible(api_version)),
         22 => Some(init_producer_id_request::is_flexible(api_version)),
         11 => Some(join_group_request::is_flexible(api_version)),
         13 => Some(leave_group_request::is_flexible(api_version)),
+        16 => Some(list_groups_request::is_flexible(api_version)),
         2 => Some(list_offsets_request::is_flexible(api_version)),
         3 => Some(metadata_request::is_flexible(api_version)),
         8 => Some(offset_commit_request::is_flexible(api_version)),
@@ -114,12 +134,16 @@ pub fn supported_versions(api_key: i16) -> Option<(i16, i16)> {
         18 => Some((0, 4)),
         68 => Some((0, 1)),
         19 => Some((2, 7)),
+        20 => Some((1, 6)),
+        32 => Some((1, 4)),
+        15 => Some((0, 6)),
         1 => Some((4, 18)),
         10 => Some((0, 6)),
         12 => Some((0, 4)),
         22 => Some((0, 6)),
         11 => Some((0, 9)),
         13 => Some((0, 5)),
+        16 => Some((0, 5)),
         2 => Some((1, 10)),
         3 => Some((0, 13)),
         8 => Some((2, 10)),

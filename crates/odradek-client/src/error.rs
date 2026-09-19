@@ -134,6 +134,9 @@ impl ClientError {
                     || *code == ErrorCode::COORDINATOR_LOAD_IN_PROGRESS
                     || *code == ErrorCode::COORDINATOR_NOT_AVAILABLE
                     || *code == ErrorCode::NOT_COORDINATOR
+                    // Admin calls go to the controller, and which
+                    // broker that is moves. Refetch and ask again.
+                    || *code == ErrorCode::NOT_CONTROLLER
                     || *code == ErrorCode::REQUEST_TIMED_OUT
                     || *code == ErrorCode::KAFKA_STORAGE_ERROR
             }

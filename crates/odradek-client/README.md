@@ -6,6 +6,12 @@ tokio. No C bindings anywhere in the tree: TLS is rustls, crypto is
 RustCrypto, codecs are pure Rust (zstd via the libzstd binding is the
 one exception).
 
+- **Admin**: list the cluster's consumer groups, describe them down to
+  members and assignments, read a topic's or broker's configuration,
+  and delete topics. Each routes where the protocol says it must — a
+  listing asks *every* broker, since each answers only for the groups
+  it coordinates; a description asks each group's coordinator; a
+  deletion goes to the controller and retries when that moves.
 - **Idempotent produce** (on by default): the producer takes an id
   from the broker and numbers every batch per partition, so a produce
   whose *acknowledgement* was lost gets retried without being appended
