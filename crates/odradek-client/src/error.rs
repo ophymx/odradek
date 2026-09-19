@@ -62,6 +62,14 @@ pub enum ClientError {
          ClientConfig::allow_plaintext_credentials to accept the exposure"
     )]
     InsecureCredentials { mechanism: &'static str },
+    /// The configuration asks for something that cannot be given.
+    ///
+    /// Distinct from a protocol or broker error because no retry and no
+    /// other broker will help: the program has asked for a combination
+    /// of settings that does not hold together, and only the program
+    /// can fix it.
+    #[error("{0}")]
+    Config(String),
 }
 
 /// The session-level classification of a [`ClientError`]: what kind of

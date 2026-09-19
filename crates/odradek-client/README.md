@@ -6,6 +6,14 @@ tokio. No C bindings anywhere in the tree: TLS is rustls, crypto is
 RustCrypto, codecs are pure Rust (zstd via the libzstd binding is the
 one exception).
 
+- **Idempotent produce** (on by default): the producer takes an id
+  from the broker and numbers every batch per partition, so a produce
+  whose *acknowledgement* was lost gets retried without being appended
+  twice. A retry carries the same sequence — that is the whole
+  mechanism — and a failed batch rewinds rather than leaving a gap the
+  broker would reject everything after. It requires `acks = -1`, and a
+  configuration that asks for both idempotence and weaker acks is
+  refused rather than silently given neither.
 - **Connections**: framed, correlation-id pipelined, ApiVersions
   negotiation with the `UNSUPPORTED_VERSION` downgrade path; plaintext
   or TLS (Mozilla roots, custom CA, or caller-built config), with

@@ -32,6 +32,8 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use odradek_protocol::ErrorCode;
+use odradek_protocol::messages::init_producer_id_request::InitProducerIdRequest;
+use odradek_protocol::messages::init_producer_id_response::InitProducerIdResponse;
 use odradek_protocol::messages::produce_request::{
     PartitionProduceData, ProduceRequest, TopicProduceData,
 };
@@ -43,7 +45,7 @@ use crate::compression::compress;
 use crate::conn;
 use crate::error::ClientError;
 use crate::join::join_all;
-use crate::retry::{or_mark_stale, retry_loop};
+use crate::retry::{Attempt, or_mark_stale, retry_loop};
 
 /// Produce versions this producer speaks: name-addressed (v13+ switches
 /// to topic ids).
@@ -66,6 +68,22 @@ pub struct ProducerConfig {
     /// [`Producer::enqueue`] delivers a partition's buffer once its
     /// estimated size passes this (pre-compression bytes).
     pub batch_max_bytes: usize,
+    /// Number each batch so the broker can discard a retry it has
+    /// already applied (default: on).
+    ///
+    /// Without this a produce that succeeds and whose *acknowledgement*
+    /// is lost gets retried, and the broker has no way to tell the
+    /// retry from a second write — the batch is appended twice. With
+    /// it, the producer takes an id from the broker and numbers every
+    /// batch per partition, and the broker drops a sequence it has
+    /// already seen.
+    ///
+    /// It is not free: it costs one InitProducerId round trip on the
+    /// first produce, and it requires `acks = -1`, because a batch the
+    /// full ISR has not acknowledged can be lost in a way that breaks
+    /// the sequence. A producer configured otherwise refuses to start
+    /// rather than silently offering a guarantee it cannot keep.
+    pub idempotent: bool,
 }
 
 impl Default for ProducerConfig {
@@ -78,6 +96,7 @@ impl Default for ProducerConfig {
             retry_backoff: Duration::from_millis(250),
             compression: Compression::None,
             batch_max_bytes: 16 * 1024,
+            idempotent: true,
         }
     }
 }
@@ -106,6 +125,77 @@ pub struct Producer {
     pending: HashMap<(String, i32), PendingBatch>,
     /// Round-robin cursor for keyless [`Producer::enqueue_keyed`] records.
     next_round_robin: u64,
+    /// The identity the broker issued, once something has been produced.
+    identity: Option<ProducerIdentity>,
+    /// The next sequence number owed per partition.
+    sequences: HashMap<(String, i32), i32>,
+}
+
+/// The acknowledgement level idempotence requires: every in-sync
+/// replica.
+const ACKS_ALL: i16 = -1;
+
+/// Refusing beats pretending.
+///
+/// Below the full ISR a batch the broker took can still be lost, and the
+/// next one then carries a sequence whose predecessor the broker never
+/// saw — so the guarantee this configuration asks for cannot be given,
+/// and silently not giving it is the worst of the three options.
+fn check_idempotent_acks(acks: i16) -> Result<(), ClientError> {
+    if acks == ACKS_ALL {
+        return Ok(());
+    }
+    Err(ClientError::Config(format!(
+        "idempotent produce needs acks = {ACKS_ALL} (the full ISR), not {acks}"
+    )))
+}
+
+/// Claim the next sequence range for one partition.
+///
+/// Split out from the identity handshake so the arithmetic is testable
+/// without a broker: which sequence a batch carries is the part that has
+/// to be right, and it is pure.
+fn next_stamp(
+    identity: ProducerIdentity,
+    sequences: &mut HashMap<(String, i32), i32>,
+    key: &(String, i32),
+    records: usize,
+) -> BatchStamp {
+    let base_sequence = *sequences.get(key).unwrap_or(&0);
+    let count = i32::try_from(records).unwrap_or(i32::MAX);
+    // Sequences wrap at i32::MAX, which is what the broker expects;
+    // saturating would stall a long-lived producer instead.
+    sequences.insert(key.clone(), base_sequence.wrapping_add(count));
+    BatchStamp {
+        producer_id: identity.id,
+        producer_epoch: identity.epoch,
+        base_sequence,
+    }
+}
+
+/// What one batch carries so the broker can recognize a repeat of it.
+///
+/// The triple is the whole mechanism: a broker keeps the last few
+/// sequences per (producer id, partition) and drops a batch whose
+/// numbers it has already applied. Which is why a retry must carry the
+/// *same* stamp, and why a gap is an error rather than something to
+/// paper over — the broker cannot tell a gap from a batch it lost.
+#[derive(Debug, Clone, Copy)]
+struct BatchStamp {
+    producer_id: i64,
+    producer_epoch: i16,
+    base_sequence: i32,
+}
+
+/// What the broker knows this producer as.
+///
+/// The epoch is the broker's way of retiring an id: a producer that
+/// re-initializes gets a higher one, and batches carrying the old epoch
+/// are refused rather than interleaved with the new producer's.
+#[derive(Debug, Clone, Copy)]
+struct ProducerIdentity {
+    id: i64,
+    epoch: i16,
 }
 
 impl Producer {
@@ -119,6 +209,8 @@ impl Producer {
             config,
             pending: HashMap::new(),
             next_round_robin: 0,
+            identity: None,
+            sequences: HashMap::new(),
         }
     }
 
@@ -211,23 +303,50 @@ impl Producer {
             return Ok(Vec::new());
         }
 
+        // Stamps are reserved here, before anything is sent: these
+        // deliveries run concurrently and `batch_stamp` needs the
+        // producer, so the sequence for every partition is claimed up
+        // front and the parallel half only spends what it was given.
+        let mut stamped = Vec::with_capacity(batches.len());
+        for (key, pending) in batches {
+            match self.batch_stamp(&key, pending.records.len()).await {
+                Ok(stamp) => stamped.push((key, pending, stamp)),
+                Err(e) => {
+                    // Whatever was drained but never sent goes back, or
+                    // a failure to get an id would lose every buffer.
+                    self.restore(key, pending);
+                    for (key, pending, _) in stamped {
+                        self.restore(key, pending);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
         let cluster = &self.cluster;
         let config = &self.config;
-        let attempts: Vec<_> = batches
+        let attempts: Vec<_> = stamped
             .into_iter()
-            .map(|(key, pending)| async move {
+            .map(|(key, pending, stamp)| async move {
                 // The clone is what lets a failed partition keep its
                 // records: encoding consumes them.
-                let outcome =
-                    deliver(cluster, config, &key.0, key.1, pending.records.clone()).await;
-                (key, pending, outcome)
+                let outcome = deliver(
+                    cluster,
+                    config,
+                    &key.0,
+                    key.1,
+                    pending.records.clone(),
+                    stamp,
+                )
+                .await;
+                (key, pending, stamp, outcome)
             })
             .collect();
         let results = join_all(attempts).await;
 
         let mut deliveries = Vec::with_capacity(results.len());
         let mut failure: Option<((String, i32), ClientError)> = None;
-        for (key, pending, outcome) in results {
+        for (key, pending, stamp, outcome) in results {
             match outcome {
                 Ok(base_offset) => deliveries.push(Delivery {
                     topic: key.0,
@@ -236,6 +355,12 @@ impl Producer {
                     records: pending.records.len(),
                 }),
                 Err(e) => {
+                    // Rewind the sequence so the retry carries the same
+                    // numbers; advancing past a batch the broker never
+                    // took would leave a gap it rejects everything after.
+                    if let Some(stamp) = stamp {
+                        self.sequences.insert(key.clone(), stamp.base_sequence);
+                    }
                     self.restore(key.clone(), pending);
                     if failure.as_ref().is_none_or(|(worst, _)| key < *worst) {
                         failure = Some((key, e));
@@ -258,12 +383,23 @@ impl Producer {
         let key = (topic.to_owned(), partition);
         let pending = self.pending.remove(&key).unwrap_or_default();
         let count = pending.records.len();
+        // The identity is taken once and kept: a new one would restart
+        // every sequence, which is exactly what makes a retry look like
+        // a new write.
+        let stamp = match self.batch_stamp(&key, count).await {
+            Ok(stamp) => stamp,
+            Err(e) => {
+                self.restore(key, pending);
+                return Err(e);
+            }
+        };
         match deliver(
             &self.cluster,
             &self.config,
             topic,
             partition,
             pending.records.clone(),
+            stamp,
         )
         .await
         {
@@ -274,10 +410,44 @@ impl Producer {
                 records: count,
             }),
             Err(e) => {
+                // The sequence is *not* advanced past a failed batch:
+                // the retry has to carry the same numbers, or the broker
+                // sees a gap and rejects everything after it.
+                if let Some(stamp) = stamp {
+                    self.sequences.insert(key.clone(), stamp.base_sequence);
+                }
                 self.restore(key, pending);
                 Err(e)
             }
         }
+    }
+
+    /// The producer id, epoch and base sequence this batch carries, or
+    /// `None` when idempotence is off.
+    ///
+    /// Reserves the sequence range before the batch goes out, so a
+    /// concurrent flush of another partition cannot take the same
+    /// numbers — sequences are per partition, but the counter map is
+    /// shared.
+    async fn batch_stamp(
+        &mut self,
+        key: &(String, i32),
+        records: usize,
+    ) -> Result<Option<BatchStamp>, ClientError> {
+        if !self.config.idempotent {
+            return Ok(None);
+        }
+        check_idempotent_acks(self.config.acks)?;
+        if self.identity.is_none() {
+            self.identity = Some(init_producer_id(&self.cluster, &self.config).await?);
+        }
+        let identity = self.identity.expect("set immediately above");
+        Ok(Some(next_stamp(
+            identity,
+            &mut self.sequences,
+            key,
+            records,
+        )))
     }
 
     /// Put an undelivered batch back in front of whatever has been
@@ -299,8 +469,105 @@ impl Producer {
         partition: i32,
         records: Vec<Record>,
     ) -> Result<i64, ClientError> {
-        deliver(&self.cluster, &self.config, topic, partition, records).await
+        let key = (topic.to_owned(), partition);
+        let stamp = self.batch_stamp(&key, records.len()).await?;
+        let outcome = deliver(
+            &self.cluster,
+            &self.config,
+            topic,
+            partition,
+            records,
+            stamp,
+        )
+        .await;
+        if outcome.is_err() {
+            // Hand the sequence back: a retry has to reuse it.
+            if let Some(stamp) = stamp {
+                self.sequences.insert(key, stamp.base_sequence);
+            }
+        }
+        outcome
     }
+}
+
+/// InitProducerId versions this client speaks. v0 is enough for the
+/// idempotent case; the later ones add transactional fields.
+const INIT_PRODUCER_ID_SUPPORTED: (i16, i16) = (0, InitProducerIdRequest::MAX_VERSION);
+
+/// Take an id from the broker, once, for this producer.
+///
+/// Idempotence is per (producer id, partition, sequence), so the id has
+/// to be stable for the life of the producer: acquiring a new one would
+/// restart every sequence at zero and make the broker treat a retry as
+/// a fresh write, which is the thing being prevented.
+async fn init_producer_id(
+    cluster: &Cluster,
+    config: &ProducerConfig,
+) -> Result<ProducerIdentity, ClientError> {
+    // A broker that has just started is still loading its transaction
+    // coordinator, and says so. That is the same "ask again shortly"
+    // the produce path already retries — and it happens on exactly the
+    // first produce against a fresh cluster, which is when a user is
+    // most likely to be watching.
+    retry_loop(
+        &mut &*cluster,
+        config.max_attempts,
+        config.retry_backoff,
+        |cluster| {
+            let cluster: &Cluster = cluster;
+            Box::pin(async move {
+                match init_producer_id_once(cluster).await {
+                    Ok(identity) => Attempt::Done(identity),
+                    // `is_retriable` already knows the coordinator codes;
+                    // nothing here is partition-scoped, so no metadata to
+                    // invalidate.
+                    Err(e) if e.is_retriable() => Attempt::Retry(e),
+                    Err(e) => Attempt::Fatal(e),
+                }
+            })
+        },
+    )
+    .await
+}
+
+async fn init_producer_id_once(cluster: &Cluster) -> Result<ProducerIdentity, ClientError> {
+    let broker = cluster.control_broker().await?;
+    let version = broker
+        .ranges
+        .pick(InitProducerIdRequest::API_KEY, INIT_PRODUCER_ID_SUPPORTED)
+        .map_err(|_| {
+            // A bare NoCommonVersion(22) is true and useless. The
+            // caller asked for a guarantee this broker cannot give, and
+            // the fix is a configuration change they can make.
+            ClientError::Config(
+                "this broker does not support InitProducerId, so idempotent produce is \
+                 unavailable; set ProducerConfig::idempotent = false to produce without it"
+                    .into(),
+            )
+        })?;
+    let mut request = InitProducerIdRequest::default();
+    // No transactional id: this is the idempotent producer, not the
+    // transactional one. The broker issues an id scoped to the session
+    // rather than one it will recover after a restart.
+    request.transactional_id = None;
+    request.transaction_timeout_ms = -1;
+    request.producer_id = -1;
+    request.producer_epoch = -1;
+    let mut body = BytesMut::new();
+    request.encode(&mut body, version)?;
+    let mut resp = broker
+        .conn
+        .request(InitProducerIdRequest::API_KEY, version, &body)
+        .await?;
+    let resp = conn::decode_body::<InitProducerIdResponse>(&mut resp, version)?;
+    let code = ErrorCode(resp.error_code);
+    if !code.is_ok() {
+        return Err(ClientError::Broker(code));
+    }
+    Ok(ProducerIdentity {
+        id: resp.producer_id,
+        epoch: resp.producer_epoch,
+    })
 }
 
 /// Deliver one batch to one partition, retrying through leadership
@@ -316,10 +583,11 @@ async fn deliver(
     topic: &str,
     partition: i32,
     records: Vec<Record>,
+    stamp: Option<BatchStamp>,
 ) -> Result<i64, ClientError> {
     // Owned per-round captures keep the attempt future free of
     // outer borrows; the Bytes clone is a refcount bump.
-    let set = encode_batch(records, config.compression)?;
+    let set = encode_batch(records, config.compression, stamp)?;
     // A retriable failure means leadership (or the broker itself)
     // may have moved on; refetch rather than resend into the wall.
     retry_loop(
@@ -461,7 +729,11 @@ fn estimate_record_size(record: &Record) -> usize {
 /// Assemble one record batch: offset deltas by position, timestamps
 /// anchored at now, producer id -1 (not idempotent), records compressed
 /// with `codec`.
-fn encode_batch(mut records: Vec<Record>, codec: Compression) -> Result<Bytes, ClientError> {
+fn encode_batch(
+    mut records: Vec<Record>,
+    codec: Compression,
+    stamp: Option<BatchStamp>,
+) -> Result<Bytes, ClientError> {
     if records.is_empty() {
         return Err(ClientError::ProtocolViolation(
             "cannot produce an empty record set".into(),
@@ -498,9 +770,11 @@ fn encode_batch(mut records: Vec<Record>, codec: Compression) -> Result<Bytes, C
         last_offset_delta: i32::try_from(last).unwrap_or(i32::MAX),
         base_timestamp: now_ms,
         max_timestamp: now_ms + max_delta,
-        producer_id: -1,
-        producer_epoch: -1,
-        base_sequence: -1,
+        // -1 throughout is "not idempotent"; the broker then has no way
+        // to recognize a retry and appends it as a new batch.
+        producer_id: stamp.map_or(-1, |s| s.producer_id),
+        producer_epoch: stamp.map_or(-1, |s| s.producer_epoch),
+        base_sequence: stamp.map_or(-1, |s| s.base_sequence),
         records: batch_records,
         ..Default::default()
     };
@@ -564,5 +838,123 @@ mod tests {
         });
         // Same key, same partition, always.
         assert_eq!(partition_for_key(b"21", 12), partition_for_key(b"21", 12));
+    }
+}
+
+#[cfg(test)]
+mod idempotence_tests {
+    use odradek_protocol::records::decode_set;
+
+    use super::*;
+
+    fn record(value: &str) -> Record {
+        Record {
+            value: Some(Bytes::copy_from_slice(value.as_bytes())),
+            ..Default::default()
+        }
+    }
+
+    /// Without a stamp the batch says "-1" in all three fields, which is
+    /// how a non-idempotent producer identifies itself: the broker then
+    /// has no way to recognize a retry and appends it again.
+    #[test]
+    fn an_unstamped_batch_disclaims_a_producer_id() {
+        let set = encode_batch(vec![record("a")], Compression::None, None).unwrap();
+        let batch = &decode_set(&mut set.clone()).unwrap()[0];
+        assert_eq!(batch.producer_id, -1);
+        assert_eq!(batch.producer_epoch, -1);
+        assert_eq!(batch.base_sequence, -1);
+    }
+
+    /// And a stamped one carries exactly what it was given — the triple
+    /// the broker dedupes on.
+    #[test]
+    fn a_stamped_batch_carries_the_triple() {
+        let stamp = BatchStamp {
+            producer_id: 4242,
+            producer_epoch: 7,
+            base_sequence: 19,
+        };
+        let set = encode_batch(
+            vec![record("a"), record("b")],
+            Compression::None,
+            Some(stamp),
+        )
+        .unwrap();
+        let batch = &decode_set(&mut set.clone()).unwrap()[0];
+        assert_eq!(batch.producer_id, 4242);
+        assert_eq!(batch.producer_epoch, 7);
+        assert_eq!(batch.base_sequence, 19);
+        // last_offset_delta tells the broker the range this batch
+        // covers, and so which sequences it consumed.
+        assert_eq!(batch.last_offset_delta, 1);
+    }
+
+    /// Sequences advance by the record count, so consecutive batches
+    /// leave no gap. A gap is not a smaller problem than a duplicate:
+    /// the broker cannot tell it from a batch it lost, and refuses
+    /// everything after it.
+    #[test]
+    fn sequences_advance_by_the_record_count() {
+        let identity = ProducerIdentity { id: 1, epoch: 0 };
+        let mut sequences = HashMap::new();
+        let key = ("t".to_owned(), 0);
+
+        assert_eq!(
+            next_stamp(identity, &mut sequences, &key, 3).base_sequence,
+            0
+        );
+        assert_eq!(
+            next_stamp(identity, &mut sequences, &key, 2).base_sequence,
+            3
+        );
+        // Per partition, not per producer: another partition starts over.
+        let other = ("t".to_owned(), 1);
+        assert_eq!(
+            next_stamp(identity, &mut sequences, &other, 1).base_sequence,
+            0
+        );
+    }
+
+    /// A failed batch puts its sequence back, so the retry carries the
+    /// same numbers. This is the whole point: a retry with a *new*
+    /// sequence is a second write, which is what idempotence exists to
+    /// prevent.
+    #[test]
+    fn a_rewound_sequence_is_reused() {
+        let identity = ProducerIdentity { id: 1, epoch: 0 };
+        let mut sequences = HashMap::new();
+        let key = ("t".to_owned(), 0);
+
+        let attempt = next_stamp(identity, &mut sequences, &key, 4);
+        // What the failure path does.
+        sequences.insert(key.clone(), attempt.base_sequence);
+        let retry = next_stamp(identity, &mut sequences, &key, 4);
+        assert_eq!(retry.base_sequence, attempt.base_sequence);
+
+        // And the batch after the successful retry continues from there.
+        let next = next_stamp(identity, &mut sequences, &key, 1);
+        assert_eq!(next.base_sequence, 4);
+    }
+
+    /// Idempotence with weaker acks is refused rather than pretended.
+    #[test]
+    fn idempotence_requires_full_acks() {
+        assert!(check_idempotent_acks(ACKS_ALL).is_ok());
+        for acks in [0, 1] {
+            assert!(
+                matches!(check_idempotent_acks(acks), Err(ClientError::Config(_))),
+                "acks={acks} should be refused"
+            );
+        }
+    }
+
+    /// The default configuration is the safe one: on, with the acks it
+    /// needs.
+    #[test]
+    fn the_default_is_idempotent_and_consistent() {
+        let config = ProducerConfig::default();
+        assert!(config.idempotent);
+        assert!(check_idempotent_acks(config.acks).is_ok());
     }
 }

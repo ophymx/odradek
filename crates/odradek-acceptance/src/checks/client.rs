@@ -27,6 +27,7 @@ use odradek_protocol::messages::api_versions_request::ApiVersionsRequest;
 use odradek_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
 use odradek_protocol::messages::fetch_request::FetchRequest;
 use odradek_protocol::messages::fetch_response::FetchResponse;
+use odradek_protocol::messages::init_producer_id_request::InitProducerIdRequest;
 use odradek_protocol::messages::metadata_request::MetadataRequest;
 use odradek_protocol::messages::metadata_response::{
     MetadataResponse, MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
@@ -59,6 +60,14 @@ const ADVERTISED: &[(i16, i16, i16)] = &[
         ProduceRequest::API_KEY,
         ProduceRequest::MIN_VERSION,
         ProduceRequest::MAX_VERSION,
+    ),
+    // An idempotent producer asks for an id before it produces
+    // anything, so a harness that does not offer this is one no
+    // default-configured client can produce to.
+    (
+        InitProducerIdRequest::API_KEY,
+        InitProducerIdRequest::MIN_VERSION,
+        InitProducerIdRequest::MAX_VERSION,
     ),
     (
         FetchRequest::API_KEY,
@@ -674,6 +683,26 @@ async fn respond(
                 buf.freeze(),
                 response_header_version(MetadataRequest::API_KEY, v).unwrap_or(0),
             )
+        }
+        InitProducerIdRequest::API_KEY => {
+            use odradek_protocol::messages::init_producer_id_response::InitProducerIdResponse;
+            let v = api_version.clamp(
+                InitProducerIdRequest::MIN_VERSION,
+                InitProducerIdRequest::MAX_VERSION,
+            );
+            // One id for the harness's lifetime. Nothing here checks
+            // sequences — that is the broker's job and this is not one —
+            // but a client that asks has to be answered, or it cannot
+            // produce at all.
+            let mut resp = InitProducerIdResponse::default();
+            resp.error_code = ErrorCode::NONE.0;
+            resp.producer_id = 1000;
+            resp.producer_epoch = 0;
+            let mut body = BytesMut::new();
+            if resp.encode(&mut body, v).is_err() {
+                return;
+            }
+            (body.freeze(), v)
         }
         ProduceRequest::API_KEY => {
             use odradek_protocol::messages::produce_response::{

@@ -7,6 +7,7 @@ use bytes::{Bytes, BytesMut};
 use odradek_client::{ClientConfig, ClientError, Cluster};
 use odradek_protocol::header::{request_header_version, response_header_version};
 use odradek_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsResponse};
+use odradek_protocol::messages::init_producer_id_request::InitProducerIdRequest;
 use odradek_protocol::messages::metadata_response::{
     MetadataResponse, MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
 };
@@ -251,6 +252,16 @@ async fn serve_conn(
                     // this fake's handlers serve names, so both cap
                     // below the schema's max.
                     (ProduceRequest::API_KEY, ProduceRequest::MIN_VERSION, 12),
+                    // A default-configured producer asks for an id
+                    // before it produces anything, so a fake broker
+                    // without this is one the client cannot produce to
+                    // at all — which is the behaviour a real broker
+                    // lacking it would also get.
+                    (
+                        InitProducerIdRequest::API_KEY,
+                        InitProducerIdRequest::MIN_VERSION,
+                        InitProducerIdRequest::MAX_VERSION,
+                    ),
                     (FetchRequest::API_KEY, FetchRequest::MIN_VERSION, 12),
                     (
                         ListOffsetsRequest::API_KEY,
@@ -312,6 +323,20 @@ async fn serve_conn(
                     v
                 })
                 .collect();
+                let mut buf = BytesMut::new();
+                resp.encode(&mut buf, api_version).unwrap();
+                buf.freeze()
+            }
+            22 => {
+                use odradek_protocol::messages::init_producer_id_response::InitProducerIdResponse;
+                // One id for this fake's lifetime. Nothing here checks
+                // sequences — that is a real broker's job — but a
+                // client that asks has to be answered or it cannot
+                // produce at all.
+                let mut resp = InitProducerIdResponse::default();
+                resp.error_code = 0;
+                resp.producer_id = 7000;
+                resp.producer_epoch = 0;
                 let mut buf = BytesMut::new();
                 resp.encode(&mut buf, api_version).unwrap();
                 buf.freeze()

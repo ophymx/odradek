@@ -17,6 +17,8 @@ pub mod find_coordinator_request;
 pub mod find_coordinator_response;
 pub mod heartbeat_request;
 pub mod heartbeat_response;
+pub mod init_producer_id_request;
+pub mod init_producer_id_response;
 pub mod join_group_request;
 pub mod join_group_response;
 pub mod leave_group_request;
@@ -54,6 +56,8 @@ pub use find_coordinator_request::FindCoordinatorRequest;
 pub use find_coordinator_response::FindCoordinatorResponse;
 pub use heartbeat_request::HeartbeatRequest;
 pub use heartbeat_response::HeartbeatResponse;
+pub use init_producer_id_request::InitProducerIdRequest;
+pub use init_producer_id_response::InitProducerIdResponse;
 pub use join_group_request::JoinGroupRequest;
 pub use join_group_response::JoinGroupResponse;
 pub use leave_group_request::LeaveGroupRequest;
@@ -88,6 +92,7 @@ pub fn request_is_flexible(api_key: i16, api_version: i16) -> Option<bool> {
         1 => Some(fetch_request::is_flexible(api_version)),
         10 => Some(find_coordinator_request::is_flexible(api_version)),
         12 => Some(heartbeat_request::is_flexible(api_version)),
+        22 => Some(init_producer_id_request::is_flexible(api_version)),
         11 => Some(join_group_request::is_flexible(api_version)),
         13 => Some(leave_group_request::is_flexible(api_version)),
         2 => Some(list_offsets_request::is_flexible(api_version)),
@@ -112,6 +117,7 @@ pub fn supported_versions(api_key: i16) -> Option<(i16, i16)> {
         1 => Some((4, 18)),
         10 => Some((0, 6)),
         12 => Some((0, 4)),
+        22 => Some((0, 6)),
         11 => Some((0, 9)),
         13 => Some((0, 5)),
         2 => Some((1, 10)),
