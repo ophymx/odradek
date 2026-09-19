@@ -40,6 +40,7 @@ use odradek_protocol::messages::sasl_authenticate_request::SaslAuthenticateReque
 use odradek_protocol::messages::sasl_authenticate_response::SaslAuthenticateResponse;
 use odradek_protocol::messages::sasl_handshake_request::SaslHandshakeRequest;
 use odradek_protocol::messages::sasl_handshake_response::SaslHandshakeResponse;
+use odradek_protocol::wire::RawTaggedField;
 use odradek_protocol::{ErrorCode, Message, frame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -154,6 +155,13 @@ pub static CLIENT_CHECKS: &[Check] = &[
         runner: Runner::Client(recovers_from_leader_change),
     },
     Check {
+        id: "client/tolerates-unknown-tagged-fields",
+        requirement: "keeps going after a response carrying a tagged field it \
+                      does not know, which is what the tagged-field section is \
+                      for",
+        runner: Runner::Client(tolerates_unknown_tagged_fields),
+    },
+    Check {
         id: "client/honours-throttle-time",
         requirement: "waits out a response's throttle_time_ms before sending \
                       again on that connection, instead of pushing into a \
@@ -194,6 +202,16 @@ pub enum HarnessFault {
     /// this project wrote and caught against a live broker, and these
     /// checks exist to make it unrepeatable.
     RejectSaslToken,
+
+    /// Carry a tagged field no released Kafka version defines, the way
+    /// a broker newer than the client does.
+    ///
+    /// Forward compatibility is the tagged-field section's whole
+    /// purpose: a client is supposed to keep what it does not
+    /// understand and carry on. One that refuses instead breaks against
+    /// every broker newer than itself, and breaks on upgrade day rather
+    /// than in anybody's test suite.
+    UnknownTaggedField,
 
     /// Answer with a non-zero `throttle_time_ms`, the way a broker
     /// enforcing a quota does.
@@ -271,6 +289,13 @@ const THROTTLE_MS: i32 = 400;
 /// Metadata carries `throttle_time_ms` from v3.
 const METADATA_THROTTLE_MIN: i16 = 3;
 
+/// Metadata gained a tagged-field section at v9.
+const METADATA_FLEXIBLE_MIN: i16 = 9;
+
+/// A tag far above anything the schemas define, so it can only be
+/// something the client has never heard of.
+const UNKNOWN_TAG: u32 = 60_000;
+
 const SASL_HANDSHAKE_API: i16 = 17;
 const SASL_AUTHENTICATE_API: i16 = 36;
 
@@ -293,6 +318,9 @@ pub(crate) struct Session {
     /// `(connection, request index, when the answer went out)` for every
     /// throttled response.
     throttles: Vec<(usize, usize, u64)>,
+    /// `(connection, request index)` for every response that carried an
+    /// unknown tagged field.
+    tagged: Vec<(usize, usize)>,
 }
 
 /// Connection bookkeeping for one session: hands out connection ordinals
@@ -344,6 +372,9 @@ struct ClusterView {
     throttles: std::sync::Mutex<Vec<(usize, usize, u64)>>,
     /// The session's zero point, for `at_ms`.
     started: std::time::Instant,
+    /// `(connection, request index)` for every response that carried an
+    /// unknown tagged field.
+    tagged: std::sync::Mutex<Vec<(usize, usize)>>,
 }
 
 impl ClusterView {
@@ -428,6 +459,7 @@ pub async fn run(listener: &TcpListener, config: &ObserveConfig) -> io::Result<R
         events: std::sync::Mutex::new(Vec::new()),
         sasl_rejections: std::sync::Mutex::new(Vec::new()),
         throttles: std::sync::Mutex::new(Vec::new()),
+        tagged: std::sync::Mutex::new(Vec::new()),
         started: std::time::Instant::now(),
     });
 
@@ -528,6 +560,7 @@ pub async fn run(listener: &TcpListener, config: &ObserveConfig) -> io::Result<R
         events,
         sasl_rejections: view.sasl_rejections.lock().unwrap().clone(),
         throttles: view.throttles.lock().unwrap().clone(),
+        tagged: view.tagged.lock().unwrap().clone(),
     };
     Ok(evaluate(&session, &format!("client {peer}")))
 }
@@ -755,6 +788,13 @@ async fn respond(
             // Metadata carries the throttle from v3 on, and every client
             // asks for it early and often — so it is where a quota pause
             // is most likely to reach one.
+            if view.fault == Some(HarnessFault::UnknownTaggedField) && v >= METADATA_FLEXIBLE_MIN {
+                resp.unknown_tagged_fields.push(RawTaggedField {
+                    tag: UNKNOWN_TAG,
+                    data: Bytes::from_static(b"from a newer broker"),
+                });
+                view.tagged.lock().unwrap().push((conn_id, index));
+            }
             if view.fault == Some(HarnessFault::Throttle) && v >= METADATA_THROTTLE_MIN {
                 resp.throttle_time_ms = THROTTLE_MS;
                 let sent_at = u64::try_from(view.started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -1349,4 +1389,46 @@ fn honours_throttle_time(session: &Session) -> Verdict {
         };
     }
     Verdict::Pass
+}
+
+/// A client must carry on past a tagged field it does not know.
+///
+/// This is what the tagged-field section is *for*: brokers add fields
+/// without a version bump, and every client older than the addition is
+/// expected to keep them and proceed. One that refuses instead breaks
+/// against every broker newer than itself — and breaks on upgrade day,
+/// in somebody's cluster, rather than in a test suite.
+///
+/// Judged by whether the client went on working: it asked for
+/// something, was answered with a field from the future, and either
+/// carried on or did not.
+fn tolerates_unknown_tagged_fields(session: &Session) -> Verdict {
+    let Some(&(conn_id, index)) = session.tagged.first() else {
+        return Verdict::Skipped {
+            reason: "no response carried an unknown tagged field in this session".into(),
+        };
+    };
+    let carried_on = session
+        .observations
+        .iter()
+        .any(|obs| obs.conn_id == conn_id && obs.index > index);
+    if carried_on {
+        return Verdict::Pass;
+    }
+    // Another connection is enough too: a client that reconnects rather
+    // than reusing the connection has still tolerated the field.
+    if session
+        .observations
+        .iter()
+        .any(|obs| obs.conn_id != conn_id)
+    {
+        return Verdict::Pass;
+    }
+    Verdict::Fail {
+        details: format!(
+            "answered request {index} on connection {conn_id} with tag {UNKNOWN_TAG}, a field \
+             no schema defines, and the client sent nothing further anywhere; a client that \
+             stops at a field from the future stops at every broker newer than itself"
+        ),
+    }
 }

@@ -37,6 +37,7 @@ const CITED: &[&str] = &[
     "client/heeds-sasl-rejection",
     "client/acknowledges-sasl-rejection",
     "client/honours-throttle-time",
+    "client/tolerates-unknown-tagged-fields",
 ];
 
 #[test]
@@ -112,6 +113,7 @@ async fn odradek_client_passes_the_client_checks() {
         "client/honours-throttle-time",
         "client/heeds-sasl-rejection",
         "client/acknowledges-sasl-rejection",
+        "client/tolerates-unknown-tagged-fields",
     ];
     for id in client_check_ids() {
         let verdict = report.verdict(id);
@@ -503,5 +505,82 @@ async fn a_client_that_ignores_a_throttle_is_caught() {
             Some(Verdict::Fail { .. })
         ),
         "ignoring a throttle must be caught:\n{report}"
+    );
+}
+
+/// The odradek client carries on past a field from the future.
+///
+/// The protocol crate keeps unknown tagged fields rather than refusing
+/// them, and this is that promise observed from outside: a response
+/// arrives carrying a tag no schema defines, and the client goes on
+/// working.
+#[tokio::test]
+async fn odradek_client_tolerates_a_field_from_the_future() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let harness = tokio::spawn(async move {
+        let mut config = config();
+        config.fault = Some(HarnessFault::UnknownTaggedField);
+        run(&listener, &config).await
+    });
+
+    let mut client_config = ClientConfig::default();
+    client_config.bootstrap_servers = vec![addr];
+    client_config.client_id = "odradek".into();
+    let cluster = Cluster::connect(client_config).await.unwrap();
+    let mut producer = Producer::new(cluster);
+    producer
+        .produce(
+            ROUTING_TOPIC,
+            0,
+            vec![odradek_protocol::records::Record {
+                value: Some(Bytes::from_static(b"undeterred")),
+                ..Default::default()
+            }],
+        )
+        .await
+        .unwrap();
+    drop(producer);
+
+    let report = harness.await.unwrap().expect("harness ran");
+    assert!(
+        matches!(
+            report.verdict("client/tolerates-unknown-tagged-fields"),
+            Some(Verdict::Pass)
+        ),
+        "{report}"
+    );
+}
+
+/// And a client that gives up at the unknown field is caught.
+#[tokio::test]
+async fn a_client_that_stops_at_an_unknown_field_is_caught() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let harness = tokio::spawn(async move {
+        let mut config = config();
+        config.fault = Some(HarnessFault::UnknownTaggedField);
+        run(&listener, &config).await
+    });
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    send_frame(&mut stream, &request_frame(18, 0, 1, &[])).await;
+    // Metadata v9 naming no topics; the answer carries the unknown tag.
+    send_frame(
+        &mut stream,
+        &request_frame(3, 9, 2, &[0x01, 0x00, 0x00, 0x00]),
+    )
+    .await;
+    // And then nothing: the client that could not cope.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(stream);
+
+    let report = harness.await.unwrap().expect("harness ran");
+    assert!(
+        matches!(
+            report.verdict("client/tolerates-unknown-tagged-fields"),
+            Some(Verdict::Fail { .. })
+        ),
+        "giving up at an unknown tagged field must be caught:\n{report}"
     );
 }

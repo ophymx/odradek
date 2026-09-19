@@ -170,6 +170,13 @@ watches for the lone `\x01` the RFC has the client send back, without
 which the broker is left mid-exchange and reports a timeout instead of
 the reason it already knows.
 
+`client/tolerates-unknown-tagged-fields` checks the other direction of
+the same promise the protocol crate makes internally: a response
+arrives carrying a tag no schema defines — the way one from a newer
+broker does — and the client is expected to keep it and carry on. One
+that refuses instead breaks against every broker newer than itself, and
+breaks on upgrade day in somebody's cluster rather than in a test suite.
+
 `client/honours-throttle-time` found a second gap in this crate's own
 client, which read `throttle_time_ms` from nothing at all. Quota
 enforcement is not advice a client can decline: the broker answers,
