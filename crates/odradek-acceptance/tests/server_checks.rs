@@ -82,6 +82,10 @@ const SENSITIVITY: &[(Fault, &str)] = &[
     (Fault::ProduceTopicIdUnknown, "produce/topic-id"),
     (Fault::FetchWrongTopicId, "fetch/topic-id"),
     (
+        Fault::ProduceAcceptsFencedEpoch,
+        "txn/fenced-producer-cannot-produce",
+    ),
+    (
         Fault::TxnCommitMarksAborted,
         "txn/commit-is-visible-to-readers",
     ),

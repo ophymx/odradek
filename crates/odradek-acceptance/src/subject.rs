@@ -216,6 +216,10 @@ pub enum Fault {
     /// Echo a different topic id than the fetch requested.
     FetchWrongTopicId,
 
+    /// Accept a transactional write carrying a superseded epoch at the
+    /// partition leader, so a zombie's records land inside the
+    /// transaction its successor commits.
+    ProduceAcceptsFencedEpoch,
     /// Report a committed transaction as aborted, so every reader
     /// throws its records away on purpose.
     TxnCommitMarksAborted,
@@ -301,6 +305,7 @@ impl Fault {
         Fault::FetchCorruptBatch,
         Fault::ProduceTopicIdUnknown,
         Fault::FetchWrongTopicId,
+        Fault::ProduceAcceptsFencedEpoch,
         Fault::TxnCommitMarksAborted,
         Fault::TxnOffsetsPublishImmediately,
         Fault::ProduceRewritesCompressedBatches,
@@ -1945,10 +1950,10 @@ fn produce_exchange(
 
     // Taken before the logs are borrowed mutably; a produce never
     // changes which partitions were announced.
-    let txns_snapshot: HashMap<String, HashSet<(String, i32)>> = state
+    let txns_snapshot: TxnSnapshot = state
         .txns
         .iter()
-        .map(|(id, txn)| (id.clone(), txn.partitions.clone()))
+        .map(|(id, txn)| (id.clone(), (txn.epoch, txn.partitions.clone())))
         .collect();
 
     let mut responses = Vec::new();
@@ -1982,6 +1987,24 @@ fn produce_exchange(
             // A stamped batch is the broker's to recognize: the same
             // producer, epoch and sequence twice is one write, and a
             // sequence that skips ahead is a gap it cannot fill.
+            // Fencing first: a producer that has been replaced is not
+            // owed an opinion about its sequence numbers, and telling it
+            // the sequence is wrong sends it to rebuild a stamp it is
+            // no longer entitled to use at all.
+            if let Some(code) = fenced_at_the_leader(
+                &txns_snapshot,
+                request.transactional_id.as_deref(),
+                batches.first(),
+                faults,
+            ) {
+                let mut entry = PartitionProduceResponse::default();
+                entry.index = partition.index;
+                entry.error_code = code.0;
+                entry.base_offset = -1;
+                entry.log_append_time_ms = -1;
+                partition_responses.push(entry);
+                continue;
+            }
             if let Some(code) = stamped_verdict(log, batches.first(), faults) {
                 let mut entry = PartitionProduceResponse::default();
                 entry.index = partition.index;
@@ -2016,10 +2039,7 @@ fn produce_exchange(
             // TxnUnannouncedWriteEscapes it does neither, and they are
             // covered by nothing.
             if request.transactional_id.is_some() {
-                let producer_id = records::decode_set(&mut set.clone())
-                    .ok()?
-                    .first()
-                    .map_or(-1, |batch| batch.producer_id);
+                let producer_id = batches.first().map_or(-1, |batch| batch.producer_id);
                 let announced = state_txn_has_partition(
                     &txns_snapshot,
                     request.transactional_id.as_deref(),
@@ -2449,16 +2469,37 @@ fn txn_epoch_check(
 /// The fetch isolation level that filters uncommitted data.
 const READ_COMMITTED: i8 = 1;
 
+/// What a produce needs to know about the open transactions, taken
+/// before the logs are borrowed mutably: each id's current epoch and
+/// the partitions it has announced.
+type TxnSnapshot = HashMap<String, (i16, HashSet<(String, i32)>)>;
+
 /// Whether `partition` was announced for the transaction `id` names.
 fn state_txn_has_partition(
-    snapshot: &HashMap<String, HashSet<(String, i32)>>,
+    snapshot: &TxnSnapshot,
     transactional_id: Option<&str>,
     topic: &str,
     partition: i32,
 ) -> bool {
     transactional_id
         .and_then(|id| snapshot.get(id))
-        .is_some_and(|partitions| partitions.contains(&(topic.to_owned(), partition)))
+        .is_some_and(|(_, partitions)| partitions.contains(&(topic.to_owned(), partition)))
+}
+
+/// Whether the partition leader should refuse this write because the
+/// epoch it carries has been superseded.
+fn fenced_at_the_leader(
+    snapshot: &TxnSnapshot,
+    transactional_id: Option<&str>,
+    batch: Option<&records::RecordBatch>,
+    faults: &[Fault],
+) -> Option<ErrorCode> {
+    if faults.contains(&Fault::ProduceAcceptsFencedEpoch) {
+        return None;
+    }
+    let batch = batch?;
+    let (epoch, _) = snapshot.get(transactional_id?)?;
+    (batch.producer_epoch < *epoch).then_some(ErrorCode::PRODUCER_FENCED)
 }
 
 /// The last stable offset this partition reports.

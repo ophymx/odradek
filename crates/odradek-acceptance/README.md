@@ -153,6 +153,12 @@ the ones where the *wrong* answer is plausible:
   high watermark. A broker that lets them meet shows `read_committed`
   consumers records that may still be aborted — the one thing they
   asked not to see.
+- A fenced producer cannot *write*. Refusing its bookkeeping calls at
+  the coordinator is only inconvenient for a zombie; the partition
+  leader is different code and the one that matters, because records it
+  accepts land inside a transaction the live producer is about to
+  commit. The successor then commits work it never did, leaving no
+  trace anywhere.
 - A committed transaction becomes readable and is *not* named in the
   aborted list. Two quiet ways to get it wrong: a stable offset that
   never moves past the records leaves a consumer blocked on a

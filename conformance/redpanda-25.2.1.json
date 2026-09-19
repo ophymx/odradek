@@ -45,6 +45,7 @@
     "sasl/scram-server-proves-itself": "skipped",
     "txn/abort-is-reported-to-readers": "pass",
     "txn/commit-is-visible-to-readers": "pass",
+    "txn/fenced-producer-cannot-produce": "pass",
     "txn/init-bumps-the-epoch": "pass",
     "txn/offsets-wait-for-the-commit": "pass",
     "txn/open-transaction-holds-the-stable-offset": "pass",

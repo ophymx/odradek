@@ -381,6 +381,13 @@ pub static SERVER_CHECKS: &[Check] = &[
         runner: Runner::Server(|ctx| Box::pin(txn_open_transaction_holds_the_stable_offset(ctx))),
     },
     Check {
+        id: "txn/fenced-producer-cannot-produce",
+        requirement: "refuses a transactional produce carrying a superseded \
+                      epoch at the partition leader, not only at the \
+                      coordinator",
+        runner: Runner::Server(|ctx| Box::pin(txn_fenced_producer_cannot_produce(ctx))),
+    },
+    Check {
         id: "txn/commit-is-visible-to-readers",
         requirement: "moves the stable offset past a committed transaction's \
                       records and does not name it in the aborted list, so \
@@ -6288,4 +6295,92 @@ async fn txn_offset_commit(
         .first()
         .and_then(|t| t.partitions.first())
         .map_or(ErrorCode::NONE, |p| ErrorCode(p.error_code)))
+}
+
+/// A fenced producer must not be able to write records.
+///
+/// `txn/stale-epoch-is-fenced` asks the *coordinator* to refuse a
+/// superseded epoch. This asks the partition leader, which is different
+/// code and the one that matters more: the coordinator refusing a
+/// bookkeeping call is inconvenient for a zombie, but a leader that
+/// accepts its records puts them inside a transaction the live producer
+/// is about to commit. The successor then commits work it never did,
+/// which is the exact failure fencing exists to prevent, and it leaves
+/// no trace anywhere.
+async fn txn_fenced_producer_cannot_produce(ctx: &ServerCtx) -> Verdict {
+    let versions = match txn_versions(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let produced = match produce_flow(ctx, "txnzombie", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    let topic = produced.topic.clone();
+    let mut conn = produced.conn;
+    let id = unique_transactional_id("zombie");
+
+    let first = match init_producer_id(ctx, &mut conn, versions.init, &id, 1_200).await {
+        Ok(r) => r,
+        Err(e) => return e.context("InitProducerId (first)").into_verdict(),
+    };
+    let zombie = TxnActor::new(&id, &first);
+    // The doomed producer announces its partition while it still can,
+    // so what the leader refuses later is the write itself rather than
+    // an unannounced partition.
+    if let Err(verdict) =
+        open_transaction(ctx, &mut conn, &versions, zombie, &topic, 0, 1_220).await
+    {
+        return verdict;
+    }
+
+    let second = match init_producer_id(ctx, &mut conn, versions.init, &id, 1_260).await {
+        Ok(r) => r,
+        Err(e) => return e.context("InitProducerId (second)").into_verdict(),
+    };
+    if second.producer_epoch <= first.producer_epoch {
+        return Verdict::Skipped {
+            reason: "the epoch never advanced, so there is no fenced producer to refuse \
+                     (txn/init-bumps-the-epoch reports that)"
+                .into(),
+        };
+    }
+
+    // The zombie writes on, at the epoch it still believes it holds.
+    let outcome = produce_stamped(
+        &mut conn,
+        versions.produce,
+        ProduceStamp::transactional(zombie, 1),
+        &topic,
+        0,
+        1_280,
+    )
+    .await;
+    // Whatever happens, do not leave the successor's transaction open
+    // behind this check.
+    let live = TxnActor::new(&id, &second);
+    let _ = end_txn(&mut conn, versions.end, live, false, 1_299).await;
+
+    match outcome {
+        Ok((code, _)) if is_fenced(code) => Verdict::Pass,
+        // Refusing for any reason keeps the records out, which is the
+        // thing that matters; the code is the secondary question.
+        Ok((code, _)) if !code.is_ok() => Verdict::Fail {
+            details: format!(
+                "a produce at the superseded epoch {} was refused with {code} rather than a \
+                 fencing code, so a zombie producer is told its stamp is wrong without being \
+                 told it has been replaced",
+                first.producer_epoch
+            ),
+        },
+        Ok((_, offset)) => Verdict::Fail {
+            details: format!(
+                "a produce at the superseded epoch {} was accepted at offset {offset} while \
+                 epoch {} holds the id; those records sit inside a transaction the live \
+                 producer is about to commit",
+                first.producer_epoch, second.producer_epoch
+            ),
+        },
+        Err(e) => e.context("Produce (fenced)").into_verdict(),
+    }
 }
