@@ -799,3 +799,182 @@ async fn a_hub_without_a_gate_denies_everything() {
     log.append(TOPIC, 0, None, b"opened", Vec::new());
     assert_eq!(collect(&mut sub, 1).await, vec![(0, "opened".into())]);
 }
+
+/// A topic subscribe that runs into the pump ceiling must not leave the
+/// pumps it managed to start behind.
+///
+/// It spawns one pump per partition in order, so a topic with more
+/// partitions than the hub has room for gets part way and then fails.
+/// The pumps it already started stay in the map, counting against the
+/// ceiling until they idle out — so one refused request can hold the
+/// hub's whole budget against every other topic, and a client that
+/// retries holds it indefinitely.
+#[tokio::test]
+async fn a_refused_topic_subscribe_leaves_no_pumps_behind() {
+    let log = MemoryLog::with_partitions(4);
+    let hub = SharedHub::from_hub(
+        Hub::new(MemoryFactory::new(log.clone()), PumpConfig::default())
+            .allow_all_topics()
+            .with_max_pumps(2),
+    );
+
+    let refused = hub
+        .subscribe_topic(
+            TOPIC,
+            odradek_web_core::TopicPosition::Latest,
+            Filter::default(),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(HubError::AtCapacity)),
+        "{:?}",
+        refused.map(|_| ())
+    );
+    assert_eq!(
+        hub.active_pumps().await,
+        0,
+        "a subscribe that could not be served should not hold pump slots"
+    );
+
+    // The same through the owned hub, which walks the partitions one at
+    // a time rather than acquiring them all under one lock.
+    let mut owned = Hub::new(MemoryFactory::new(log), PumpConfig::default())
+        .allow_all_topics()
+        .with_max_pumps(2);
+    let refused = owned
+        .subscribe_topic(
+            TOPIC,
+            odradek_web_core::TopicPosition::Latest,
+            Filter::default(),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(HubError::AtCapacity)),
+        "{:?}",
+        refused.map(|_| ())
+    );
+    assert_eq!(owned.active_partitions().count(), 0);
+}
+
+/// A source that refuses everything below `log_start` the way a broker
+/// refuses a fetch under the retention horizon: a transient error, not
+/// a permanent one, because the topic and the partition are both fine.
+struct TruncatedSource {
+    log_start: i64,
+    fetches: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl RecordSource for TruncatedSource {
+    async fn fetch(
+        &mut self,
+        _topic: &str,
+        _partition: i32,
+        offset: i64,
+    ) -> Result<SourceBatch, SourceError> {
+        if offset < self.log_start {
+            self.fetches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(SourceError::unavailable("offset out of range"));
+        }
+        let mut batch = SourceBatch::default();
+        batch.next_offset = self.log_start;
+        batch.high_watermark = self.log_start;
+        Ok(batch)
+    }
+
+    async fn earliest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
+        Ok(self.log_start)
+    }
+
+    async fn latest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
+        Ok(self.log_start)
+    }
+}
+
+/// Resuming from an offset the source no longer has must end the
+/// stream, not hang it.
+///
+/// This is the ordinary expired-resume-token case: a browser reconnects
+/// with a `Last-Event-ID` older than the topic's retention. The
+/// catch-up fetch fails transiently forever, so the subscriber is never
+/// served and never told, while the pump spends a source round trip on
+/// it every iteration for as long as the client stays connected.
+#[tokio::test]
+async fn an_offset_below_the_log_start_ends_the_stream() {
+    let fetches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = fetches.clone();
+
+    struct Factory {
+        fetches: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl SourceFactory for Factory {
+        type Source = TruncatedSource;
+        async fn create(&self, _topic: &str, _partition: i32) -> Result<Self::Source, SourceError> {
+            Ok(TruncatedSource {
+                log_start: 1_000,
+                fetches: self.fetches.clone(),
+            })
+        }
+        async fn partitions(&self, _topic: &str) -> Result<Vec<i32>, SourceError> {
+            Ok(vec![0])
+        }
+    }
+
+    let mut hub = Hub::new(Factory { fetches: counter }, PumpConfig::default()).allow_all_topics();
+    let mut sub = hub
+        .subscribe(TOPIC, 0, Position::Offset(0), Filter::default())
+        .await
+        .unwrap();
+
+    let outcome = tokio::time::timeout(Duration::from_secs(2), sub.recv()).await;
+    let attempts = fetches.load(std::sync::atomic::Ordering::Relaxed);
+    match outcome {
+        Ok(Some(Err(_)) | None) => {}
+        Ok(Some(Ok(event))) => panic!("unexpected event at {}", event.offset),
+        Err(_) => panic!(
+            "the stream neither delivered nor ended; the pump retried the \
+             out-of-range fetch {attempts} times and the client was told nothing"
+        ),
+    }
+}
+
+/// Dropping a topic subscription must let its pumps go idle, even when
+/// the partitions are quiet.
+///
+/// A topic stream is a forwarder task per partition feeding one merged
+/// channel. A forwarder parked in `recv()` still *holds* its
+/// partition's receiver, so the pump sees a subscriber that is very
+/// much alive — and on a quiet partition nothing ever arrives to make
+/// the forwarder notice the merged stream is gone. The pump then never
+/// idles, which is every disconnected browser on a low-traffic topic.
+#[tokio::test]
+async fn dropping_a_topic_stream_releases_quiet_pumps() {
+    let log = MemoryLog::with_partitions(2);
+    let mut config = PumpConfig::default();
+    config.idle_shutdown = Some(Duration::from_millis(100));
+    let hub =
+        SharedHub::from_hub(Hub::new(MemoryFactory::new(log.clone()), config).allow_all_topics());
+
+    let stream = hub
+        .subscribe_topic(
+            TOPIC,
+            odradek_web_core::TopicPosition::Latest,
+            Filter::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hub.active_pumps().await, 2);
+
+    // The client goes away without another record ever being produced.
+    drop(stream);
+
+    // Well past idle_shutdown, with a reap to collect the exited pumps
+    // the way a subscribe would.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    hub.reap_exited_pumps().await;
+    assert_eq!(
+        hub.active_pumps().await,
+        0,
+        "pumps for a departed subscriber should have idled out"
+    );
+}

@@ -55,7 +55,7 @@
 //! exactly the reconnect-storm case. Topic-level subscribes go one step
 //! further and run their per-partition round trips concurrently.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -279,13 +279,26 @@ impl<F: SourceFactory> Hub<F> {
         filter: Filter,
     ) -> Result<TopicSubscription, HubError> {
         let partitions = self.partitions_of(topic).await?;
+        // A topic subscribe is all or nothing, so the pumps it starts
+        // are its own to clean up: it walks the partitions in order, and
+        // one that fails part way — at the pump ceiling, most likely —
+        // would otherwise leave the earlier ones holding slots against
+        // every other topic until they idle out.
+        let before = self.running_partitions(topic, &partitions);
         let mut subscriptions = Vec::with_capacity(partitions.len());
         for partition in &partitions {
             let start = partition_position(&position, *partition);
-            subscriptions.push(
-                self.subscribe(topic, *partition, start, filter.clone())
-                    .await?,
-            );
+            match self
+                .subscribe(topic, *partition, start, filter.clone())
+                .await
+            {
+                Ok(subscription) => subscriptions.push(subscription),
+                Err(e) => {
+                    drop(subscriptions);
+                    self.release_new(topic, &partitions, &before).await;
+                    return Err(e);
+                }
+            }
         }
         Ok(merge(
             topic,
@@ -293,6 +306,33 @@ impl<F: SourceFactory> Hub<F> {
             subscriptions,
             self.config.queue_capacity,
         ))
+    }
+
+    /// Which of `partitions` already have a pump running.
+    fn running_partitions(&self, topic: &str, partitions: &[i32]) -> HashSet<i32> {
+        partitions
+            .iter()
+            .copied()
+            .filter(|partition| self.pumps.contains_key(&(topic.to_owned(), *partition)))
+            .collect()
+    }
+
+    /// Stop and forget the pumps for `partitions` that were not already
+    /// running when `before` was taken.
+    ///
+    /// Only reached with exclusive access to the map (`&mut self`, or
+    /// the shared hub's lock held across the whole acquire loop), so a
+    /// pump another subscriber attached to in the meantime cannot be
+    /// one of these.
+    async fn release_new(&mut self, topic: &str, partitions: &[i32], before: &HashSet<i32>) {
+        for partition in partitions {
+            if before.contains(partition) {
+                continue;
+            }
+            if let Some(handle) = self.pumps.remove(&(topic.to_owned(), *partition)) {
+                handle.shutdown().await;
+            }
+        }
     }
 
     /// Subscribe to one partition, starting the pump on first use.
@@ -526,9 +566,24 @@ fn merge(
         let merged = merged.clone();
         tokio::spawn(async move {
             let mut receiver = subscription.into_receiver();
-            while let Some(item) = receiver.recv().await {
-                if merged.send(item).await.is_err() {
-                    return; // merged stream dropped
+            loop {
+                tokio::select! {
+                    // Watched rather than discovered on the next send:
+                    // a forwarder parked in `recv()` still holds its
+                    // partition's receiver, so the pump sees a live
+                    // subscriber. On a quiet partition nothing ever
+                    // arrives to make it notice the merged stream is
+                    // gone, and the pump never idles — which is every
+                    // disconnected client on a low-traffic topic.
+                    () = merged.closed() => return,
+                    item = receiver.recv() => match item {
+                        Some(item) => {
+                            if merged.send(item).await.is_err() {
+                                return; // merged stream dropped
+                            }
+                        }
+                        None => return, // this partition's stream ended
+                    },
                 }
             }
         });
@@ -655,8 +710,18 @@ impl<F: SourceFactory> SharedHub<F> {
         let mut handles = Vec::with_capacity(partitions.len());
         let capacity = {
             let mut hub = self.hub.lock().await;
+            // Rolled back under the same lock the pumps were created
+            // under: a topic subscribe that cannot be served in full
+            // must not hold slots for the partitions it did reach.
+            let before = hub.running_partitions(topic, &partitions);
             for partition in &partitions {
-                handles.push(hub.acquire(topic, *partition).await?);
+                match hub.acquire(topic, *partition).await {
+                    Ok(entry) => handles.push(entry),
+                    Err(e) => {
+                        hub.release_new(topic, &partitions, &before).await;
+                        return Err(e);
+                    }
+                }
             }
             hub.config.queue_capacity
         };

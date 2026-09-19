@@ -65,8 +65,17 @@ pub struct PumpConfig {
     pub idle_poll: Duration,
     /// Pause after a transient source error.
     pub error_backoff: Duration,
-    /// Consecutive transient source errors before the pump gives up and
-    /// closes every subscription with a terminal [`StreamError`].
+    /// Consecutive transient source errors before giving up.
+    ///
+    /// Bounds two different failures with one number. On the live path
+    /// it is the pump's own budget: running out closes *every*
+    /// subscription with a terminal [`StreamError`]. On a catch-up
+    /// fetch it is per subscriber, because the usual cause — a cursor
+    /// below what the source still holds, which is what an expired
+    /// resume token looks like — is that subscriber's problem alone;
+    /// running out ends that one stream and leaves the pump serving
+    /// everybody else.
+    ///
     /// Permanent errors (`NotFound`, `Auth`) skip the budget entirely.
     pub max_consecutive_errors: u32,
     /// How long a pump lingers with zero subscribers before exiting
@@ -334,6 +343,15 @@ struct SubState {
     filter: Filter,
     mode: Mode,
     closed: bool,
+    /// Consecutive failures of *this subscriber's* catch-up fetch.
+    ///
+    /// Separate from the pump's own budget because the failure it
+    /// bounds is per subscriber: a cursor below what the source still
+    /// holds fails forever while the live path and every other
+    /// subscriber are fine. Most often that is an expired resume
+    /// token — a client reconnecting with a position the topic's
+    /// retention has since passed.
+    catch_up_errors: u32,
 }
 
 impl SubState {
@@ -396,6 +414,7 @@ impl Subscribers {
             filter,
             mode,
             closed: false,
+            catch_up_errors: 0,
         });
     }
 
@@ -430,6 +449,21 @@ impl Subscribers {
         self.rotor = id + 1;
         Some(index)
     }
+}
+
+/// End one subscriber's stream with a terminal error, leaving the pump
+/// and every other subscriber running.
+///
+/// Sent from its own task for the same reason [`fail_subs`] does it: the
+/// queue may be full, and the pump must not block on a reader that has
+/// stopped reading.
+fn fail_one(sub: &mut SubState, error: &SourceError) {
+    sub.closed = true;
+    let sender = sub.sender.clone();
+    let error = StreamError::from(error.clone());
+    tokio::spawn(async move {
+        let _ = sender.send(Err(error)).await;
+    });
 }
 
 /// Deliver a terminal error to every subscriber, each on its own task
@@ -562,8 +596,14 @@ async fn run_pump<S: RecordSource>(
             advance_from_ring(sub, &ring, live_edge);
         }
         if let Some(index) = subs.next_fetch(ring_start, live_edge) {
-            let outcome =
-                fetch_catch_up(&mut subs.list[index], &mut source, &topic, partition).await;
+            let outcome = fetch_catch_up(
+                &mut subs.list[index],
+                &mut source,
+                &topic,
+                partition,
+                &config,
+            )
+            .await;
             if let Err(e) = outcome {
                 fail_subs(subs.take(), &e);
                 return;
@@ -682,13 +722,22 @@ fn advance_from_ring(sub: &mut SubState, ring: &VecDeque<SharedEvent>, live_edge
 
 /// Spend one source fetch on a subscriber that has fallen behind the
 /// ring. Stops early (without losing its place) when the subscriber's
-/// queue fills. A permanent source error is returned to end the whole
-/// pump; a transient one is left for the next iteration's turn.
+/// queue fills.
+///
+/// A permanent source error is returned to end the whole pump. A
+/// transient one is left for the next iteration's turn, but only
+/// [`PumpConfig::max_consecutive_errors`] times: a cursor the source
+/// cannot serve — below its retention horizon, most often — fails
+/// transiently *forever*, and without the budget the subscriber is
+/// never served, never told, and costs a source round trip every
+/// iteration for as long as it stays connected. The budget ends that
+/// one stream with the reason and leaves the pump running.
 async fn fetch_catch_up<S: RecordSource>(
     sub: &mut SubState,
     source: &mut S,
     topic: &str,
     partition: i32,
+    config: &PumpConfig,
 ) -> Result<(), SourceError> {
     let Mode::CatchingUp { cursor } = sub.mode else {
         return Ok(());
@@ -697,6 +746,7 @@ async fn fetch_catch_up<S: RecordSource>(
     // gaps, control batches) via next_offset.
     match source.fetch(topic, partition, cursor).await {
         Ok(batch) => {
+            sub.catch_up_errors = 0;
             let events: Vec<SharedEvent> = batch.events.into_iter().map(SharedEvent::new).collect();
             // Sources answer from `cursor`, but skipping any earlier
             // events they do return costs one binary search.
@@ -713,8 +763,20 @@ async fn fetch_catch_up<S: RecordSource>(
         }
         Err(e) if e.is_permanent() => return Err(e),
         Err(e) => {
-            // Transient; the next pump iteration retries.
-            tracing::debug!(topic, partition, error = %e, "catch-up fetch failed");
+            sub.catch_up_errors += 1;
+            if sub.catch_up_errors > config.max_consecutive_errors {
+                tracing::warn!(
+                    topic,
+                    partition,
+                    error = %e,
+                    attempts = sub.catch_up_errors,
+                    "ending a subscriber whose catch-up cursor the source will not serve"
+                );
+                fail_one(sub, &e);
+            } else {
+                // Transient; the next pump iteration retries.
+                tracing::debug!(topic, partition, error = %e, "catch-up fetch failed");
+            }
         }
     }
     Ok(())
