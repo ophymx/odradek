@@ -22,9 +22,15 @@
 //!    response frame is a correlation id and then a body whose header
 //!    shape depends on the *request's* api key and version — which the
 //!    response does not carry. So the proxy remembers, per correlation
-//!    id, what went out. That is [`header::response_header_version`],
-//!    including the ApiVersions quirk where the error response is
-//!    always header v0 whatever the request asked for.
+//!    id, the version each Metadata request went out at. That is
+//!    [`header::response_header_version`], including the ApiVersions
+//!    quirk where the error response is always header v0 whatever the
+//!    request asked for.
+//!
+//!    Only Metadata is remembered, and the reason is worth knowing
+//!    before you write your own: an `acks=0` produce is answered with
+//!    silence, so a proxy that recorded every request would keep those
+//!    entries forever and leak on every fire-and-forget write.
 //!
 //! 2. **Metadata advertises where to connect next.** A client asks for
 //!    metadata, is told the brokers' real addresses, and connects to
@@ -65,18 +71,18 @@ use odradek_protocol::messages::response_header::ResponseHeader;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 
-/// What a request was, so its response can be read.
-#[derive(Clone, Copy)]
-struct Pending {
-    api_key: i16,
-    api_version: i16,
-}
-
-/// Correlation id → the request that is still outstanding for it.
+/// Correlation ids of Metadata requests still awaiting an answer, and
+/// the version each was asked at.
 ///
-/// A client may have many in flight; brokers answer a connection in
-/// order, but nothing here depends on that.
-type Outstanding = Arc<Mutex<HashMap<i32, Pending>>>;
+/// Only Metadata, because Metadata is the only response this proxy
+/// interprets — everything else is forwarded without being looked at,
+/// so there is nothing to remember about it. That is not only
+/// economy. A produce with `acks=0` is answered with *silence*: the
+/// broker sends nothing at all, by design. A proxy that recorded every
+/// request would keep those entries for the life of the connection and
+/// leak a little on every fire-and-forget write. Remembering only what
+/// has to be remembered makes the leak impossible rather than rare.
+type Outstanding = Arc<Mutex<HashMap<i32, i16>>>;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -166,21 +172,20 @@ async fn pump_requests(
         let Some(payload) = read_frame(&mut from).await? else {
             return Ok(());
         };
-        // The first four bytes are api key and version; that is all the
-        // proxy needs from a request it is not rewriting.
+        // The first four bytes are the api key and version, which is
+        // all the proxy needs to decide whether it cares at all.
         if payload.len() >= 4 {
             let api_key = i16::from_be_bytes([payload[0], payload[1]]);
             let api_version = i16::from_be_bytes([payload[2], payload[3]]);
-            if let Some(hv) = header::request_header_version(api_key, api_version) {
-                let mut head = payload.clone();
-                if let Ok(header) = RequestHeader::decode(&mut head, hv) {
-                    outstanding.lock().unwrap().insert(
-                        header.correlation_id,
-                        Pending {
-                            api_key,
-                            api_version,
-                        },
-                    );
+            if api_key == MetadataResponse::API_KEY {
+                if let Some(hv) = header::request_header_version(api_key, api_version) {
+                    let mut head = payload.clone();
+                    if let Ok(header) = RequestHeader::decode(&mut head, hv) {
+                        outstanding
+                            .lock()
+                            .unwrap()
+                            .insert(header.correlation_id, api_version);
+                    }
                 }
             }
         }
@@ -202,23 +207,23 @@ async fn pump_responses(
             return Ok(());
         };
         let correlation = frame::peek_correlation_id(&payload)?;
-        let pending = outstanding.lock().unwrap().remove(&correlation);
+        // Present only for Metadata; everything else falls through
+        // without being parsed.
+        let asked_at = outstanding.lock().unwrap().remove(&correlation);
 
-        let forwarded = match pending {
-            Some(pending) if pending.api_key == MetadataResponse::API_KEY => {
-                match rewrite_metadata(&payload, pending.api_version, &host, port) {
-                    Ok(rewritten) => rewritten,
-                    // A Metadata shape this crate cannot read is still
-                    // the broker's answer; forwarding it unchanged is
-                    // wrong for routing but better than dropping the
-                    // client's connection over it.
-                    Err(e) => {
-                        eprintln!("metadata v{}: {e}", pending.api_version);
-                        payload
-                    }
+        let forwarded = match asked_at {
+            Some(api_version) => match rewrite_metadata(&payload, api_version, &host, port) {
+                Ok(rewritten) => rewritten,
+                // A Metadata shape this crate cannot read is still the
+                // broker's answer; forwarding it unchanged is wrong for
+                // routing but better than dropping the client's
+                // connection over it.
+                Err(e) => {
+                    eprintln!("metadata v{api_version}: {e}");
+                    payload
                 }
-            }
-            _ => payload,
+            },
+            None => payload,
         };
         write_frame(&mut to, &forwarded).await?;
     }
