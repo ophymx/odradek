@@ -11,6 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 
 use bytes::{Bytes, BytesMut};
+use odradek_protocol::messages::add_offsets_to_txn_request::AddOffsetsToTxnRequest;
+use odradek_protocol::messages::add_offsets_to_txn_response::AddOffsetsToTxnResponse;
 use odradek_protocol::messages::add_partitions_to_txn_request::AddPartitionsToTxnRequest;
 use odradek_protocol::messages::add_partitions_to_txn_response::{
     AddPartitionsToTxnPartitionResult, AddPartitionsToTxnResponse, AddPartitionsToTxnTopicResult,
@@ -78,6 +80,10 @@ use odradek_protocol::messages::sasl_handshake_request::SaslHandshakeRequest;
 use odradek_protocol::messages::sasl_handshake_response::SaslHandshakeResponse;
 use odradek_protocol::messages::sync_group_request::SyncGroupRequest;
 use odradek_protocol::messages::sync_group_response::SyncGroupResponse;
+use odradek_protocol::messages::txn_offset_commit_request::TxnOffsetCommitRequest;
+use odradek_protocol::messages::txn_offset_commit_response::{
+    TxnOffsetCommitResponse, TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic,
+};
 use odradek_protocol::records;
 use odradek_protocol::{ErrorCode, frame, header};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -210,6 +216,13 @@ pub enum Fault {
     /// Echo a different topic id than the fetch requested.
     FetchWrongTopicId,
 
+    /// Report a committed transaction as aborted, so every reader
+    /// throws its records away on purpose.
+    TxnCommitMarksAborted,
+    /// Publish an offset committed inside a transaction straight away,
+    /// so the input reads as processed while the output can still be
+    /// thrown away.
+    TxnOffsetsPublishImmediately,
     /// Re-stamp a compressed batch before storing it, rewriting bytes
     /// the producer's crc covered. The records still decode, which is
     /// what makes it quiet.
@@ -288,6 +301,8 @@ impl Fault {
         Fault::FetchCorruptBatch,
         Fault::ProduceTopicIdUnknown,
         Fault::FetchWrongTopicId,
+        Fault::TxnCommitMarksAborted,
+        Fault::TxnOffsetsPublishImmediately,
         Fault::ProduceRewritesCompressedBatches,
         Fault::FetchIgnoresMaxWait,
         Fault::MetadataLeaderIsUnknown,
@@ -428,6 +443,16 @@ fn advertised_keys() -> Vec<ApiVersion> {
             EndTxnRequest::MAX_VERSION,
         ),
         (
+            AddOffsetsToTxnRequest::API_KEY,
+            AddOffsetsToTxnRequest::MIN_VERSION,
+            AddOffsetsToTxnRequest::MAX_VERSION,
+        ),
+        (
+            TxnOffsetCommitRequest::API_KEY,
+            TxnOffsetCommitRequest::MIN_VERSION,
+            TxnOffsetCommitRequest::MAX_VERSION,
+        ),
+        (
             OffsetCommitRequest::API_KEY,
             OffsetCommitRequest::MIN_VERSION,
             OffsetCommitRequest::MAX_VERSION,
@@ -537,6 +562,10 @@ struct TxnState {
     epoch: i16,
     /// Partitions announced for the transaction currently open.
     partitions: HashSet<(String, i32)>,
+    /// Offsets committed inside the open transaction, held back until
+    /// it commits. This is the exactly-once half: the input is not
+    /// marked processed while the output can still be thrown away.
+    pending_offsets: HashMap<(String, String, i32), (i64, Option<String>)>,
 }
 
 /// Connection-scoped broker state — the suite's produce/fetch flow uses
@@ -758,6 +787,12 @@ async fn handle_connection(mut stream: TcpStream, faults: Vec<Fault>) {
                 add_partitions_to_txn_exchange(frame, api_version, &faults, &mut state)
             }
             EndTxnRequest::API_KEY => end_txn_exchange(frame, api_version, &faults, &mut state),
+            AddOffsetsToTxnRequest::API_KEY => {
+                add_offsets_to_txn_exchange(frame, api_version, &faults, &mut state)
+            }
+            TxnOffsetCommitRequest::API_KEY => {
+                txn_offset_commit_exchange(frame, api_version, &faults, &mut state)
+            }
             SaslHandshakeRequest::API_KEY => {
                 sasl_handshake_exchange(frame, api_version, &faults, &mut state)
             }
@@ -2351,8 +2386,28 @@ fn end_txn_exchange(
             // stable offset ends up past the transaction's records
             // rather than at them.
             log.next_offset += 1;
-            if !request.committed && !faults.contains(&Fault::TxnAbortListOmitted) {
+            let disown = if faults.contains(&Fault::TxnCommitMarksAborted) {
+                // Marker-type confusion: a committed transaction
+                // reported as aborted, so every reader throws its
+                // records away on purpose.
+                true
+            } else {
+                !request.committed
+            };
+            if disown && !faults.contains(&Fault::TxnAbortListOmitted) {
                 log.aborted.push((producer_id, first_offset));
+            }
+        }
+        // The offsets go with the transaction: published on commit,
+        // dropped on abort.
+        let pending = state
+            .txns
+            .get_mut(&request.transactional_id)
+            .map(|txn| std::mem::take(&mut txn.pending_offsets))
+            .unwrap_or_default();
+        if request.committed {
+            for (key, value) in pending {
+                state.committed.insert(key, value);
             }
         }
         if let Some(txn) = state.txns.get_mut(&request.transactional_id) {
@@ -2646,4 +2701,109 @@ fn rewrite_compressed(
     let mut out = BytesMut::new();
     rewritten.encode_to(&mut out).ok()?;
     Some(out.freeze())
+}
+
+/// AddOffsetsToTxn: the group's offsets are part of this transaction.
+///
+/// Nothing to record beyond the epoch check — the offsets themselves
+/// arrive with TxnOffsetCommit — but a coordinator that answered
+/// without checking would let a fenced producer enrol a group.
+fn add_offsets_to_txn_exchange(
+    mut frame: Bytes,
+    api_version: i16,
+    faults: &[Fault],
+    state: &mut ConnState,
+) -> Option<BytesMut> {
+    if !(AddOffsetsToTxnRequest::MIN_VERSION..=AddOffsetsToTxnRequest::MAX_VERSION)
+        .contains(&api_version)
+    {
+        return None;
+    }
+    let hv = header::request_header_version(AddOffsetsToTxnRequest::API_KEY, api_version)?;
+    let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
+    let request = AddOffsetsToTxnRequest::decode(&mut frame, api_version).ok()?;
+
+    let code = txn_epoch_check(
+        state,
+        &request.transactional_id,
+        request.producer_epoch,
+        faults,
+    );
+    let mut resp = AddOffsetsToTxnResponse::default();
+    resp.error_code = code.0;
+    frame_response(
+        req_header.correlation_id,
+        response_header_version(AddOffsetsToTxnRequest::API_KEY, api_version),
+        |out| resp.encode(out, api_version).unwrap(),
+        false,
+    )
+}
+
+/// TxnOffsetCommit: hold the offset with the transaction.
+fn txn_offset_commit_exchange(
+    mut frame: Bytes,
+    api_version: i16,
+    faults: &[Fault],
+    state: &mut ConnState,
+) -> Option<BytesMut> {
+    if !(TxnOffsetCommitRequest::MIN_VERSION..=TxnOffsetCommitRequest::MAX_VERSION)
+        .contains(&api_version)
+    {
+        return None;
+    }
+    let hv = header::request_header_version(TxnOffsetCommitRequest::API_KEY, api_version)?;
+    let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
+    let request = TxnOffsetCommitRequest::decode(&mut frame, api_version).ok()?;
+
+    let code = txn_epoch_check(
+        state,
+        &request.transactional_id,
+        request.producer_epoch,
+        faults,
+    );
+    if code.is_ok() {
+        let immediate = faults.contains(&Fault::TxnOffsetsPublishImmediately);
+        for topic in &request.topics {
+            for p in &topic.partitions {
+                let key = (
+                    request.group_id.clone(),
+                    topic.name.clone(),
+                    p.partition_index,
+                );
+                let value = (p.committed_offset, p.committed_metadata.clone());
+                if immediate {
+                    state.committed.insert(key, value);
+                } else if let Some(txn) = state.txns.get_mut(&request.transactional_id) {
+                    txn.pending_offsets.insert(key, value);
+                }
+            }
+        }
+    }
+
+    let mut resp = TxnOffsetCommitResponse::default();
+    resp.topics = request
+        .topics
+        .iter()
+        .map(|topic| {
+            let mut out = TxnOffsetCommitResponseTopic::default();
+            out.name = topic.name.clone();
+            out.partitions = topic
+                .partitions
+                .iter()
+                .map(|p| {
+                    let mut entry = TxnOffsetCommitResponsePartition::default();
+                    entry.partition_index = p.partition_index;
+                    entry.error_code = code.0;
+                    entry
+                })
+                .collect();
+            out
+        })
+        .collect();
+    frame_response(
+        req_header.correlation_id,
+        response_header_version(TxnOffsetCommitRequest::API_KEY, api_version),
+        |out| resp.encode(out, api_version).unwrap(),
+        false,
+    )
 }

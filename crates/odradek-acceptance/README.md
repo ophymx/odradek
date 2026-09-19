@@ -153,6 +153,17 @@ the ones where the *wrong* answer is plausible:
   high watermark. A broker that lets them meet shows `read_committed`
   consumers records that may still be aborted — the one thing they
   asked not to see.
+- A committed transaction becomes readable and is *not* named in the
+  aborted list. Two quiet ways to get it wrong: a stable offset that
+  never moves past the records leaves a consumer blocked on a
+  transaction that finished, and naming a committed producer as aborted
+  has every client throw its records away on purpose.
+- Offsets committed inside a transaction are held back until it
+  commits. This is exactly-once from the broker's side — a broker that
+  publishes them immediately has the input marked processed while the
+  output can still be thrown away, which is the duplicate-work window
+  transactions exist to close, and it closes silently because every
+  request succeeds.
 - An aborted transaction is *named* in a `read_committed` fetch over
   its records. The records are returned either way, because aborting
   does not unwrite anything; the list is the only thing that tells a

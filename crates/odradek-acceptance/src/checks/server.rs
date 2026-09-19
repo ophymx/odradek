@@ -13,6 +13,8 @@
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use odradek_protocol::messages::add_offsets_to_txn_request::AddOffsetsToTxnRequest;
+use odradek_protocol::messages::add_offsets_to_txn_response::AddOffsetsToTxnResponse;
 use odradek_protocol::messages::add_partitions_to_txn_request::{
     AddPartitionsToTxnRequest, AddPartitionsToTxnTopic,
 };
@@ -69,6 +71,10 @@ use odradek_protocol::messages::sync_group_request::{
     SyncGroupRequest, SyncGroupRequestAssignment,
 };
 use odradek_protocol::messages::sync_group_response::SyncGroupResponse;
+use odradek_protocol::messages::txn_offset_commit_request::{
+    TxnOffsetCommitRequest, TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic,
+};
+use odradek_protocol::messages::txn_offset_commit_response::TxnOffsetCommitResponse;
 use odradek_protocol::records::{Record, RecordBatch, RecordHeader, Records, decode_set};
 use odradek_protocol::{ErrorCode, Message, frame, header};
 
@@ -373,6 +379,20 @@ pub static SERVER_CHECKS: &[Check] = &[
                       while a transaction is open, so read_committed consumers \
                       are not shown records that may yet be aborted",
         runner: Runner::Server(|ctx| Box::pin(txn_open_transaction_holds_the_stable_offset(ctx))),
+    },
+    Check {
+        id: "txn/commit-is-visible-to-readers",
+        requirement: "moves the stable offset past a committed transaction's \
+                      records and does not name it in the aborted list, so \
+                      read_committed consumers can see it",
+        runner: Runner::Server(|ctx| Box::pin(txn_commit_is_visible_to_readers(ctx))),
+    },
+    Check {
+        id: "txn/offsets-wait-for-the-commit",
+        requirement: "holds offsets committed inside a transaction back until it \
+                      commits, so the input is never marked processed while the \
+                      output can still be thrown away",
+        runner: Runner::Server(|ctx| Box::pin(txn_offsets_wait_for_the_commit(ctx))),
     },
     Check {
         id: "txn/abort-is-reported-to-readers",
@@ -5920,4 +5940,352 @@ fn gzip_batch() -> Result<Bytes, String> {
         .encode(&mut out)
         .map_err(|e| format!("encoding the compressed batch: {e}"))?;
     Ok(out.freeze())
+}
+
+/// A committed transaction must become readable, and not read as
+/// aborted.
+///
+/// The counterpart to `txn/abort-is-reported-to-readers`, and the half
+/// a producer is actually waiting on. Two ways to get it wrong and both
+/// are quiet: a stable offset that never moves past the records leaves
+/// a `read_committed` consumer blocked on a transaction that finished,
+/// and naming a committed producer in the aborted list has every client
+/// throw the records away on purpose.
+async fn txn_commit_is_visible_to_readers(ctx: &ServerCtx) -> Verdict {
+    let versions = match txn_versions(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let produced = match produce_flow(ctx, "txncommit", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    let topic = produced.topic.clone();
+    let mut conn = produced.conn;
+    let id = unique_transactional_id("commit");
+
+    let identity = match init_producer_id(ctx, &mut conn, versions.init, &id, 980).await {
+        Ok(r) => r,
+        Err(e) => return e.context("InitProducerId").into_verdict(),
+    };
+    let actor = TxnActor::new(&id, &identity);
+    let first_offset =
+        match open_transaction(ctx, &mut conn, &versions, actor, &topic, 0, 1_000).await {
+            Ok(offset) => offset,
+            Err(verdict) => return verdict,
+        };
+    match end_txn(&mut conn, versions.end, actor, true, 1_020).await {
+        Ok(code) if code.is_ok() => {}
+        Ok(code) => {
+            return Verdict::Fail {
+                details: format!("committing the transaction answered {code}"),
+            };
+        }
+        Err(e) => return e.context("EndTxn").into_verdict(),
+    }
+
+    // The marker lands after EndTxn answers, so the stable offset moves
+    // a moment later; reading immediately would prove nothing.
+    let mut data = None;
+    for attempt in 0..ctx.config.settle_attempts() {
+        if attempt > 0 {
+            tokio::time::sleep(ctx.config.settle_delay).await;
+        }
+        let got = match fetch_partition(
+            &mut conn,
+            versions.fetch,
+            &topic,
+            0,
+            first_offset,
+            READ_COMMITTED,
+            1_040 + i32::try_from(attempt).unwrap_or(0),
+        )
+        .await
+        {
+            Ok(got) => got,
+            Err(e) => return e.context("Fetch (read_committed)").into_verdict(),
+        };
+        let settled = got.last_stable_offset > first_offset;
+        data = Some(got);
+        if settled {
+            break;
+        }
+    }
+    let data = match data {
+        Some(data) => data,
+        None => {
+            return Verdict::Error {
+                details: "no fetch attempts were made".into(),
+            };
+        }
+    };
+    if data.last_stable_offset <= first_offset {
+        return Verdict::Fail {
+            details: format!(
+                "the commit was acknowledged but the stable offset never moved past \
+                 {first_offset} (still {}); a read_committed consumer stays blocked on a \
+                 transaction that finished",
+                data.last_stable_offset
+            ),
+        };
+    }
+    let aborted = data.aborted_transactions.unwrap_or_default();
+    if aborted
+        .iter()
+        .any(|entry| entry.producer_id == identity.producer_id)
+    {
+        return Verdict::Fail {
+            details: format!(
+                "producer {} committed and is still named in the aborted list; every client \
+                 reading this partition throws those records away on purpose",
+                identity.producer_id
+            ),
+        };
+    }
+    if data.records.as_ref().is_none_or(bytes::Bytes::is_empty) {
+        return Verdict::Fail {
+            details: format!(
+                "the transaction committed and the stable offset moved past {first_offset}, \
+                 but a read_committed fetch from there returns nothing"
+            ),
+        };
+    }
+    Verdict::Pass
+}
+
+/// Offsets committed inside a transaction must be held back with it.
+///
+/// This is exactly-once consume-transform-produce from the broker's
+/// side: the offsets go into the same transaction as the output, so
+/// they become visible when it commits and never if it aborts. A broker
+/// that publishes them immediately has the input marked processed while
+/// the output may still be thrown away, which is the duplicate-work
+/// window transactions exist to close — and it closes silently, because
+/// every request succeeds.
+async fn txn_offsets_wait_for_the_commit(ctx: &ServerCtx) -> Verdict {
+    let versions = match txn_versions(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let offsets_version = match negotiate(
+        "AddOffsetsToTxn",
+        match ctx.range(AddOffsetsToTxnRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        AddOffsetsToTxnRequest::MIN_VERSION,
+        ADD_OFFSETS_CLIENT_MAX,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let commit_version = match negotiate(
+        "TxnOffsetCommit",
+        match ctx.range(TxnOffsetCommitRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        TxnOffsetCommitRequest::MIN_VERSION,
+        TXN_OFFSET_COMMIT_CLIENT_MAX,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let (_, fetch_offsets_version) = match offsets_versions(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let produced = match produce_flow(ctx, "txnoffsets", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    let topic = produced.topic.clone();
+    let topic_id = produced.topic_id;
+    let mut conn = produced.conn;
+    let id = unique_transactional_id("txnoffsets");
+    let group = check_group("txnoffsets");
+    if let Err(e) = await_coordinator(ctx, &group).await {
+        return e.into_verdict();
+    }
+
+    let identity = match init_producer_id(ctx, &mut conn, versions.init, &id, 1_060).await {
+        Ok(r) => r,
+        Err(e) => return e.context("InitProducerId").into_verdict(),
+    };
+    let actor = TxnActor::new(&id, &identity);
+    // Tell the coordinator the group's offsets belong to this
+    // transaction, then commit one inside it.
+    match add_offsets_to_txn(&mut conn, offsets_version, actor, &group, 1_080).await {
+        Ok(code) if code.is_ok() => {}
+        Ok(code) => {
+            return Verdict::Fail {
+                details: format!("AddOffsetsToTxn answered {code}"),
+            };
+        }
+        Err(e) => return e.context("AddOffsetsToTxn").into_verdict(),
+    }
+    let committed = 31;
+    match txn_offset_commit(
+        &mut conn,
+        commit_version,
+        actor,
+        &group,
+        &topic,
+        committed,
+        1_100,
+    )
+    .await
+    {
+        Ok(code) if code.is_ok() => {}
+        Ok(code) => {
+            return Verdict::Fail {
+                details: format!("TxnOffsetCommit answered {code}"),
+            };
+        }
+        Err(e) => return e.context("TxnOffsetCommit").into_verdict(),
+    }
+
+    // Still open: the offset must not be readable yet.
+    match fetch_committed(
+        &mut conn,
+        fetch_offsets_version,
+        &group,
+        &topic,
+        topic_id,
+        1_120,
+    )
+    .await
+    {
+        Ok(got) if got == committed => {
+            // Leave nothing open behind a failure.
+            let _ = end_txn(&mut conn, versions.end, actor, false, 1_139).await;
+            return Verdict::Fail {
+                details: format!(
+                    "offset {committed} was committed inside an open transaction and is \
+                     already readable; the input reads as processed while the output may \
+                     still be thrown away"
+                ),
+            };
+        }
+        Ok(_) => {}
+        Err(e) => return e.context("OffsetFetch (mid-transaction)").into_verdict(),
+    }
+
+    match end_txn(&mut conn, versions.end, actor, true, 1_140).await {
+        Ok(code) if code.is_ok() => {}
+        Ok(code) => {
+            return Verdict::Fail {
+                details: format!("committing the transaction answered {code}"),
+            };
+        }
+        Err(e) => return e.context("EndTxn").into_verdict(),
+    }
+
+    for attempt in 0..ctx.config.settle_attempts() {
+        if attempt > 0 {
+            tokio::time::sleep(ctx.config.settle_delay).await;
+        }
+        match fetch_committed(
+            &mut conn,
+            fetch_offsets_version,
+            &group,
+            &topic,
+            topic_id,
+            1_160 + i32::try_from(attempt).unwrap_or(0),
+        )
+        .await
+        {
+            Ok(got) if got == committed => return Verdict::Pass,
+            Ok(_) => {}
+            Err(e) => return e.context("OffsetFetch (after commit)").into_verdict(),
+        }
+    }
+    Verdict::Fail {
+        details: format!(
+            "the transaction committed and offset {committed} never became readable; the \
+             output exists and the input still reads as unprocessed, so it will be done again"
+        ),
+    }
+}
+
+/// AddOffsetsToTxn versions a client may speak.
+const ADD_OFFSETS_CLIENT_MAX: i16 = 4;
+/// TxnOffsetCommit below v5, which needs KIP-890 transactions V2.
+const TXN_OFFSET_COMMIT_CLIENT_MAX: i16 = 4;
+
+/// Tell the coordinator this transaction will also commit `group`'s
+/// offsets.
+async fn add_offsets_to_txn(
+    conn: &mut RawConnection,
+    version: i16,
+    actor: TxnActor<'_>,
+    group: &str,
+    correlation: i32,
+) -> Result<ErrorCode, CheckError> {
+    let mut request = AddOffsetsToTxnRequest::default();
+    request.transactional_id = actor.transactional_id.to_owned();
+    request.producer_id = actor.producer_id;
+    request.producer_epoch = actor.producer_epoch;
+    request.group_id = group.to_owned();
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding AddOffsetsToTxn: {e}")))?;
+    let resp: AddOffsetsToTxnResponse = api_call(
+        conn,
+        AddOffsetsToTxnRequest::API_KEY,
+        version,
+        correlation,
+        &body,
+    )
+    .await?;
+    Ok(ErrorCode(resp.error_code))
+}
+
+/// Commit one partition's offset inside the transaction.
+#[allow(clippy::too_many_arguments)]
+async fn txn_offset_commit(
+    conn: &mut RawConnection,
+    version: i16,
+    actor: TxnActor<'_>,
+    group: &str,
+    topic: &str,
+    offset: i64,
+    correlation: i32,
+) -> Result<ErrorCode, CheckError> {
+    let mut partition = TxnOffsetCommitRequestPartition::default();
+    partition.partition_index = 0;
+    partition.committed_offset = offset;
+    partition.committed_leader_epoch = -1;
+    let mut req_topic = TxnOffsetCommitRequestTopic::default();
+    req_topic.name = topic.to_owned();
+    req_topic.partitions = vec![partition];
+    let mut request = TxnOffsetCommitRequest::default();
+    request.transactional_id = actor.transactional_id.to_owned();
+    request.group_id = group.to_owned();
+    request.producer_id = actor.producer_id;
+    request.producer_epoch = actor.producer_epoch;
+    // A simple (non-member) transactional commit, like the offsets path
+    // the plain commit check uses.
+    request.generation_id = -1;
+    request.member_id = String::new();
+    request.group_instance_id = None;
+    request.topics = vec![req_topic];
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding TxnOffsetCommit: {e}")))?;
+    let resp: TxnOffsetCommitResponse = api_call(
+        conn,
+        TxnOffsetCommitRequest::API_KEY,
+        version,
+        correlation,
+        &body,
+    )
+    .await?;
+    Ok(resp
+        .topics
+        .first()
+        .and_then(|t| t.partitions.first())
+        .map_or(ErrorCode::NONE, |p| ErrorCode(p.error_code)))
 }

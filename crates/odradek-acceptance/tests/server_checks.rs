@@ -82,6 +82,14 @@ const SENSITIVITY: &[(Fault, &str)] = &[
     (Fault::ProduceTopicIdUnknown, "produce/topic-id"),
     (Fault::FetchWrongTopicId, "fetch/topic-id"),
     (
+        Fault::TxnCommitMarksAborted,
+        "txn/commit-is-visible-to-readers",
+    ),
+    (
+        Fault::TxnOffsetsPublishImmediately,
+        "txn/offsets-wait-for-the-commit",
+    ),
+    (
         Fault::ProduceRewritesCompressedBatches,
         "produce/compressed-batch-passthrough",
     ),
