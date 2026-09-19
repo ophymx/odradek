@@ -210,6 +210,10 @@ pub enum Fault {
     /// Echo a different topic id than the fetch requested.
     FetchWrongTopicId,
 
+    /// Re-stamp a compressed batch before storing it, rewriting bytes
+    /// the producer's crc covered. The records still decode, which is
+    /// what makes it quiet.
+    ProduceRewritesCompressedBatches,
     /// Answer a fetch that cannot be satisfied immediately instead of
     /// waiting out `max_wait_ms`, turning every caught-up consumer into
     /// a busy loop.
@@ -284,6 +288,7 @@ impl Fault {
         Fault::FetchCorruptBatch,
         Fault::ProduceTopicIdUnknown,
         Fault::FetchWrongTopicId,
+        Fault::ProduceRewritesCompressedBatches,
         Fault::FetchIgnoresMaxWait,
         Fault::MetadataLeaderIsUnknown,
         Fault::DescribeGroupsHidesMembers,
@@ -1991,7 +1996,15 @@ fn produce_exchange(
                     log.open.entry(producer_id).or_insert(base_offset);
                 }
             }
-            log.bytes.extend_from_slice(&set);
+            // A broker that re-stamps what it stores rewrites bytes the
+            // producer's crc covered: the batch still decodes, it is
+            // simply not the one anybody wrote. Confined to compressed
+            // batches so the uncompressed integrity check is untouched.
+            let stored = match rewrite_compressed(&set, &batches, faults) {
+                Some(rewritten) => rewritten,
+                None => set.clone(),
+            };
+            log.bytes.extend_from_slice(&stored);
             log.next_offset += appended;
             if let Some(batch) = batches.first() {
                 if batch.producer_id >= 0 && batch.base_sequence >= 0 {
@@ -2611,3 +2624,26 @@ fn describe_groups_exchange(
 
 /// The client id this subject reports for its members.
 const CLIENT_ID_LABEL: &str = "odradek-acceptance";
+
+/// Under `ProduceRewritesCompressedBatches`, re-encode a compressed
+/// batch with a different max timestamp — a crc-covered field, so the
+/// stored bytes stop being the produced ones while still decoding.
+fn rewrite_compressed(
+    set: &Bytes,
+    batches: &[records::RecordBatch],
+    faults: &[Fault],
+) -> Option<Bytes> {
+    if !faults.contains(&Fault::ProduceRewritesCompressedBatches) {
+        return None;
+    }
+    let batch = batches.first()?;
+    if !matches!(batch.records, records::Records::Compressed { .. }) {
+        return None;
+    }
+    let _ = set;
+    let mut rewritten = batch.clone();
+    rewritten.max_timestamp += 1;
+    let mut out = BytesMut::new();
+    rewritten.encode_to(&mut out).ok()?;
+    Some(out.freeze())
+}

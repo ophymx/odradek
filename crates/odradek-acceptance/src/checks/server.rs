@@ -274,6 +274,13 @@ pub static SERVER_CHECKS: &[Check] = &[
         runner: Runner::Server(|ctx| Box::pin(scram_server_proves_itself(ctx))),
     },
     Check {
+        id: "produce/compressed-batch-passthrough",
+        requirement: "returns a gzip-compressed batch exactly as it was \
+                      produced, rather than recompressing it and rewriting \
+                      bytes the producer's crc covered",
+        runner: Runner::Server(|ctx| Box::pin(produce_compressed_passthrough(ctx))),
+    },
+    Check {
         id: "fetch/long-poll-contract",
         requirement: "waits out max_wait_ms for a fetch it cannot yet satisfy, \
                       and answers one it can without spending the wait",
@@ -5708,4 +5715,209 @@ async fn describe_groups_reports_members(ctx: &ServerCtx) -> Verdict {
         };
     }
     Verdict::Pass
+}
+
+/// The compression codec bits of a record batch's attributes.
+const GZIP_ATTR: i16 = 1;
+
+/// A compressed batch must come back exactly as it was sent.
+///
+/// The record set is the producer's bytes, and a broker storing a topic
+/// at the default `compression.type=producer` has no business in them.
+/// Recompressing — even to the same codec — rewrites the batch and
+/// breaks every consumer that verified the crc it was given, which
+/// includes anything proxying or mirroring the log. It is the same
+/// promise the uncompressed case makes in `fetch/batch-integrity`, on
+/// the path where a broker is most tempted to intervene, and the
+/// give-away is not an error: the records decode fine, they are simply
+/// not the bytes anybody wrote.
+async fn produce_compressed_passthrough(ctx: &ServerCtx) -> Verdict {
+    let create_version = match negotiate(
+        "CreateTopics",
+        match ctx.range(CreateTopicsRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        CreateTopicsRequest::MIN_VERSION,
+        CreateTopicsRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let produce_version = match negotiate(
+        "Produce",
+        match ctx.range(ProduceRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        ProduceRequest::MIN_VERSION,
+        PRODUCE_NAME_MAX,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let fetch_version = match negotiate(
+        "Fetch",
+        match ctx.range(FetchRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        FetchRequest::MIN_VERSION,
+        FETCH_NAME_MAX,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+
+    let mut conn = match connect(&ctx.addr).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
+    let topic = unique_topic("gzip");
+    match create_topic_call(ctx, &mut conn, create_version, &topic, false, 950).await {
+        Ok((code, _)) if code.is_ok() => {}
+        Ok((code, _)) => {
+            return Verdict::Fail {
+                details: format!("creating {topic} answered {code}"),
+            };
+        }
+        Err(e) => return e.context("CreateTopics").into_verdict(),
+    }
+
+    let sent = match gzip_batch() {
+        Ok(bytes) => bytes,
+        Err(details) => return Verdict::Error { details },
+    };
+
+    // The produce rides out post-create leadership settling the way
+    // produce_flow does.
+    let mut last = ErrorCode::NONE;
+    let mut produced = false;
+    for attempt in 0..ctx.config.settle_attempts() {
+        if attempt > 0 {
+            tokio::time::sleep(ctx.config.settle_delay).await;
+        }
+        let mut partition_data = PartitionProduceData::default();
+        partition_data.index = 0;
+        partition_data.records = Some(sent.clone());
+        let mut topic_data = TopicProduceData::default();
+        topic_data.name = topic.clone();
+        topic_data.partition_data = vec![partition_data];
+        let mut request = ProduceRequest::default();
+        request.acks = -1;
+        request.timeout_ms = 10_000;
+        request.topic_data = vec![topic_data];
+        let mut body = BytesMut::new();
+        if let Err(e) = request.encode(&mut body, produce_version) {
+            return Verdict::Error {
+                details: format!("encoding Produce: {e}"),
+            };
+        }
+        let resp: ProduceResponse = match api_call(
+            &mut conn,
+            ProduceRequest::API_KEY,
+            produce_version,
+            960 + i32::try_from(attempt).unwrap_or(0),
+            &body,
+        )
+        .await
+        {
+            Ok(resp) => resp,
+            Err(e) => return e.context("Produce").into_verdict(),
+        };
+        last = resp
+            .responses
+            .first()
+            .and_then(|t| t.partition_responses.first())
+            .map_or(ErrorCode::NONE, |p| ErrorCode(p.error_code));
+        if last.is_ok() {
+            produced = true;
+            break;
+        }
+        if last == ErrorCode::UNSUPPORTED_COMPRESSION_TYPE {
+            return Verdict::Skipped {
+                reason: "the subject does not accept gzip-compressed batches".into(),
+            };
+        }
+        if !retriable(last) {
+            return Verdict::Fail {
+                details: format!("producing a gzip batch answered {last}"),
+            };
+        }
+    }
+    if !produced {
+        return Verdict::Fail {
+            details: format!("a gzip batch never became producible: still {last}"),
+        };
+    }
+
+    let data = match fetch_partition(&mut conn, fetch_version, &topic, 0, 0, 0, 970).await {
+        Ok(data) => data,
+        Err(e) => return e.context("Fetch").into_verdict(),
+    };
+    let got = data.records.unwrap_or_default();
+    // Everything from the attributes on is inside the crc; only
+    // base_offset and partition_leader_epoch, which sit outside it, may
+    // legitimately be rewritten.
+    const OUTSIDE_CRC: usize = 12 + 4 + 4;
+    if got.len() < OUTSIDE_CRC || sent.len() < OUTSIDE_CRC {
+        return Verdict::Fail {
+            details: format!(
+                "produced {} byte(s) of gzip batch and got {} back",
+                sent.len(),
+                got.len()
+            ),
+        };
+    }
+    if got[OUTSIDE_CRC..] != sent[OUTSIDE_CRC..] {
+        return Verdict::Fail {
+            details: format!(
+                "a gzip batch came back rewritten: {} byte(s) produced, {} returned, and the \
+                 crc-covered bytes differ — the records still decode, they are simply not \
+                 the ones anybody wrote",
+                sent.len(),
+                got.len()
+            ),
+        };
+    }
+    Verdict::Pass
+}
+
+/// [`probe_batch`]'s records, gzipped, as a batch declaring the codec.
+///
+/// Built rather than pasted so it stays honest if the probe batch
+/// changes; gzip because it is the one codec every Kafka-protocol
+/// implementation has had since the beginning.
+fn gzip_batch() -> Result<Bytes, String> {
+    use std::io::Write as _;
+
+    let batch = probe_batch();
+    let Records::Plain(records) = &batch.records else {
+        return Err("the probe batch is not plain records".into());
+    };
+    let mut plain = BytesMut::new();
+    for record in records {
+        record
+            .encode(&mut plain)
+            .map_err(|e| format!("encoding a record: {e}"))?;
+    }
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(&plain)
+        .map_err(|e| format!("gzipping the record set: {e}"))?;
+    let payload = encoder
+        .finish()
+        .map_err(|e| format!("finishing the gzip stream: {e}"))?;
+
+    let mut compressed = batch.clone();
+    compressed.attributes |= GZIP_ATTR;
+    compressed.records = Records::Compressed {
+        count: i32::try_from(records.len()).unwrap_or(0),
+        payload: Bytes::from(payload),
+    };
+    let mut out = BytesMut::new();
+    compressed
+        .encode(&mut out)
+        .map_err(|e| format!("encoding the compressed batch: {e}"))?;
+    Ok(out.freeze())
 }

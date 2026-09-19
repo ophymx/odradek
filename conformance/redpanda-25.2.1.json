@@ -34,6 +34,7 @@
     "offsets/metadata-round-trips": "pass",
     "offsets/unset-is-sentinel": "pass",
     "produce/basic": "pass",
+    "produce/compressed-batch-passthrough": "pass",
     "produce/idempotent-retry-is-deduped": "pass",
     "produce/sequence-gap-is-refused": "pass",
     "produce/topic-id": "skipped",

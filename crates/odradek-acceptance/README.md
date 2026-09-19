@@ -111,6 +111,14 @@ the ones where the *wrong* answer is plausible:
 - A topic reported deleted stops existing — the mirror of
   `validate_only`, checked by asking again rather than by trusting the
   acknowledgement.
+- A gzip-compressed batch comes back exactly as it was produced. The
+  record set is the producer's bytes and a broker storing a topic at
+  the default `compression.type=producer` has no business in them —
+  recompressing, even to the same codec, rewrites the batch and breaks
+  every consumer that verified the crc it was given, which includes
+  anything proxying or mirroring the log. The give-away is not an
+  error: the records decode fine, they are simply not the bytes anybody
+  wrote.
 - A replication factor the cluster cannot satisfy is *refused*. The
   plausible wrong answer here is not an error but a success: creating
   the topic with however many replicas are available, so a caller who

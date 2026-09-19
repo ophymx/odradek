@@ -81,6 +81,10 @@ const SENSITIVITY: &[(Fault, &str)] = &[
     (Fault::FetchCorruptBatch, "fetch/batch-integrity"),
     (Fault::ProduceTopicIdUnknown, "produce/topic-id"),
     (Fault::FetchWrongTopicId, "fetch/topic-id"),
+    (
+        Fault::ProduceRewritesCompressedBatches,
+        "produce/compressed-batch-passthrough",
+    ),
     (Fault::FetchIgnoresMaxWait, "fetch/long-poll-contract"),
     (
         Fault::MetadataLeaderIsUnknown,
