@@ -61,9 +61,10 @@ catalog worth anything — a check that cannot fail passes everywhere.
 
 `api-versions/*`, `metadata/*`, `produce/*`, `fetch/*`,
 `list-offsets/*`, `find-coordinator/*`, `offsets/*`, `create-topics/*`,
-`groups/*`, `consumer-group/*` (KIP-848), `sasl/*`, and `txn/*` —
-everything a consumer needs, plus the group protocols, the SASL
-handshake sequence, and transactions.
+`groups/*`, `consumer-group/*` (KIP-848), `sasl/*`, `txn/*`, and
+`admin/*` — everything a producer or consumer needs, plus the group
+protocols, the SASL handshake sequence, transactions, and topic
+deletion.
 
 Success paths are the easy half. The checks that earn their keep are
 the ones where the *wrong* answer is plausible:
@@ -92,6 +93,24 @@ the ones where the *wrong* answer is plausible:
   connect, so it has a floor (RFC 7677: 4096).
 - A SCRAM exchange ends with a server signature, or the client has
   authenticated itself to whatever answered the socket and cannot tell.
+- A batch sent twice under one producer id, epoch and sequence is
+  stored *once*. This is the whole of idempotent produce: the producer
+  cannot tell a lost request from a lost acknowledgement, so it
+  retries, and a broker that appends the retry leaves the log holding
+  the records twice with nothing downstream able to say which
+  duplicates were meant.
+- A stamped sequence that skips ahead is refused with
+  `OUT_OF_ORDER_SEQUENCE_NUMBER`. The broker cannot tell "the batch you
+  skipped never existed" from "it is still in flight and will arrive
+  out of order", so accepting the gap abandons the ordering the
+  producer was promised without saying so.
+- Seeking by time lands on the first record at or after the timestamp,
+  and answers `-1` for a time after the last one. Both wrong answers
+  are quiet: the log end reads as "you are caught up", the log start as
+  "read everything again".
+- A topic reported deleted stops existing — the mirror of
+  `validate_only`, checked by asking again rather than by trusting the
+  acknowledgement.
 - Re-taking a transactional id must hand out a *higher* epoch, and the
   superseded one must then be refused. Either half alone is worthless:
   an epoch nobody enforces fences nothing, and enforcement without a

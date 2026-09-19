@@ -25,6 +25,10 @@ use odradek_protocol::messages::create_topics_request::CreateTopicsRequest;
 use odradek_protocol::messages::create_topics_response::{
     CreatableTopicResult, CreateTopicsResponse,
 };
+use odradek_protocol::messages::delete_topics_request::DeleteTopicsRequest;
+use odradek_protocol::messages::delete_topics_response::{
+    DeletableTopicResult, DeleteTopicsResponse,
+};
 use odradek_protocol::messages::end_txn_request::EndTxnRequest;
 use odradek_protocol::messages::end_txn_response::EndTxnResponse;
 use odradek_protocol::messages::fetch_request::FetchRequest;
@@ -202,6 +206,21 @@ pub enum Fault {
     /// Echo a different topic id than the fetch requested.
     FetchWrongTopicId,
 
+    /// Answer a timestamp lookup with the log end instead of searching,
+    /// so a consumer seeking past the last record is told it is caught
+    /// up rather than that there is nothing there.
+    ListOffsetsTimestampReturnsLogEnd,
+    /// Report a topic deleted and keep it, so the caller has no way to
+    /// tell the deletion happened.
+    DeleteTopicsKeepsTheTopic,
+    /// Append a batch whose (producer id, sequence) the partition has
+    /// already stored, so a producer retrying a lost acknowledgement
+    /// writes its records twice.
+    ProduceAppendsIdempotentRetries,
+    /// Accept a stamped batch whose sequence skips past what the
+    /// partition last took, abandoning the ordering the producer was
+    /// promised without saying so.
+    ProduceAcceptsSequenceGaps,
     /// Hand a producer re-taking a transactional id the same epoch its
     /// predecessor had, so the two are indistinguishable and neither is
     /// fenced.
@@ -242,6 +261,10 @@ impl Fault {
         Fault::FetchCorruptBatch,
         Fault::ProduceTopicIdUnknown,
         Fault::FetchWrongTopicId,
+        Fault::ListOffsetsTimestampReturnsLogEnd,
+        Fault::DeleteTopicsKeepsTheTopic,
+        Fault::ProduceAppendsIdempotentRetries,
+        Fault::ProduceAcceptsSequenceGaps,
         Fault::TxnInitReusesEpoch,
         Fault::TxnIgnoresProducerEpoch,
         Fault::TxnUnannouncedWriteEscapes,
@@ -346,6 +369,11 @@ fn advertised_keys() -> Vec<ApiVersion> {
             FindCoordinatorRequest::MAX_VERSION,
         ),
         (
+            DeleteTopicsRequest::API_KEY,
+            DeleteTopicsRequest::MIN_VERSION,
+            DeleteTopicsRequest::MAX_VERSION,
+        ),
+        (
             InitProducerIdRequest::API_KEY,
             InitProducerIdRequest::MIN_VERSION,
             InitProducerIdRequest::MAX_VERSION,
@@ -431,6 +459,23 @@ struct PartitionLog {
     /// offset). Reported to `read_committed` fetches, which is the only
     /// way a reader learns those records were thrown away.
     aborted: Vec<(i64, i64)>,
+    /// What each producer last wrote here: the sequence range it
+    /// claimed and the offset that batch landed at.
+    ///
+    /// This is the whole of idempotence on the broker side. Keeping the
+    /// offset as well as the sequence is what lets a recognized retry be
+    /// answered with the original position rather than a new one.
+    last_batch: HashMap<i64, LastBatch>,
+}
+
+/// The last batch one producer wrote to a partition.
+#[derive(Debug, Clone, Copy)]
+struct LastBatch {
+    base_sequence: i32,
+    /// One past the last sequence the batch claimed — the sequence the
+    /// next batch from this producer must start at.
+    next_sequence: i32,
+    base_offset: i64,
 }
 
 impl PartitionLog {
@@ -656,6 +701,9 @@ async fn handle_connection(mut stream: TcpStream, faults: Vec<Fault>) {
             LeaveGroupRequest::API_KEY => leave_group_exchange(frame, api_version, &mut state),
             ConsumerGroupHeartbeatRequest::API_KEY => {
                 consumer_group_heartbeat_exchange(frame, api_version, &faults, &mut state)
+            }
+            DeleteTopicsRequest::API_KEY => {
+                delete_topics_exchange(frame, api_version, &faults, &mut state)
             }
             InitProducerIdRequest::API_KEY => {
                 init_producer_id_exchange(frame, api_version, &faults, &mut state)
@@ -1258,10 +1306,8 @@ fn list_offsets_exchange(
                 .partitions
                 .iter()
                 .map(|p| {
-                    let end = state
-                        .logs
-                        .get(&(topic.name.clone(), p.partition_index))
-                        .map_or(0, |log| log.next_offset);
+                    let log = state.logs.get(&(topic.name.clone(), p.partition_index));
+                    let end = log.map_or(0, |log| log.next_offset);
                     let (timestamp, offset) = match p.timestamp {
                         EARLIEST_TIMESTAMP => {
                             let start = if faults.contains(&Fault::ListOffsetsWrongEarliest) {
@@ -1274,9 +1320,16 @@ fn list_offsets_exchange(
                             (-1, start)
                         }
                         LATEST_TIMESTAMP => (-1, end),
-                        // No message search in this subject: a timestamp
-                        // lookup finds nothing, which is `offset: -1`.
-                        _ => (-1, -1),
+                        // A real timestamp is a search: the first record
+                        // at or after it, or no offset at all when every
+                        // record predates it. Answering the log end
+                        // instead reads to a time-seeking consumer as
+                        // "you are caught up".
+                        wanted if faults.contains(&Fault::ListOffsetsTimestampReturnsLogEnd) => {
+                            let _ = wanted;
+                            (-1, end)
+                        }
+                        wanted => log.map_or((-1, -1), |log| timestamp_search(log, wanted)),
                     };
                     let mut out = ListOffsetsPartitionResponse::default();
                     out.partition_index = p.partition_index;
@@ -1789,9 +1842,33 @@ fn produce_exchange(
                 .entry((name.clone(), partition.index))
                 .or_default();
             let set = partition.records.clone().unwrap_or_default();
+            let batches = records::decode_set(&mut set.clone()).ok()?;
+            // A stamped batch is the broker's to recognize: the same
+            // producer, epoch and sequence twice is one write, and a
+            // sequence that skips ahead is a gap it cannot fill.
+            if let Some(code) = stamped_verdict(log, batches.first(), faults) {
+                let mut entry = PartitionProduceResponse::default();
+                entry.index = partition.index;
+                entry.error_code = code.0;
+                entry.base_offset = -1;
+                entry.log_append_time_ms = -1;
+                partition_responses.push(entry);
+                continue;
+            }
+            if let Some(known) = duplicate_of(log, batches.first(), faults) {
+                // Recognized: answer with where it landed the first
+                // time and append nothing.
+                let mut entry = PartitionProduceResponse::default();
+                entry.index = partition.index;
+                entry.error_code = 0;
+                entry.base_offset = known;
+                entry.log_append_time_ms = -1;
+                entry.log_start_offset = 0;
+                partition_responses.push(entry);
+                continue;
+            }
             // Advance the offset by the records just appended.
-            let appended: i64 = records::decode_set(&mut set.clone())
-                .ok()?
+            let appended: i64 = batches
                 .iter()
                 .map(|b| i64::from(b.last_offset_delta) + 1)
                 .sum();
@@ -1820,6 +1897,19 @@ fn produce_exchange(
             }
             log.bytes.extend_from_slice(&set);
             log.next_offset += appended;
+            if let Some(batch) = batches.first() {
+                if batch.producer_id >= 0 && batch.base_sequence >= 0 {
+                    let count = i32::try_from(appended).unwrap_or(i32::MAX);
+                    log.last_batch.insert(
+                        batch.producer_id,
+                        LastBatch {
+                            base_sequence: batch.base_sequence,
+                            next_sequence: batch.base_sequence.wrapping_add(count),
+                            base_offset,
+                        },
+                    );
+                }
+            }
             if faults.contains(&Fault::ProduceWrongBaseOffset) {
                 base_offset += 1;
             }
@@ -2202,4 +2292,139 @@ fn stable_offset(log: &PartitionLog, faults: &[Fault]) -> i64 {
     } else {
         log.last_stable_offset()
     }
+}
+
+/// Whether a stamped batch's sequence is one this partition can accept,
+/// and the error to answer with when it is not.
+///
+/// A gap cannot be papered over: the broker cannot tell "the batch you
+/// skipped never existed" from "it is still in flight and will arrive
+/// out of order", so the only honest answer is to refuse and let the
+/// producer learn its stamp has drifted.
+fn stamped_verdict(
+    log: &PartitionLog,
+    batch: Option<&records::RecordBatch>,
+    faults: &[Fault],
+) -> Option<ErrorCode> {
+    if faults.contains(&Fault::ProduceAcceptsSequenceGaps) {
+        return None;
+    }
+    let batch = batch?;
+    if batch.producer_id < 0 || batch.base_sequence < 0 {
+        return None;
+    }
+    let known = log.last_batch.get(&batch.producer_id)?;
+    // The repeat of the last batch is a retry, not a gap; `duplicate_of`
+    // answers that one.
+    if batch.base_sequence == known.base_sequence || batch.base_sequence == known.next_sequence {
+        return None;
+    }
+    Some(ErrorCode::OUT_OF_ORDER_SEQUENCE_NUMBER)
+}
+
+/// Where this batch landed the first time, when it is a repeat of the
+/// last one this producer wrote here.
+fn duplicate_of(
+    log: &PartitionLog,
+    batch: Option<&records::RecordBatch>,
+    faults: &[Fault],
+) -> Option<i64> {
+    if faults.contains(&Fault::ProduceAppendsIdempotentRetries) {
+        return None;
+    }
+    let batch = batch?;
+    if batch.producer_id < 0 || batch.base_sequence < 0 {
+        return None;
+    }
+    let known = log.last_batch.get(&batch.producer_id)?;
+    (batch.base_sequence == known.base_sequence).then_some(known.base_offset)
+}
+
+/// The first offset in `log` whose record timestamp is at or after
+/// `wanted`, as the `(timestamp, offset)` pair ListOffsets answers with.
+///
+/// Absolute offsets are reconstructed by counting rather than read off
+/// the batches: this subject stores what it was produced byte for byte
+/// (that is what `fetch/batch-integrity` checks), so the base offsets in
+/// the log are the producer's zeros, not positions.
+fn timestamp_search(log: &PartitionLog, wanted: i64) -> (i64, i64) {
+    let Ok(batches) = records::decode_set(&mut log.bytes.clone().freeze()) else {
+        return (-1, -1);
+    };
+    let mut offset = 0i64;
+    for batch in &batches {
+        match &batch.records {
+            records::Records::Plain(plain) => {
+                for record in plain {
+                    let at = batch.base_timestamp + record.timestamp_delta;
+                    if at >= wanted {
+                        return (at, offset);
+                    }
+                    offset += 1;
+                }
+            }
+            // Opaque without decompressing, and nothing this subject
+            // produces is compressed; skip the span it covers.
+            records::Records::Compressed { .. } => {
+                offset += i64::from(batch.last_offset_delta) + 1;
+            }
+        }
+    }
+    (-1, -1)
+}
+
+/// Delete topics, which means they stop existing — the part a caller
+/// cannot verify except by asking again.
+fn delete_topics_exchange(
+    mut frame: Bytes,
+    api_version: i16,
+    faults: &[Fault],
+    state: &mut ConnState,
+) -> Option<BytesMut> {
+    if !(DeleteTopicsRequest::MIN_VERSION..=DeleteTopicsRequest::MAX_VERSION).contains(&api_version)
+    {
+        return None;
+    }
+    let hv = header::request_header_version(DeleteTopicsRequest::API_KEY, api_version)?;
+    let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
+    let request = DeleteTopicsRequest::decode(&mut frame, api_version).ok()?;
+
+    // v6+ carries the `topics` array; below that, a list of names.
+    let names: Vec<String> = if request.topics.is_empty() {
+        request.topic_names.clone()
+    } else {
+        request
+            .topics
+            .iter()
+            .filter_map(|t| t.name.clone())
+            .collect()
+    };
+
+    let mut results = Vec::with_capacity(names.len());
+    for name in &names {
+        let existed = state.created.contains_key(name);
+        if existed && !faults.contains(&Fault::DeleteTopicsKeepsTheTopic) {
+            if let Some(id) = state.created.remove(name) {
+                state.topic_names.remove(&id);
+            }
+            state.logs.retain(|(topic, _), _| topic != name);
+        }
+        let mut result = DeletableTopicResult::default();
+        result.name = Some(name.clone());
+        result.error_code = if existed {
+            ErrorCode::NONE.0
+        } else {
+            ErrorCode::UNKNOWN_TOPIC_OR_PARTITION.0
+        };
+        results.push(result);
+    }
+
+    let mut resp = DeleteTopicsResponse::default();
+    resp.responses = results;
+    frame_response(
+        req_header.correlation_id,
+        response_header_version(DeleteTopicsRequest::API_KEY, api_version),
+        |out| resp.encode(out, api_version).unwrap(),
+        false,
+    )
 }

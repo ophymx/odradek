@@ -81,6 +81,22 @@ const SENSITIVITY: &[(Fault, &str)] = &[
     (Fault::FetchCorruptBatch, "fetch/batch-integrity"),
     (Fault::ProduceTopicIdUnknown, "produce/topic-id"),
     (Fault::FetchWrongTopicId, "fetch/topic-id"),
+    (
+        Fault::ListOffsetsTimestampReturnsLogEnd,
+        "list-offsets/by-timestamp",
+    ),
+    (
+        Fault::DeleteTopicsKeepsTheTopic,
+        "admin/delete-topics-removes-the-topic",
+    ),
+    (
+        Fault::ProduceAppendsIdempotentRetries,
+        "produce/idempotent-retry-is-deduped",
+    ),
+    (
+        Fault::ProduceAcceptsSequenceGaps,
+        "produce/sequence-gap-is-refused",
+    ),
     (Fault::TxnInitReusesEpoch, "txn/init-bumps-the-epoch"),
     (Fault::TxnIgnoresProducerEpoch, "txn/stale-epoch-is-fenced"),
     (

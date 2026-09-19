@@ -23,6 +23,8 @@ use odradek_protocol::messages::consumer_group_heartbeat_request::ConsumerGroupH
 use odradek_protocol::messages::consumer_group_heartbeat_response::ConsumerGroupHeartbeatResponse;
 use odradek_protocol::messages::create_topics_request::{CreatableTopic, CreateTopicsRequest};
 use odradek_protocol::messages::create_topics_response::CreateTopicsResponse;
+use odradek_protocol::messages::delete_topics_request::{DeleteTopicState, DeleteTopicsRequest};
+use odradek_protocol::messages::delete_topics_response::DeleteTopicsResponse;
 use odradek_protocol::messages::end_txn_request::EndTxnRequest;
 use odradek_protocol::messages::end_txn_response::EndTxnResponse;
 use odradek_protocol::messages::fetch_request::{FetchPartition, FetchRequest, FetchTopic};
@@ -266,6 +268,33 @@ pub static SERVER_CHECKS: &[Check] = &[
         requirement: "completes a SCRAM exchange with a server signature that \
                       verifies, proving it holds the account's key material",
         runner: Runner::Server(|ctx| Box::pin(scram_server_proves_itself(ctx))),
+    },
+    Check {
+        id: "list-offsets/by-timestamp",
+        requirement: "answers a timestamp with the first offset at or after it, \
+                      and a timestamp past every record with -1 rather than \
+                      with either end of the log",
+        runner: Runner::Server(|ctx| Box::pin(list_offsets_by_timestamp(ctx))),
+    },
+    Check {
+        id: "admin/delete-topics-removes-the-topic",
+        requirement: "a topic it reports deleted stops existing, rather than \
+                      being acknowledged and left in place",
+        runner: Runner::Server(|ctx| Box::pin(delete_topics_removes_the_topic(ctx))),
+    },
+    Check {
+        id: "produce/idempotent-retry-is-deduped",
+        requirement: "stores one copy of a batch sent twice under the same \
+                      producer id, epoch and sequence, however it answers the \
+                      second one",
+        runner: Runner::Server(|ctx| Box::pin(produce_idempotent_retry_is_deduped(ctx))),
+    },
+    Check {
+        id: "produce/sequence-gap-is-refused",
+        requirement: "refuses a stamped batch whose sequence skips past what \
+                      it last accepted, with OUT_OF_ORDER_SEQUENCE_NUMBER \
+                      rather than by silently accepting the gap",
+        runner: Runner::Server(|ctx| Box::pin(produce_sequence_gap_is_refused(ctx))),
     },
     Check {
         id: "txn/init-bumps-the-epoch",
@@ -3845,22 +3874,55 @@ async fn end_txn(
 
 /// Produce one transactional batch, returning the partition's error code
 /// and base offset.
-async fn produce_transactional(
+/// What a produce stamps its batch with, and whether it belongs to a
+/// transaction.
+///
+/// The triple is what the broker dedupes on; `transactional_id` is what
+/// turns an idempotent write into a transactional one, on the batch's
+/// attributes and on the request alike.
+#[derive(Debug, Clone, Copy)]
+struct ProduceStamp<'a> {
+    producer_id: i64,
+    producer_epoch: i16,
+    base_sequence: i32,
+    transactional_id: Option<&'a str>,
+}
+
+impl<'a> ProduceStamp<'a> {
+    fn transactional(actor: TxnActor<'a>, base_sequence: i32) -> ProduceStamp<'a> {
+        ProduceStamp {
+            producer_id: actor.producer_id,
+            producer_epoch: actor.producer_epoch,
+            base_sequence,
+            transactional_id: Some(actor.transactional_id),
+        }
+    }
+
+    fn idempotent(identity: &InitProducerIdResponse, base_sequence: i32) -> ProduceStamp<'static> {
+        ProduceStamp {
+            producer_id: identity.producer_id,
+            producer_epoch: identity.producer_epoch,
+            base_sequence,
+            transactional_id: None,
+        }
+    }
+}
+
+async fn produce_stamped(
     conn: &mut RawConnection,
     version: i16,
-    actor: TxnActor<'_>,
+    stamp: ProduceStamp<'_>,
     topic: &str,
     partition: i32,
-    base_sequence: i32,
     correlation: i32,
 ) -> Result<(ErrorCode, i64), CheckError> {
     let mut batch = probe_batch();
-    // The three fields plus the attribute bit are what make this a
-    // transactional write rather than a plain one.
-    batch.attributes |= TRANSACTIONAL_ATTR;
-    batch.producer_id = actor.producer_id;
-    batch.producer_epoch = actor.producer_epoch;
-    batch.base_sequence = base_sequence;
+    if stamp.transactional_id.is_some() {
+        batch.attributes |= TRANSACTIONAL_ATTR;
+    }
+    batch.producer_id = stamp.producer_id;
+    batch.producer_epoch = stamp.producer_epoch;
+    batch.base_sequence = stamp.base_sequence;
     let mut set = BytesMut::new();
     batch
         .encode(&mut set)
@@ -3873,9 +3935,10 @@ async fn produce_transactional(
     topic_data.name = topic.to_owned();
     topic_data.partition_data = vec![partition_data];
     let mut request = ProduceRequest::default();
-    request.transactional_id = Some(actor.transactional_id.to_owned());
-    // Transactional produce requires the full ISR; anything less and the
-    // broker refuses on grounds that have nothing to do with the check.
+    request.transactional_id = stamp.transactional_id.map(str::to_owned);
+    // Idempotent and transactional produce both require the full ISR;
+    // anything less and the broker refuses on grounds that have nothing
+    // to do with the check.
     request.acks = -1;
     request.timeout_ms = 10_000;
     request.topic_data = vec![topic_data];
@@ -4085,14 +4148,22 @@ async fn txn_unannounced_write_stays_in_the_transaction(ctx: &ServerCtx) -> Verd
 
     // No AddPartitionsToTxn: straight to the write.
     let actor = TxnActor::new(&id, &identity);
-    let base_offset =
-        match produce_transactional(&mut conn, versions.produce, actor, &topic, 0, 0, 520).await {
-            // Refusing is the other safe answer: nothing was written, so
-            // nothing can be orphaned.
-            Ok((code, _)) if !code.is_ok() => return Verdict::Pass,
-            Ok((_, base_offset)) => base_offset,
-            Err(e) => return e.context("Produce").into_verdict(),
-        };
+    let base_offset = match produce_stamped(
+        &mut conn,
+        versions.produce,
+        ProduceStamp::transactional(actor, 0),
+        &topic,
+        0,
+        520,
+    )
+    .await
+    {
+        // Refusing is the other safe answer: nothing was written, so
+        // nothing can be orphaned.
+        Ok((code, _)) if !code.is_ok() => return Verdict::Pass,
+        Ok((_, base_offset)) => base_offset,
+        Err(e) => return e.context("Produce").into_verdict(),
+    };
 
     // It was accepted. Then the transaction had better own it — which
     // an abort is the sharpest way to ask: if these records survive
@@ -4358,13 +4429,12 @@ async fn open_transaction(
         if attempt > 0 {
             tokio::time::sleep(ctx.config.settle_delay).await;
         }
-        match produce_transactional(
+        match produce_stamped(
             conn,
             versions.produce,
-            actor,
+            ProduceStamp::transactional(actor, 0),
             topic,
             partition,
-            0,
             correlation + 10 + i32::try_from(attempt).unwrap_or(0),
         )
         .await
@@ -4387,4 +4457,507 @@ async fn open_transaction(
 /// True when this code tells a producer it has been superseded.
 fn is_fenced(code: ErrorCode) -> bool {
     code == ErrorCode::PRODUCER_FENCED || code == ErrorCode::INVALID_PRODUCER_EPOCH
+}
+
+// ---- idempotent produce ---------------------------------------------
+//
+// A producer that retries a batch whose acknowledgement was lost has no
+// way to tell "the broker never got it" from "the broker got it and the
+// reply went missing". Idempotence is the broker's half of that deal:
+// it remembers the last sequences per (producer id, partition) and
+// recognizes a repeat. Both checks below are guarantees the client's
+// producer is built on, and both fail silently when they are not kept —
+// a duplicated batch and a dropped one look like ordinary data.
+
+/// Take a producer id with no transactional id attached.
+///
+/// The plain idempotent case: no coordinator to find, no fencing, just
+/// an id scoped to this session that the broker will dedupe against.
+async fn init_idempotent_producer_id(
+    ctx: &ServerCtx,
+    conn: &mut RawConnection,
+    version: i16,
+    correlation: i32,
+) -> Result<InitProducerIdResponse, CheckError> {
+    let mut request = InitProducerIdRequest::default();
+    request.transactional_id = None;
+    request.transaction_timeout_ms = -1;
+    request.producer_id = -1;
+    request.producer_epoch = -1;
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding InitProducerId: {e}")))?;
+
+    let mut last = ErrorCode(0);
+    for attempt in 0..ctx.config.settle_attempts() {
+        if attempt > 0 {
+            tokio::time::sleep(ctx.config.settle_delay).await;
+        }
+        let resp: InitProducerIdResponse = api_call(
+            conn,
+            InitProducerIdRequest::API_KEY,
+            version,
+            correlation + i32::try_from(attempt).unwrap_or(0),
+            &body,
+        )
+        .await?;
+        last = ErrorCode(resp.error_code);
+        if last.is_ok() {
+            return Ok(resp);
+        }
+        // A broker still loading its transaction log says so even for
+        // an id it will not coordinate.
+        if !retriable(last) && !txn_coordinator_settling(last) {
+            break;
+        }
+    }
+    Err(CheckError::Violation(format!(
+        "InitProducerId never succeeded: {last}"
+    )))
+}
+
+/// The number of records in a partition, from the offsets at both ends.
+async fn log_span(
+    ctx: &ServerCtx,
+    conn: &mut RawConnection,
+    topic: &str,
+    correlation: i32,
+) -> Result<i64, CheckError> {
+    let version = negotiate(
+        "ListOffsets",
+        ctx.range(ListOffsetsRequest::API_KEY)
+            .map_err(|_| CheckError::Infra("ListOffsets is not advertised".into()))?,
+        ListOffsetsRequest::MIN_VERSION,
+        ListOffsetsRequest::MAX_VERSION,
+    )
+    .map_err(|_| CheckError::Infra("no common ListOffsets version".into()))?;
+    let earliest = list_offset_of(conn, version, topic, EARLIEST_TIMESTAMP, correlation).await?;
+    let latest = list_offset_of(conn, version, topic, LATEST_TIMESTAMP, correlation + 1).await?;
+    Ok(latest - earliest)
+}
+
+/// One ListOffsets lookup for partition 0 of `topic`.
+async fn list_offset_of(
+    conn: &mut RawConnection,
+    version: i16,
+    topic: &str,
+    timestamp: i64,
+    correlation: i32,
+) -> Result<i64, CheckError> {
+    let mut request_partition = ListOffsetsPartition::default();
+    request_partition.partition_index = 0;
+    request_partition.current_leader_epoch = -1;
+    request_partition.timestamp = timestamp;
+    let mut request_topic = ListOffsetsTopic::default();
+    request_topic.name = topic.to_owned();
+    request_topic.partitions = vec![request_partition];
+    let mut request = ListOffsetsRequest::default();
+    request.replica_id = -1;
+    request.isolation_level = 0;
+    request.topics = vec![request_topic];
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding ListOffsets: {e}")))?;
+    let resp: ListOffsetsResponse = api_call(
+        conn,
+        ListOffsetsRequest::API_KEY,
+        version,
+        correlation,
+        &body,
+    )
+    .await?;
+    let entry = resp
+        .topics
+        .first()
+        .and_then(|t| t.partitions.first())
+        .ok_or_else(|| CheckError::Violation("ListOffsets names no partitions".into()))?;
+    let code = ErrorCode(entry.error_code);
+    if !code.is_ok() {
+        return Err(CheckError::Violation(format!(
+            "ListOffsets answered {code}"
+        )));
+    }
+    Ok(entry.offset)
+}
+
+/// Versions for a stamped produce and the offsets lookups around it.
+fn idempotence_versions(ctx: &ServerCtx) -> Result<(i16, i16), Verdict> {
+    Ok((
+        negotiate(
+            "InitProducerId",
+            ctx.range(InitProducerIdRequest::API_KEY)?,
+            InitProducerIdRequest::MIN_VERSION,
+            TXN_INIT_MAX,
+        )?,
+        negotiate(
+            "Produce",
+            ctx.range(ProduceRequest::API_KEY)?,
+            ProduceRequest::MIN_VERSION,
+            PRODUCE_NAME_MAX,
+        )?,
+    ))
+}
+
+/// A batch sent twice under the same stamp must be stored once.
+///
+/// This is the entire point of idempotent produce. The producer cannot
+/// tell a lost request from a lost acknowledgement, so it retries; if
+/// the broker appends the retry as a new batch the log quietly holds
+/// the records twice, and nothing downstream can tell which duplicates
+/// were meant. Answering the retry with the original offset and
+/// answering it with DUPLICATE_SEQUENCE_NUMBER are both fine — what
+/// matters is the count in the log.
+async fn produce_idempotent_retry_is_deduped(ctx: &ServerCtx) -> Verdict {
+    let (init_version, produce_version) = match idempotence_versions(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let produced = match produce_flow(ctx, "dedupe", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    let topic = produced.topic.clone();
+    let mut conn = produced.conn;
+
+    let identity = match init_idempotent_producer_id(ctx, &mut conn, init_version, 700).await {
+        Ok(r) => r,
+        Err(e) => return e.context("InitProducerId").into_verdict(),
+    };
+    let before = match log_span(ctx, &mut conn, &topic, 710).await {
+        Ok(span) => span,
+        Err(e) => return e.context("ListOffsets (before)").into_verdict(),
+    };
+
+    let stamp = ProduceStamp::idempotent(&identity, 0);
+    let first = match produce_stamped(&mut conn, produce_version, stamp, &topic, 0, 720).await {
+        Ok((code, offset)) if code.is_ok() => offset,
+        Ok((code, _)) => {
+            return Verdict::Fail {
+                details: format!("the first stamped produce answered {code}"),
+            };
+        }
+        Err(e) => return e.context("Produce (first)").into_verdict(),
+    };
+    // Byte for byte the same batch, the way a producer retrying a lost
+    // acknowledgement sends it.
+    let retry = match produce_stamped(&mut conn, produce_version, stamp, &topic, 0, 730).await {
+        Ok(outcome) => outcome,
+        Err(e) => return e.context("Produce (retry)").into_verdict(),
+    };
+    let after = match log_span(ctx, &mut conn, &topic, 740).await {
+        Ok(span) => span,
+        Err(e) => return e.context("ListOffsets (after)").into_verdict(),
+    };
+
+    let records = batch_record_count(&probe_batch());
+    let appended = after - before;
+    if appended != records {
+        return Verdict::Fail {
+            details: format!(
+                "a batch of {records} record(s) sent twice under producer {} sequence 0 grew the \
+                 log by {appended}; the retry was appended rather than recognized (first at \
+                 offset {first}, retry answered {}, offset {})",
+                identity.producer_id, retry.0, retry.1
+            ),
+        };
+    }
+    Verdict::Pass
+}
+
+/// A sequence that skips ahead must be refused.
+///
+/// The broker's dedupe window is the last few sequences per producer and
+/// partition, so a gap is not something it can paper over: it cannot
+/// tell "the batch you skipped never existed" from "the batch you
+/// skipped is still in flight and will arrive out of order". Accepting
+/// the gap silently abandons the ordering the producer was promised, so
+/// OUT_OF_ORDER_SEQUENCE_NUMBER is the answer, and it is what tells a
+/// client its stamp has drifted.
+async fn produce_sequence_gap_is_refused(ctx: &ServerCtx) -> Verdict {
+    let (init_version, produce_version) = match idempotence_versions(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let produced = match produce_flow(ctx, "seqgap", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    let topic = produced.topic.clone();
+    let mut conn = produced.conn;
+
+    let identity = match init_idempotent_producer_id(ctx, &mut conn, init_version, 750).await {
+        Ok(r) => r,
+        Err(e) => return e.context("InitProducerId").into_verdict(),
+    };
+    // Establish the sequence: this batch is 0..count.
+    match produce_stamped(
+        &mut conn,
+        produce_version,
+        ProduceStamp::idempotent(&identity, 0),
+        &topic,
+        0,
+        760,
+    )
+    .await
+    {
+        Ok((code, _)) if code.is_ok() => {}
+        Ok((code, _)) => {
+            return Verdict::Fail {
+                details: format!("the first stamped produce answered {code}"),
+            };
+        }
+        Err(e) => return e.context("Produce (first)").into_verdict(),
+    }
+
+    // Skip a long way past what comes next, so no dedupe window can
+    // plausibly contain it.
+    let gap = i32::try_from(batch_record_count(&probe_batch())).unwrap_or(2) + 50;
+    match produce_stamped(
+        &mut conn,
+        produce_version,
+        ProduceStamp::idempotent(&identity, gap),
+        &topic,
+        0,
+        770,
+    )
+    .await
+    {
+        Ok((code, _)) if code == ErrorCode::OUT_OF_ORDER_SEQUENCE_NUMBER => Verdict::Pass,
+        Ok((code, offset)) if code.is_ok() => Verdict::Fail {
+            details: format!(
+                "a batch stamped with sequence {gap} was accepted at offset {offset} after a \
+                 batch ending well below it; the gap was neither filled nor refused"
+            ),
+        },
+        Ok((code, _)) => Verdict::Fail {
+            details: format!(
+                "a batch stamped with sequence {gap} was refused with {code} rather than \
+                 OUT_OF_ORDER_SEQUENCE_NUMBER, which is the code that tells a producer its \
+                 stamp has drifted"
+            ),
+        },
+        Err(e) => e.context("Produce (gap)").into_verdict(),
+    }
+}
+
+/// DeleteTopics versions this suite speaks: v6+ moved the request from
+/// a name list to a `topics` array that can address by id.
+const DELETE_TOPICS_BY_STATE: i16 = 6;
+
+/// Seeking by time must land on the first record at or after the
+/// timestamp, and report *no offset* for a time after the last one.
+///
+/// A consumer that seeks by time has no other way to find its place, so
+/// both halves matter and both have a plausible wrong answer. Returning
+/// the log end for a future timestamp reads as "start here", which
+/// looks exactly like being caught up; returning the log *start* reads
+/// as "read everything", which silently reprocesses the topic.
+async fn list_offsets_by_timestamp(ctx: &ServerCtx) -> Verdict {
+    let version = match negotiate(
+        "ListOffsets",
+        match ctx.range(ListOffsetsRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        // v1 is the first with the timestamp/offset response shape.
+        1,
+        ListOffsetsRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let produced = match produce_flow(ctx, "bytime", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    let topic = produced.topic.clone();
+    let mut conn = produced.conn;
+
+    let batch = probe_batch();
+    let first = batch.base_timestamp;
+    let last = batch.max_timestamp;
+    let records = batch_record_count(&batch);
+
+    // The batch's own first timestamp: the first record, offset 0.
+    match list_offset_of(&mut conn, version, &topic, first, 780).await {
+        Ok(0) => {}
+        Ok(other) => {
+            return Verdict::Fail {
+                details: format!(
+                    "the batch's first timestamp ({first}) answered offset {other}, not 0"
+                ),
+            };
+        }
+        Err(e) => return e.context("ListOffsets (first timestamp)").into_verdict(),
+    }
+
+    // One past the last record's timestamp is after every record here,
+    // so there is no offset to name.
+    match list_offset_of(&mut conn, version, &topic, last + 1, 790).await {
+        Ok(UNSET_OFFSET) => {}
+        Ok(other) if other == records => {
+            return Verdict::Fail {
+                details: format!(
+                    "a timestamp after every record answered the log end ({other}) instead of \
+                     {UNSET_OFFSET}; a consumer seeking forward in time reads that as being \
+                     caught up"
+                ),
+            };
+        }
+        Ok(other) => {
+            return Verdict::Fail {
+                details: format!(
+                    "a timestamp after every record answered offset {other} instead of \
+                     {UNSET_OFFSET}"
+                ),
+            };
+        }
+        Err(e) => return e.context("ListOffsets (future timestamp)").into_verdict(),
+    }
+    Verdict::Pass
+}
+
+/// A deleted topic must actually be gone.
+///
+/// The plausible wrong answer is the one `create-topics/validate-only`
+/// guards from the other side: reporting success without doing the
+/// work. A caller has no way to see the difference except by asking
+/// again, which is what this does — the topic must stop being named in
+/// Metadata as one that exists.
+async fn delete_topics_removes_the_topic(ctx: &ServerCtx) -> Verdict {
+    let delete_version = match negotiate(
+        "DeleteTopics",
+        match ctx.range(DeleteTopicsRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        DeleteTopicsRequest::MIN_VERSION,
+        DeleteTopicsRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let metadata_version = match negotiate(
+        "Metadata",
+        match ctx.range(MetadataRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        1,
+        MetadataRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let produced = match produce_flow(ctx, "delete", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    let topic = produced.topic.clone();
+    let mut conn = produced.conn;
+
+    let mut request = DeleteTopicsRequest::default();
+    if delete_version >= DELETE_TOPICS_BY_STATE {
+        let mut state = DeleteTopicState::default();
+        state.name = Some(topic.clone());
+        request.topics = vec![state];
+    } else {
+        request.topic_names = vec![topic.clone()];
+    }
+    request.timeout_ms = 30_000;
+    let mut body = BytesMut::new();
+    if let Err(e) = request.encode(&mut body, delete_version) {
+        return Verdict::Error {
+            details: format!("encoding DeleteTopics: {e}"),
+        };
+    }
+    let resp: DeleteTopicsResponse = match api_call(
+        &mut conn,
+        DeleteTopicsRequest::API_KEY,
+        delete_version,
+        800,
+        &body,
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(e) => return e.context("DeleteTopics").into_verdict(),
+    };
+    let code = resp
+        .responses
+        .first()
+        .map_or(ErrorCode::NONE, |r| ErrorCode(r.error_code));
+    if code == ErrorCode::TOPIC_DELETION_DISABLED {
+        return Verdict::Skipped {
+            reason: "the subject has topic deletion disabled".into(),
+        };
+    }
+    if !code.is_ok() {
+        return Verdict::Fail {
+            details: format!("deleting {topic} answered {code}"),
+        };
+    }
+
+    // Deletion is asynchronous on a real broker, so the answer is "gone
+    // shortly", not "gone by the time this returns".
+    let mut last = ErrorCode::NONE;
+    for attempt in 0..ctx.config.settle_attempts() {
+        if attempt > 0 {
+            tokio::time::sleep(ctx.config.settle_delay).await;
+        }
+        let resp = match metadata_of_topic(
+            &mut conn,
+            metadata_version,
+            &topic,
+            810 + i32::try_from(attempt).unwrap_or(0),
+        )
+        .await
+        {
+            Ok(resp) => resp,
+            Err(e) => return e.context("Metadata").into_verdict(),
+        };
+        last = resp
+            .topics
+            .iter()
+            .find(|t| t.name.as_deref() == Some(topic.as_str()))
+            .map_or(ErrorCode::UNKNOWN_TOPIC_OR_PARTITION, |t| {
+                ErrorCode(t.error_code)
+            });
+        if last == ErrorCode::UNKNOWN_TOPIC_OR_PARTITION || last == ErrorCode::UNKNOWN_TOPIC_ID {
+            return Verdict::Pass;
+        }
+    }
+    Verdict::Fail {
+        details: format!(
+            "{topic} was reported deleted, but Metadata still answers {last} for it after \
+             {:?}; the deletion was acknowledged without being done",
+            ctx.config.settle_budget
+        ),
+    }
+}
+
+/// A Metadata request naming one topic, with auto-creation refused.
+///
+/// The flag matters here as much as it does in
+/// `metadata/unknown-topic`: a broker configured to auto-create would
+/// answer a question about a deleted topic by making it again, and the
+/// check would report a pass for the wrong reason.
+async fn metadata_of_topic(
+    conn: &mut RawConnection,
+    version: i16,
+    topic: &str,
+    correlation: i32,
+) -> Result<MetadataResponse, CheckError> {
+    let mut requested = MetadataRequestTopic::default();
+    requested.name = Some(topic.to_owned());
+    let mut request = MetadataRequest::default();
+    request.topics = Some(vec![requested]);
+    request.allow_auto_topic_creation = false;
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding Metadata: {e}")))?;
+    api_call(conn, MetadataRequest::API_KEY, version, correlation, &body).await
 }
