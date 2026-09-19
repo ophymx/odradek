@@ -32,7 +32,12 @@ fn usage() -> ExitCode {
     eprintln!(
         "usage: odradek-accept (--server <host:port> | --client-listen <host:port> | --list)\n\
          \x20 [--sasl-server <host:port>]  a second listener with SASL configured\n\
-         \x20                    [--fault leader-move] [--json]\n\
+         \x20                    [--json]\n\
+         \x20 [--fault <name>]   stage one misbehavior for the client to cope\n\
+         \x20                    with: leader-move, throttle,\n\
+         \x20                    unknown-tagged-field, reject-sasl-token.\n\
+         \x20                    Each arms the checks that need it; without\n\
+         \x20                    one those checks skip.\n\
          \x20                    [--baseline <file>] [--write-baseline <file>]"
     );
     ExitCode::from(2)
@@ -70,6 +75,11 @@ fn parse_args(args: &[String]) -> Option<Args> {
             "--fault" => {
                 parsed.fault = match it.next()?.as_str() {
                     "leader-move" => Some(checks::client::HarnessFault::LeaderMove),
+                    "throttle" => Some(checks::client::HarnessFault::Throttle),
+                    "unknown-tagged-field" => {
+                        Some(checks::client::HarnessFault::UnknownTaggedField)
+                    }
+                    "reject-sasl-token" => Some(checks::client::HarnessFault::RejectSaslToken),
                     _ => return None,
                 }
             }

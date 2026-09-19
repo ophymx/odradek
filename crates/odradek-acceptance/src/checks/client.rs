@@ -1355,15 +1355,16 @@ fn honours_throttle_time(session: &Session) -> Verdict {
     // Clients open several connections — bootstrap, control, one per
     // partition leader — and a throttle on one the client never speaks
     // to again says nothing, which is not the same as passing.
-    let Some((sent_at, next)) = session
+    let Some((sent_at, spoke)) = session
         .throttles
         .iter()
         .find_map(|&(conn_id, index, sent_at)| {
-            session
+            let after: Vec<&Observation> = session
                 .observations
                 .iter()
-                .find(|obs| obs.conn_id == conn_id && obs.index > index)
-                .map(|next| (sent_at, next))
+                .filter(|obs| obs.conn_id == conn_id && obs.index > index)
+                .collect();
+            (!after.is_empty()).then_some((sent_at, after))
         })
     else {
         return Verdict::Skipped {
@@ -1372,23 +1373,38 @@ fn honours_throttle_time(session: &Session) -> Verdict {
                 .into(),
         };
     };
-    // Half the window: a client that rounds, or wakes a little early,
-    // still passes, while one that never waited cannot — those come
-    // back in under a millisecond.
-    let floor = u64::try_from(THROTTLE_MS).unwrap_or(0) / 2;
-    let waited = next.at_ms.saturating_sub(sent_at);
-    if waited < floor {
-        return Verdict::Fail {
-            details: format!(
-                "answered with throttle_time_ms={THROTTLE_MS} and the next request on that \
-                 connection (api {} v{}) arrived {waited}ms later; the broker is not reading \
-                 yet, so that request waits out the mute instead of the client waiting out \
-                 the throttle",
-                next.api_key, next.api_version
-            ),
-        };
+
+    // Judged on the *back half* of the window, not on the next request.
+    // A client may have requests on the wire already when the throttled
+    // answer arrives — Kafka's own producer does — and those are not
+    // violations, they crossed in flight. What no client has an excuse
+    // for is still talking once those have drained: anything arriving
+    // this deep into the window was sent by a client that had read the
+    // throttle and kept going.
+    // The middle of the window, not the whole of it. The front is left
+    // to requests crossing in flight; the tail is left to a client
+    // resuming a little early, which is a rounding difference rather
+    // than a refusal to wait.
+    let window = u64::try_from(THROTTLE_MS).unwrap_or(0);
+    let enforced_from = sent_at + window / 2;
+    let enforced_until = sent_at + window - window / 8;
+    let Some(offender) = spoke
+        .iter()
+        .find(|obs| obs.at_ms >= enforced_from && obs.at_ms < enforced_until)
+    else {
+        return Verdict::Pass;
+    };
+    Verdict::Fail {
+        details: format!(
+            "answered with throttle_time_ms={THROTTLE_MS} and the client was still sending \
+             {}ms into the pause (api {} v{}); requests already in flight are fair, but by \
+             now they have drained and the broker is not reading yet — that request waits \
+             out the mute instead of the client waiting out the throttle",
+            offender.at_ms.saturating_sub(sent_at),
+            offender.api_key,
+            offender.api_version
+        ),
     }
-    Verdict::Pass
 }
 
 /// A client must carry on past a tagged field it does not know.

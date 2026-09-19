@@ -204,14 +204,28 @@ broker does — and the client is expected to keep it and carry on. One
 that refuses instead breaks against every broker newer than itself, and
 breaks on upgrade day in somebody's cluster rather than in a test suite.
 
-`client/honours-throttle-time` found a second gap in this crate's own
-client, which read `throttle_time_ms` from nothing at all. Quota
+`client/honours-throttle-time` is the one that has been wrong twice,
+in both directions. It found a gap in this crate's own client, which
+read `throttle_time_ms` from nothing at all — Quota
 enforcement is not advice a client can decline: the broker answers,
 sets the field, and then stops reading that connection for that long,
 so a client that ignores it does not get its next request in sooner —
 it gets it in later, sitting in a socket buffer while its own request
 timeout runs down. The failure looks like an unreliable broker from
 the inside, which is why nobody goes looking for it in the client.
+
+Then Apache's own Java client failed it, and the check was what was
+wrong. It asked whether the *next* request waited, which assumes a
+client that speaks in turns; a pipelining client has requests on the
+wire before it reads the answer, and Kafka's producer had an
+InitProducerId out 2ms later. That is not a violation, it crossed in
+flight. The check now looks at the *middle* of the pause instead —
+the front belongs to requests already sent, the tail to a client
+resuming a rounding-error early, and what nobody has an excuse for is
+still talking in between. Pointing a foreign client at the harness is
+the only thing that could have shown this: every client check here was
+written, calibrated, and dogfooded by the same author against the same
+client, which is a closed loop no amount of care escapes.
 
 Five checks sweep **every version the subject advertises** rather than
 negotiating one and stopping. Against Kafka 4.1 that is 13 Metadata

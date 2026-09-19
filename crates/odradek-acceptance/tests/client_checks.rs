@@ -450,12 +450,16 @@ async fn odradek_client_waits_out_a_throttle() {
     // it opens its own connection to the partition leader and a pause
     // is per connection.
     let cluster = Cluster::connect(client_config).await.unwrap();
-    // Twice, because the first refresh after connecting opens the
-    // control connection rather than reusing the bootstrap one — so it
-    // is the second that follows a throttle on a connection the client
-    // is still using.
-    cluster.refresh_metadata(&[ROUTING_TOPIC]).await.unwrap();
-    cluster.refresh_metadata(&[ROUTING_TOPIC]).await.unwrap();
+    // Refreshing in a loop for longer than the throttle window is what
+    // makes this observable. A client that waits sends a handful of
+    // requests spaced a window apart, and is silent through the middle
+    // of each one; a client that does not is talking the whole time,
+    // and the check is looking at exactly that middle stretch. Without
+    // the loop the test passes either way — its first version did.
+    let until = std::time::Instant::now() + Duration::from_millis(900);
+    while std::time::Instant::now() < until {
+        cluster.refresh_metadata(&[ROUTING_TOPIC]).await.unwrap();
+    }
     drop(cluster);
 
     let report = harness.await.unwrap().expect("harness ran");
@@ -488,8 +492,11 @@ async fn a_client_that_ignores_a_throttle_is_caught() {
         &request_frame(3, 9, 2, &[0x01, 0x00, 0x00, 0x00]),
     )
     .await;
-    // Straight on without pausing, which is the sin.
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    // A request while the pause is still running, and late enough that
+    // nothing could still be crossing in flight: the sin is talking
+    // *during* the window, not having had something already on the
+    // wire when it started.
+    tokio::time::sleep(Duration::from_millis(250)).await;
     send_frame(
         &mut stream,
         &request_frame(3, 9, 3, &[0x01, 0x00, 0x00, 0x00]),
