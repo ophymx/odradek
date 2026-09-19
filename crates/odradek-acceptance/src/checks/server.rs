@@ -25,6 +25,8 @@ use odradek_protocol::messages::create_topics_request::{CreatableTopic, CreateTo
 use odradek_protocol::messages::create_topics_response::CreateTopicsResponse;
 use odradek_protocol::messages::delete_topics_request::{DeleteTopicState, DeleteTopicsRequest};
 use odradek_protocol::messages::delete_topics_response::DeleteTopicsResponse;
+use odradek_protocol::messages::describe_groups_request::DescribeGroupsRequest;
+use odradek_protocol::messages::describe_groups_response::DescribeGroupsResponse;
 use odradek_protocol::messages::end_txn_request::EndTxnRequest;
 use odradek_protocol::messages::end_txn_response::EndTxnResponse;
 use odradek_protocol::messages::fetch_request::{FetchPartition, FetchRequest, FetchTopic};
@@ -270,6 +272,24 @@ pub static SERVER_CHECKS: &[Check] = &[
         requirement: "completes a SCRAM exchange with a server signature that \
                       verifies, proving it holds the account's key material",
         runner: Runner::Server(|ctx| Box::pin(scram_server_proves_itself(ctx))),
+    },
+    Check {
+        id: "fetch/long-poll-contract",
+        requirement: "waits out max_wait_ms for a fetch it cannot yet satisfy, \
+                      and answers one it can without spending the wait",
+        runner: Runner::Server(|ctx| Box::pin(fetch_long_poll_contract(ctx))),
+    },
+    Check {
+        id: "metadata/leader-is-a-known-broker",
+        requirement: "names every partition leader in the same response's broker \
+                      list, so a client has somewhere to route to",
+        runner: Runner::Server(|ctx| Box::pin(metadata_leader_is_a_known_broker(ctx))),
+    },
+    Check {
+        id: "admin/describe-groups-reports-members",
+        requirement: "reports the members a live group has, rather than \
+                      describing it as empty",
+        runner: Runner::Server(|ctx| Box::pin(describe_groups_reports_members(ctx))),
     },
     Check {
         id: "offsets/metadata-round-trips",
@@ -5414,4 +5434,278 @@ async fn sync_as_leader(
             details: format!("SyncGroup as the group's only member answered {code}"),
         })
     }
+}
+
+/// A fetch must block when there is nothing, and return at once when
+/// there is.
+///
+/// Both halves are the same contract and both fail quietly. A broker
+/// that answers an empty long poll immediately turns every caught-up
+/// consumer into a busy loop — correct data, burned CPU and network, no
+/// error anywhere. A broker that sits on a fetch it could already
+/// satisfy adds its whole wait to the latency of every record.
+async fn fetch_long_poll_contract(ctx: &ServerCtx) -> Verdict {
+    let version = match negotiate(
+        "Fetch",
+        match ctx.range(FetchRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        FetchRequest::MIN_VERSION,
+        FETCH_NAME_MAX,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let produced = match produce_flow(ctx, "longpoll", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    let topic = produced.topic.clone();
+    let mut conn = produced.conn;
+    let end = batch_record_count(&probe_batch());
+
+    // Nothing at the log end, and a byte is asked for: the broker has
+    // to wait for one.
+    // Long enough that a broker which does not wait at all is
+    // unmistakable — those answer in microseconds — and short enough
+    // that the fault matrix, which runs the whole catalogue once per
+    // fault, does not pay a second for it every time.
+    let wait_ms = 500;
+    let started = std::time::Instant::now();
+    if let Err(e) = fetch_with_wait(&mut conn, version, &topic, end, 1, wait_ms, 890).await {
+        return e.context("Fetch (empty, long poll)").into_verdict();
+    }
+    let waited = started.elapsed();
+    // Half the window, so a broker that rounds or wakes early still
+    // passes while one that does not wait at all cannot.
+    let floor = Duration::from_millis(u64::try_from(wait_ms).unwrap_or(0) / 2);
+    if waited < floor {
+        return Verdict::Fail {
+            details: format!(
+                "a fetch at the log end asking for 1 byte with max_wait_ms={wait_ms} came \
+                 back in {waited:?}; a caught-up consumer polling this broker spins instead \
+                 of waiting"
+            ),
+        };
+    }
+
+    // Data already there, the same long wait: it must not be spent.
+    let started = std::time::Instant::now();
+    if let Err(e) = fetch_with_wait(&mut conn, version, &topic, 0, 1, wait_ms, 900).await {
+        return e.context("Fetch (satisfiable, long poll)").into_verdict();
+    }
+    let waited = started.elapsed();
+    if waited >= floor {
+        return Verdict::Fail {
+            details: format!(
+                "a fetch that could be answered from existing records still took {waited:?} \
+                 with max_wait_ms={wait_ms}; the wait is for data that is not there yet, not \
+                 for data that is"
+            ),
+        };
+    }
+    Verdict::Pass
+}
+
+/// One fetch with an explicit `min_bytes` and `max_wait_ms`.
+async fn fetch_with_wait(
+    conn: &mut RawConnection,
+    version: i16,
+    topic: &str,
+    offset: i64,
+    min_bytes: i32,
+    max_wait_ms: i32,
+    correlation: i32,
+) -> Result<(), CheckError> {
+    let mut fetch_partition = FetchPartition::default();
+    fetch_partition.partition = 0;
+    fetch_partition.current_leader_epoch = -1;
+    fetch_partition.fetch_offset = offset;
+    fetch_partition.last_fetched_epoch = -1;
+    fetch_partition.log_start_offset = -1;
+    fetch_partition.partition_max_bytes = 1 << 20;
+    let mut fetch_topic = FetchTopic::default();
+    fetch_topic.topic = topic.to_owned();
+    fetch_topic.partitions = vec![fetch_partition];
+    let mut request = FetchRequest::default();
+    request.max_wait_ms = max_wait_ms;
+    request.min_bytes = min_bytes;
+    request.max_bytes = 1 << 22;
+    request.isolation_level = 0;
+    request.session_id = 0;
+    request.session_epoch = -1;
+    request.topics = vec![fetch_topic];
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding Fetch: {e}")))?;
+    let _: FetchResponse =
+        api_call(conn, FetchRequest::API_KEY, version, correlation, &body).await?;
+    Ok(())
+}
+
+/// Every partition leader must be a broker the same response names.
+///
+/// Metadata is the only thing a client has to route by, and a leader id
+/// it cannot resolve leaves it with nowhere to send and nothing to say
+/// about why. The failure is quiet in a particular way: the response
+/// carries no error, so a client sees a healthy topic it simply cannot
+/// write to.
+async fn metadata_leader_is_a_known_broker(ctx: &ServerCtx) -> Verdict {
+    let version = match negotiate(
+        "Metadata",
+        match ctx.range(MetadataRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        1,
+        MetadataRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let produced = match produce_flow(ctx, "leaderref", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    let topic = produced.topic.clone();
+    let mut conn = produced.conn;
+
+    let resp = match metadata_of_topic(&mut conn, version, &topic, 910).await {
+        Ok(resp) => resp,
+        Err(e) => return e.context("Metadata").into_verdict(),
+    };
+    let known: Vec<i32> = resp.brokers.iter().map(|b| b.node_id).collect();
+    if known.is_empty() {
+        // Nothing to be consistent with. A response that names no
+        // brokers at all is a different and larger failure, and
+        // `metadata/basic` is the check that reports it.
+        return Verdict::Skipped {
+            reason: "the response names no brokers at all (metadata/basic reports that)".into(),
+        };
+    }
+    let Some(entry) = resp
+        .topics
+        .iter()
+        .find(|t| t.name.as_deref() == Some(topic.as_str()))
+    else {
+        return Verdict::Fail {
+            details: format!("Metadata does not name {topic}, which was just produced to"),
+        };
+    };
+    let code = ErrorCode(entry.error_code);
+    if !code.is_ok() {
+        return Verdict::Fail {
+            details: format!("Metadata answered {code} for a topic that exists"),
+        };
+    }
+    if entry.partitions.is_empty() {
+        return Verdict::Fail {
+            details: format!("{topic} exists but Metadata gives it no partitions"),
+        };
+    }
+    for partition in &entry.partitions {
+        let code = ErrorCode(partition.error_code);
+        if !code.is_ok() {
+            continue;
+        }
+        if !known.contains(&partition.leader_id) {
+            return Verdict::Fail {
+                details: format!(
+                    "{topic}[{}] names leader {} and the response's brokers are {known:?}; a \
+                     client is given a healthy-looking topic it has nowhere to send to",
+                    partition.partition_index, partition.leader_id
+                ),
+            };
+        }
+    }
+    Verdict::Pass
+}
+
+/// A described group must name the members it has.
+///
+/// This is the operator's and the admin client's only view of who holds
+/// what. A group reported with no members reads as idle — the state a
+/// tool uses to decide a group is safe to delete, or that a consumer
+/// has died and its lag is nobody's.
+async fn describe_groups_reports_members(ctx: &ServerCtx) -> Verdict {
+    let (join_version, sync_version) = match group_versions(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let describe_version = match negotiate(
+        "DescribeGroups",
+        match ctx.range(DescribeGroupsRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        DescribeGroupsRequest::MIN_VERSION,
+        DescribeGroupsRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let mut conn = match connect(&ctx.addr).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
+    let group = check_group("described");
+    if let Err(e) = await_coordinator(ctx, &group).await {
+        return e.into_verdict();
+    }
+    let (member_id, generation) =
+        match join_as_leader(ctx, &mut conn, join_version, &group, 920).await {
+            Ok(v) => v,
+            Err(e) => return e.into_verdict(),
+        };
+    if let Err(verdict) =
+        sync_as_leader(&mut conn, sync_version, &group, &member_id, generation, 930).await
+    {
+        return verdict;
+    }
+
+    let mut request = DescribeGroupsRequest::default();
+    request.groups = vec![group.clone()];
+    let mut body = BytesMut::new();
+    if let Err(e) = request.encode(&mut body, describe_version) {
+        return Verdict::Error {
+            details: format!("encoding DescribeGroups: {e}"),
+        };
+    }
+    let resp: DescribeGroupsResponse = match api_call(
+        &mut conn,
+        DescribeGroupsRequest::API_KEY,
+        describe_version,
+        940,
+        &body,
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(e) => return e.context("DescribeGroups").into_verdict(),
+    };
+    let Some(described) = resp.groups.iter().find(|g| g.group_id == group) else {
+        return Verdict::Fail {
+            details: format!("DescribeGroups was asked about {group} and answered about neither"),
+        };
+    };
+    let code = ErrorCode(described.error_code);
+    if !code.is_ok() {
+        return Verdict::Fail {
+            details: format!("describing a live group answered {code}"),
+        };
+    }
+    if !described.members.iter().any(|m| m.member_id == member_id) {
+        return Verdict::Fail {
+            details: format!(
+                "{group} has a synced member {member_id}, and DescribeGroups reports {} \
+                 member(s) (state {:?}); a group that reads as empty reads as safe to \
+                 delete",
+                described.members.len(),
+                described.group_state
+            ),
+        };
+    }
+    Verdict::Pass
 }

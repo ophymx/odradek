@@ -3,6 +3,7 @@
   "suite": "0.1.0",
   "checks": {
     "admin/delete-topics-removes-the-topic": "pass",
+    "admin/describe-groups-reports-members": "pass",
     "api-versions/correlation-echo": "pass",
     "api-versions/flexible-v3": "pass",
     "api-versions/unsupported-version-error": "pass",
@@ -15,6 +16,7 @@
     "create-topics/impossible-replication": "pass",
     "create-topics/validate-only": "pass",
     "fetch/batch-integrity": "pass",
+    "fetch/long-poll-contract": "pass",
     "fetch/offset-out-of-range": "pass",
     "fetch/topic-id": "skipped",
     "find-coordinator/group": "pass",
@@ -26,6 +28,7 @@
     "list-offsets/earliest-latest": "pass",
     "metadata/basic": "pass",
     "metadata/flexible-response-header": "skipped",
+    "metadata/leader-is-a-known-broker": "pass",
     "metadata/unknown-topic": "pass",
     "offsets/commit-fetch-roundtrip": "pass",
     "offsets/metadata-round-trips": "pass",

@@ -120,6 +120,19 @@ the ones where the *wrong* answer is plausible:
   client's — processing state, a schema version, a shard id — and the
   offset beside it reads back fine either way, so a broker that drops
   it loses something nothing looks wrong about.
+- A fetch waits out `max_wait_ms` for data that is not there, and does
+  not spend it on data that is. Both halves fail quietly: a broker that
+  answers an empty long poll immediately turns every caught-up consumer
+  into a busy loop — correct data, burned CPU, no error anywhere — and
+  one that sits on a fetch it could already answer adds its whole wait
+  to the latency of every record.
+- Every partition leader is a broker the same response names. A leader
+  id a client cannot resolve leaves it with nowhere to send and no
+  error to explain it: a healthy-looking topic it simply cannot write
+  to.
+- A live group is described with the members it has. That is the only
+  view an operator or an admin client gets of who holds what, and a
+  group that reads as empty reads as safe to delete.
 - A member that has left stops being one. A coordinator that keeps
   honouring a departed member's heartbeats believes it still owns its
   partitions, so they are never reassigned and simply go unread, with

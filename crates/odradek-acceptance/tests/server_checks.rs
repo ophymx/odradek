@@ -81,6 +81,15 @@ const SENSITIVITY: &[(Fault, &str)] = &[
     (Fault::FetchCorruptBatch, "fetch/batch-integrity"),
     (Fault::ProduceTopicIdUnknown, "produce/topic-id"),
     (Fault::FetchWrongTopicId, "fetch/topic-id"),
+    (Fault::FetchIgnoresMaxWait, "fetch/long-poll-contract"),
+    (
+        Fault::MetadataLeaderIsUnknown,
+        "metadata/leader-is-a-known-broker",
+    ),
+    (
+        Fault::DescribeGroupsHidesMembers,
+        "admin/describe-groups-reports-members",
+    ),
     (
         Fault::OffsetCommitDropsMetadata,
         "offsets/metadata-round-trips",
@@ -242,7 +251,11 @@ async fn isolated_faults_cause_no_collateral_failures() {
         Fault::ErrorBodyNotV0,
         Fault::AdvertiseWrongMaxInError,
         Fault::FlexibleHeaderOnV3,
-        Fault::MetadataEmptyBrokers,
+        // MetadataEmptyBrokers is NOT isolated: a response that names no
+        // brokers is the precondition every routing answer rests on, so
+        // metadata/leader-is-a-known-broker correctly declines to judge
+        // rather than accusing the subject of a leader it never named.
+        // `metadata/basic` is the check that reports the empty list.
         Fault::MetadataUnrequestedTopic,
         // The fetch flows deliberately ignore the assigned base offset, so
         // this stays confined to produce/basic. FetchCorruptBatch and

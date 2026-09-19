@@ -29,6 +29,10 @@ use odradek_protocol::messages::delete_topics_request::DeleteTopicsRequest;
 use odradek_protocol::messages::delete_topics_response::{
     DeletableTopicResult, DeleteTopicsResponse,
 };
+use odradek_protocol::messages::describe_groups_request::DescribeGroupsRequest;
+use odradek_protocol::messages::describe_groups_response::{
+    DescribeGroupsResponse, DescribedGroup, DescribedGroupMember,
+};
 use odradek_protocol::messages::end_txn_request::EndTxnRequest;
 use odradek_protocol::messages::end_txn_response::EndTxnResponse;
 use odradek_protocol::messages::fetch_request::FetchRequest;
@@ -51,7 +55,7 @@ use odradek_protocol::messages::list_offsets_response::{
 };
 use odradek_protocol::messages::metadata_request::{self, MetadataRequest};
 use odradek_protocol::messages::metadata_response::{
-    MetadataResponse, MetadataResponseBroker, MetadataResponseTopic,
+    MetadataResponse, MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
 };
 use odradek_protocol::messages::offset_commit_request::OffsetCommitRequest;
 use odradek_protocol::messages::offset_commit_response::{
@@ -206,6 +210,16 @@ pub enum Fault {
     /// Echo a different topic id than the fetch requested.
     FetchWrongTopicId,
 
+    /// Answer a fetch that cannot be satisfied immediately instead of
+    /// waiting out `max_wait_ms`, turning every caught-up consumer into
+    /// a busy loop.
+    FetchIgnoresMaxWait,
+    /// Name a partition leader that is not in the response's own broker
+    /// list, leaving a client with nowhere to route to and no error to
+    /// explain it.
+    MetadataLeaderIsUnknown,
+    /// Describe a live group as having no members, which reads as idle.
+    DescribeGroupsHidesMembers,
     /// Store a commit without the metadata string it carried, so the
     /// offset reads back fine and the client's own state is gone.
     OffsetCommitDropsMetadata,
@@ -270,6 +284,9 @@ impl Fault {
         Fault::FetchCorruptBatch,
         Fault::ProduceTopicIdUnknown,
         Fault::FetchWrongTopicId,
+        Fault::FetchIgnoresMaxWait,
+        Fault::MetadataLeaderIsUnknown,
+        Fault::DescribeGroupsHidesMembers,
         Fault::OffsetCommitDropsMetadata,
         Fault::LeaveGroupKeepsTheMember,
         Fault::CreateTopicsIgnoresReplicationFactor,
@@ -379,6 +396,11 @@ fn advertised_keys() -> Vec<ApiVersion> {
             FindCoordinatorRequest::API_KEY,
             FindCoordinatorRequest::MIN_VERSION,
             FindCoordinatorRequest::MAX_VERSION,
+        ),
+        (
+            DescribeGroupsRequest::API_KEY,
+            DescribeGroupsRequest::MIN_VERSION,
+            DescribeGroupsRequest::MAX_VERSION,
         ),
         (
             DeleteTopicsRequest::API_KEY,
@@ -690,7 +712,7 @@ async fn handle_connection(mut stream: TcpStream, faults: Vec<Fault>) {
                 create_topics_exchange(frame, api_version, &faults, &mut state)
             }
             ProduceRequest::API_KEY => produce_exchange(frame, api_version, &faults, &mut state),
-            FetchRequest::API_KEY => fetch_exchange(frame, api_version, &faults, &state),
+            FetchRequest::API_KEY => fetch_exchange(frame, api_version, &faults, &state).await,
             ListOffsetsRequest::API_KEY => {
                 list_offsets_exchange(frame, api_version, &faults, &state)
             }
@@ -717,6 +739,9 @@ async fn handle_connection(mut stream: TcpStream, faults: Vec<Fault>) {
             }
             ConsumerGroupHeartbeatRequest::API_KEY => {
                 consumer_group_heartbeat_exchange(frame, api_version, &faults, &mut state)
+            }
+            DescribeGroupsRequest::API_KEY => {
+                describe_groups_exchange(frame, api_version, &faults, &state)
             }
             DeleteTopicsRequest::API_KEY => {
                 delete_topics_exchange(frame, api_version, &faults, &mut state)
@@ -1762,6 +1787,21 @@ fn metadata_exchange(
                     Some(id) => {
                         topic.topic_id = *id;
                         topic.error_code = 0;
+                        let mut p = MetadataResponsePartition::default();
+                        p.partition_index = 0;
+                        p.error_code = 0;
+                        // The leader has to be a node the same response
+                        // names, or a client is handed a healthy topic
+                        // with nowhere to send to.
+                        p.leader_id = if has(Fault::MetadataLeaderIsUnknown) {
+                            BROKER_NODE_ID + 999
+                        } else {
+                            BROKER_NODE_ID
+                        };
+                        p.leader_epoch = 0;
+                        p.replica_nodes = vec![BROKER_NODE_ID];
+                        p.isr_nodes = vec![BROKER_NODE_ID];
+                        topic.partitions = vec![p];
                     }
                     None => topic.error_code = ErrorCode::UNKNOWN_TOPIC_OR_PARTITION.0,
                 }
@@ -1993,7 +2033,7 @@ fn produce_exchange(
     )
 }
 
-fn fetch_exchange(
+async fn fetch_exchange(
     mut frame: Bytes,
     api_version: i16,
     faults: &[Fault],
@@ -2005,6 +2045,23 @@ fn fetch_exchange(
     let hv = header::request_header_version(FetchRequest::API_KEY, api_version)?;
     let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
     let request = FetchRequest::decode(&mut frame, api_version).ok()?;
+
+    // The long-poll half of a fetch: when the request asks for bytes
+    // that are not there yet, the wait is the answer. Returning at once
+    // is correct data and a busy loop.
+    let satisfiable = request.min_bytes <= 0
+        || request.topics.iter().any(|topic| {
+            topic.partitions.iter().any(|p| {
+                state
+                    .logs
+                    .get(&(topic.topic.clone(), p.partition))
+                    .is_some_and(|log| p.fetch_offset < log.next_offset)
+            })
+        });
+    if !satisfiable && request.max_wait_ms > 0 && !faults.contains(&Fault::FetchIgnoresMaxWait) {
+        let wait = u64::try_from(request.max_wait_ms).unwrap_or(0);
+        tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+    }
 
     let responses = request
         .topics
@@ -2484,3 +2541,73 @@ fn delete_topics_exchange(
         false,
     )
 }
+
+/// DescribeGroups: who is in the group, which is the only view an
+/// operator or an admin client has of who holds what.
+fn describe_groups_exchange(
+    mut frame: Bytes,
+    api_version: i16,
+    faults: &[Fault],
+    state: &ConnState,
+) -> Option<BytesMut> {
+    if !(DescribeGroupsRequest::MIN_VERSION..=DescribeGroupsRequest::MAX_VERSION)
+        .contains(&api_version)
+    {
+        return None;
+    }
+    let hv = header::request_header_version(DescribeGroupsRequest::API_KEY, api_version)?;
+    let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
+    let request = DescribeGroupsRequest::decode(&mut frame, api_version).ok()?;
+
+    let mut resp = DescribeGroupsResponse::default();
+    resp.groups = request
+        .groups
+        .iter()
+        .map(|group_id| {
+            let mut described = DescribedGroup::default();
+            described.group_id = group_id.clone();
+            match state.groups.get(group_id) {
+                None => {
+                    described.error_code = ErrorCode::NONE.0;
+                    described.group_state = "Dead".into();
+                }
+                Some(group) => {
+                    described.error_code = ErrorCode::NONE.0;
+                    described.group_state = "Stable".into();
+                    described.protocol_type = group.protocol_type.clone();
+                    described.protocol_data = group.protocol_name.clone();
+                    if !faults.contains(&Fault::DescribeGroupsHidesMembers) {
+                        described.members = group
+                            .members
+                            .iter()
+                            .map(|member_id| {
+                                let mut member = DescribedGroupMember::default();
+                                member.member_id = member_id.clone();
+                                member.client_id = CLIENT_ID_LABEL.into();
+                                member.client_host = "/127.0.0.1".into();
+                                // Handed back exactly as the leader
+                                // supplied it, like everywhere else.
+                                member.member_assignment = group
+                                    .assignments
+                                    .get(member_id)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                member
+                            })
+                            .collect();
+                    }
+                }
+            }
+            described
+        })
+        .collect();
+    frame_response(
+        req_header.correlation_id,
+        response_header_version(DescribeGroupsRequest::API_KEY, api_version),
+        |out| resp.encode(out, api_version).unwrap(),
+        false,
+    )
+}
+
+/// The client id this subject reports for its members.
+const CLIENT_ID_LABEL: &str = "odradek-acceptance";
