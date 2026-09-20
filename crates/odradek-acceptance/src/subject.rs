@@ -404,8 +404,8 @@ pub struct SubjectServer {
 impl SubjectServer {
     /// Spawn a subject exhibiting `faults` (none = conformant).
     ///
-    /// [`NODES`] listeners over one [`ClusterState`], which between them
-    /// are a cluster: each leads the partitions and coordinates the
+    /// Three listeners over one shared cluster state, which between
+    /// them are a cluster: each leads the partitions and coordinates the
     /// groups that hash to it, and refers a client that asks the wrong
     /// one onwards. [`addr`](Self::addr) is the bootstrap; the rest are
     /// found through Metadata, as on any cluster.
