@@ -992,18 +992,50 @@ fn is_coordinator_settling(code: ErrorCode) -> bool {
     code == ErrorCode::COORDINATOR_NOT_AVAILABLE || code == ErrorCode::COORDINATOR_LOAD_IN_PROGRESS
 }
 
-/// Wait for the group coordinator to exist before asking it anything.
+/// The endpoint a FindCoordinator response names, from whichever shape
+/// the negotiated version used, or `None` if it named nothing usable.
+fn coordinator_endpoint(resp: &FindCoordinatorResponse, version: i16) -> Option<String> {
+    let (host, port) = if version >= FIND_COORDINATOR_BATCHED {
+        let c = resp.coordinators.first()?;
+        (c.host.as_str(), c.port)
+    } else {
+        (resp.host.as_str(), resp.port)
+    };
+    if host.is_empty() || !(1..=65535).contains(&port) {
+        return None;
+    }
+    Some(format!("{host}:{port}"))
+}
+
+/// A connection to the broker that coordinates `group`.
+///
+/// Group requests are answered only by the coordinator; every other
+/// broker replies `NOT_COORDINATOR` and expects the client to go and ask
+/// the right one. On a single-broker cluster the two are the same
+/// machine, which is how the suite got as far as it did while sending
+/// group requests down whichever connection it already had. On a real
+/// cluster that is a one-in-`n` guess.
+///
+/// Falls back to the bootstrap address when the cluster names no
+/// coordinator — the check that follows then reports whatever the
+/// cluster says, rather than this helper inventing a verdict about it.
+async fn coordinator_conn(ctx: &ServerCtx, group: &str) -> Result<RawConnection, CheckError> {
+    let addr = await_coordinator(ctx, group).await?;
+    connect(addr.as_deref().unwrap_or(&ctx.addr)).await
+}
+
+/// Wait for the group coordinator to exist, and say where it is.
 ///
 /// The offsets checks need this for the same reason and would otherwise
 /// pass or fail on whether they happened to run after
 /// `find-coordinator/group` warmed the cluster — an order dependency
 /// between checks is a bug in the suite, not a property of the subject.
-async fn await_coordinator(ctx: &ServerCtx, group: &str) -> Result<(), CheckError> {
+async fn await_coordinator(ctx: &ServerCtx, group: &str) -> Result<Option<String>, CheckError> {
     let advertised = match ctx.range(FindCoordinatorRequest::API_KEY) {
         Ok(a) => a,
         // No FindCoordinator advertised: let the offsets exchange itself
         // report whatever it reports.
-        Err(_) => return Ok(()),
+        Err(_) => return Ok(None),
     };
     let Ok(version) = negotiate(
         "FindCoordinator",
@@ -1011,7 +1043,7 @@ async fn await_coordinator(ctx: &ServerCtx, group: &str) -> Result<(), CheckErro
         FindCoordinatorRequest::MIN_VERSION,
         FindCoordinatorRequest::MAX_VERSION,
     ) else {
-        return Ok(());
+        return Ok(None);
     };
     let mut request = FindCoordinatorRequest::default();
     request.key_type = 0;
@@ -1039,10 +1071,10 @@ async fn await_coordinator(ctx: &ServerCtx, group: &str) -> Result<(), CheckErro
         )
         .await?;
         if !is_coordinator_settling(coordinator_error(&resp, version)) {
-            return Ok(());
+            return Ok(coordinator_endpoint(&resp, version));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Commit an offset for one partition of `topic` under `group`.
@@ -1213,7 +1245,7 @@ async fn offsets_commit_fetch_roundtrip(ctx: &ServerCtx) -> Verdict {
         Ok(v) => v,
         Err(skip) => return skip,
     };
-    let mut produced = match produce_flow(ctx, "offsets", Addressing::Name).await {
+    let produced = match produce_flow(ctx, "offsets", Addressing::Name).await {
         Ok(p) => p,
         Err(verdict) => return verdict,
     };
@@ -1221,15 +1253,18 @@ async fn offsets_commit_fetch_roundtrip(ctx: &ServerCtx) -> Verdict {
         return skip;
     }
     let group = check_group(&produced.topic);
-    if let Err(e) = await_coordinator(ctx, &group).await {
-        return e.into_verdict();
-    }
+    // The offsets live with the group's coordinator, which is not in
+    // general the broker that leads the topic just produced to.
+    let mut conn = match coordinator_conn(ctx, &group).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
     // Not 0, and not the log end either: a number nothing else would
     // produce by accident.
     let committed = 7;
 
     if let Err(e) = commit_offset(
-        &mut produced.conn,
+        &mut conn,
         commit_version,
         &group,
         &produced.topic,
@@ -1251,7 +1286,7 @@ async fn offsets_commit_fetch_roundtrip(ctx: &ServerCtx) -> Verdict {
         }
         let correlation = 62 + i32::try_from(i).unwrap_or(0);
         match fetch_committed(
-            &mut produced.conn,
+            &mut conn,
             version,
             &group,
             &produced.topic,
@@ -1283,7 +1318,7 @@ async fn offsets_unset_is_sentinel(ctx: &ServerCtx) -> Verdict {
         Ok(v) => v,
         Err(skip) => return skip,
     };
-    let mut produced = match produce_flow(ctx, "unset", Addressing::Name).await {
+    let produced = match produce_flow(ctx, "unset", Addressing::Name).await {
         Ok(p) => p,
         Err(verdict) => return verdict,
     };
@@ -1292,11 +1327,12 @@ async fn offsets_unset_is_sentinel(ctx: &ServerCtx) -> Verdict {
     }
     // A group that has never existed, let alone committed.
     let group = format!("{}-never-committed", check_group(&produced.topic));
-    if let Err(e) = await_coordinator(ctx, &group).await {
-        return e.into_verdict();
-    }
+    let mut conn = match coordinator_conn(ctx, &group).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
     match fetch_committed(
-        &mut produced.conn,
+        &mut conn,
         fetch_version,
         &group,
         &produced.topic,
@@ -1960,10 +1996,7 @@ async fn consumer_group_epoch_advances(ctx: &ServerCtx) -> Verdict {
         Err(skip) => return skip,
     };
     let group = check_group("epoch");
-    if let Err(e) = await_coordinator(ctx, &group).await {
-        return e.into_verdict();
-    }
-    let mut conn = match connect(&ctx.addr).await {
+    let mut conn = match coordinator_conn(ctx, &group).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
@@ -2036,7 +2069,7 @@ async fn consumer_group_assigns_subscription(ctx: &ServerCtx) -> Verdict {
         Err(skip) => return skip,
     };
     // A real topic, so there is something to assign.
-    let mut produced = match produce_flow(ctx, "cgassign", Addressing::Name).await {
+    let produced = match produce_flow(ctx, "cgassign", Addressing::Name).await {
         Ok(p) => p,
         Err(verdict) => return verdict,
     };
@@ -2046,27 +2079,21 @@ async fn consumer_group_assigns_subscription(ctx: &ServerCtx) -> Verdict {
         };
     }
     let group = check_group("cgassign");
-    if let Err(e) = await_coordinator(ctx, &group).await {
-        return e.into_verdict();
-    }
+    // ConsumerGroupHeartbeat is a group call: the coordinator answers it,
+    // and the broker leading the topic only refers you onwards.
+    let mut conn = match coordinator_conn(ctx, &group).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
     let member_id = mint_member_id("assign");
     let topics = vec![produced.topic.clone()];
 
-    let (assigned, _epoch) = match settle_assignment(
-        ctx,
-        &mut produced.conn,
-        version,
-        &group,
-        &member_id,
-        &topics,
-        160,
-    )
-    .await
-    {
-        Ok(a) => a,
-        Err(verdict) => return verdict,
-    };
-    let _ = leave_consumer_group(&mut produced.conn, version, &group, &member_id, 169).await;
+    let (assigned, _epoch) =
+        match settle_assignment(ctx, &mut conn, version, &group, &member_id, &topics, 160).await {
+            Ok(a) => a,
+            Err(verdict) => return verdict,
+        };
+    let _ = leave_consumer_group(&mut conn, version, &group, &member_id, 169).await;
 
     match assigned.iter().find(|tp| tp.topic_id == produced.topic_id) {
         Some(tp) if tp.partitions.contains(&0) => Verdict::Pass,
@@ -2158,7 +2185,7 @@ async fn consumer_group_omitted_subscription(ctx: &ServerCtx) -> Verdict {
         Ok(v) => v,
         Err(skip) => return skip,
     };
-    let mut produced = match produce_flow(ctx, "cgsteady", Addressing::Name).await {
+    let produced = match produce_flow(ctx, "cgsteady", Addressing::Name).await {
         Ok(p) => p,
         Err(verdict) => return verdict,
     };
@@ -2168,47 +2195,32 @@ async fn consumer_group_omitted_subscription(ctx: &ServerCtx) -> Verdict {
         };
     }
     let group = check_group("cgsteady");
-    if let Err(e) = await_coordinator(ctx, &group).await {
-        return e.into_verdict();
-    }
+    let mut conn = match coordinator_conn(ctx, &group).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
     let member_id = mint_member_id("steady");
     let topics = vec![produced.topic.clone()];
 
-    let (_assigned, epoch) = match settle_assignment(
-        ctx,
-        &mut produced.conn,
-        version,
-        &group,
-        &member_id,
-        &topics,
-        170,
-    )
-    .await
-    {
-        Ok(a) => a,
-        Err(verdict) => return verdict,
-    };
+    let (_assigned, epoch) =
+        match settle_assignment(ctx, &mut conn, version, &group, &member_id, &topics, 170).await {
+            Ok(a) => a,
+            Err(verdict) => return verdict,
+        };
 
     // Now heartbeat the way a settled member does: its id and the epoch
     // it was last told, and nothing else. No re-reading the epoch first —
     // a known member arriving at epoch 0 is a rejoin, and being fenced
     // for it is correct.
-    let quiet = match consumer_group_heartbeat(
-        &mut produced.conn,
-        version,
-        &group,
-        &member_id,
-        epoch,
-        None,
-        180,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => return e.into_verdict(),
-    };
+    let quiet =
+        match consumer_group_heartbeat(&mut conn, version, &group, &member_id, epoch, None, 180)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return e.into_verdict(),
+        };
     let code = ErrorCode(quiet.error_code);
-    let _ = leave_consumer_group(&mut produced.conn, version, &group, &member_id, 181).await;
+    let _ = leave_consumer_group(&mut conn, version, &group, &member_id, 181).await;
     if !code.is_ok() {
         return Verdict::Fail {
             details: format!("a heartbeat stating nothing new was answered {code}"),
@@ -2253,10 +2265,7 @@ async fn consumer_group_fenced_epoch(ctx: &ServerCtx) -> Verdict {
         Err(skip) => return skip,
     };
     let group = check_group("cgfence");
-    if let Err(e) = await_coordinator(ctx, &group).await {
-        return e.into_verdict();
-    }
-    let mut conn = match connect(&ctx.addr).await {
+    let mut conn = match coordinator_conn(ctx, &group).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
@@ -2407,14 +2416,11 @@ async fn groups_member_id_required(ctx: &ServerCtx) -> Verdict {
         Ok(v) => v,
         Err(skip) => return skip,
     };
-    let mut conn = match connect(&ctx.addr).await {
+    let group = check_group("memberid");
+    let mut conn = match coordinator_conn(ctx, &group).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
-    let group = check_group("memberid");
-    if let Err(e) = await_coordinator(ctx, &group).await {
-        return e.into_verdict();
-    }
 
     let resp = match join_group(&mut conn, version, &group, "", 120).await {
         Ok(r) => r,
@@ -2460,14 +2466,11 @@ async fn groups_assignment_round_trips(ctx: &ServerCtx) -> Verdict {
         Ok(v) => v,
         Err(skip) => return skip,
     };
-    let mut conn = match connect(&ctx.addr).await {
+    let group = check_group("assignment");
+    let mut conn = match coordinator_conn(ctx, &group).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
-    let group = check_group("assignment");
-    if let Err(e) = await_coordinator(ctx, &group).await {
-        return e.into_verdict();
-    }
     let (member_id, generation) =
         match join_as_leader(ctx, &mut conn, join_version, &group, 130).await {
             Ok(v) => v,
@@ -2544,14 +2547,11 @@ async fn groups_stale_generation_fenced(ctx: &ServerCtx) -> Verdict {
         Ok(v) => v,
         Err(skip) => return skip,
     };
-    let mut conn = match connect(&ctx.addr).await {
+    let group = check_group("fencing");
+    let mut conn = match coordinator_conn(ctx, &group).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
-    let group = check_group("fencing");
-    if let Err(e) = await_coordinator(ctx, &group).await {
-        return e.into_verdict();
-    }
     let (member_id, generation) =
         match join_as_leader(ctx, &mut conn, join_version, &group, 140).await {
             Ok(v) => v,
@@ -3329,11 +3329,19 @@ async fn produce_flow(
             ProduceRequest::MAX_VERSION,
         )?,
     };
+    // Metadata is how the leader is found; without it the flow can only
+    // address the broker it bootstrapped from and hope.
+    let metadata_version = negotiate(
+        "Metadata",
+        ctx.range(MetadataRequest::API_KEY)?,
+        1,
+        MetadataRequest::MAX_VERSION,
+    )?;
     let fail = |details: String| Verdict::Fail { details };
     // Failing to encode our own request means the check never ran.
     let infra = |details: String| Verdict::Error { details };
 
-    let mut conn = connect(&ctx.addr).await.map_err(CheckError::into_verdict)?;
+    let mut bootstrap = connect(&ctx.addr).await.map_err(CheckError::into_verdict)?;
     let topic = unique_topic(tag);
 
     // Create the topic.
@@ -3350,7 +3358,7 @@ async fn produce_flow(
         .encode(&mut body, create_version)
         .map_err(|e| infra(e.to_string()))?;
     let resp: CreateTopicsResponse = api_call(
-        &mut conn,
+        &mut bootstrap,
         CreateTopicsRequest::API_KEY,
         create_version,
         10,
@@ -3411,6 +3419,11 @@ async fn produce_flow(
         .encode(&mut body, produce_version)
         .map_err(|e| infra(e.to_string()))?;
 
+    // Address the leader, not whichever broker answered CreateTopics.
+    let mut conn = connect_to_leader(ctx, &mut bootstrap, metadata_version, &topic, 12)
+        .await
+        .map_err(|e| e.context("locating the partition leader").into_verdict())?;
+
     let mut last_code = ErrorCode(0);
     let attempts = ctx.config.settle_attempts();
     for _ in 0..attempts {
@@ -3443,6 +3456,14 @@ async fn produce_flow(
         }
         last_code = code;
         tokio::time::sleep(ctx.config.settle_delay).await;
+        // Every retriable code here is the cluster saying this broker is
+        // the wrong one to ask — either not yet, or not any more. Asking
+        // Metadata again between attempts is the difference between
+        // waiting for leadership to settle and waiting for it to settle
+        // *here*, and only the first is something a cluster will ever do.
+        conn = connect_to_leader(ctx, &mut bootstrap, metadata_version, &topic, 13)
+            .await
+            .map_err(|e| e.context("relocating the partition leader").into_verdict())?;
     }
     Err(fail(format!(
         "topic never became producible: still {last_code} after {attempts} attempts \
@@ -3810,11 +3831,11 @@ async fn await_txn_coordinator(
     conn: &mut RawConnection,
     transactional_id: &str,
     correlation: i32,
-) -> Result<(), CheckError> {
+) -> Result<Option<String>, CheckError> {
     let advertised = match ctx.range(FindCoordinatorRequest::API_KEY) {
         Ok(a) => a,
         // Nothing to ask; let InitProducerId report what it reports.
-        Err(_) => return Ok(()),
+        Err(_) => return Ok(None),
     };
     let Ok(version) = negotiate(
         "FindCoordinator",
@@ -3822,7 +3843,7 @@ async fn await_txn_coordinator(
         FindCoordinatorRequest::MIN_VERSION,
         FindCoordinatorRequest::MAX_VERSION,
     ) else {
-        return Ok(());
+        return Ok(None);
     };
     let mut request = FindCoordinatorRequest::default();
     request.key_type = 1; // transaction coordinator
@@ -3849,14 +3870,23 @@ async fn await_txn_coordinator(
         )
         .await?;
         if !is_coordinator_settling(coordinator_error(&resp, version)) {
-            return Ok(());
+            return Ok(coordinator_endpoint(&resp, version));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Claim a transactional id, riding out a coordinator that is still
-/// loading.
+/// loading, and hand back the connection to the coordinator that granted
+/// it.
+///
+/// The connection is the point. Every later call in the transaction —
+/// AddPartitionsToTxn, AddOffsetsToTxn, EndTxn — is answered by this one
+/// broker and by no other, while the writes inside the transaction go to
+/// the partition leaders instead, and any offsets go to the *group*
+/// coordinator. Three roles that a single-broker cluster collapses onto
+/// one machine and a real one does not. Handing the connection back
+/// makes each caller say which of the three it means.
 ///
 /// A cluster that has never hosted a transaction creates its
 /// transaction log on the first ask and answers
@@ -3865,12 +3895,14 @@ async fn await_txn_coordinator(
 /// as one would fail every transaction check on a fresh broker.
 async fn init_producer_id(
     ctx: &ServerCtx,
-    conn: &mut RawConnection,
     version: i16,
     transactional_id: &str,
     correlation: i32,
-) -> Result<InitProducerIdResponse, CheckError> {
-    await_txn_coordinator(ctx, conn, transactional_id, correlation - 1).await?;
+) -> Result<(RawConnection, InitProducerIdResponse), CheckError> {
+    let mut bootstrap = connect(&ctx.addr).await?;
+    let located =
+        await_txn_coordinator(ctx, &mut bootstrap, transactional_id, correlation - 1).await?;
+    let mut conn = connect(located.as_deref().unwrap_or(&ctx.addr)).await?;
     let mut request = InitProducerIdRequest::default();
     request.transactional_id = Some(transactional_id.to_owned());
     request.transaction_timeout_ms = 60_000;
@@ -3888,11 +3920,18 @@ async fn init_producer_id(
             // Ask again where the coordinator is: on a broker that has
             // never hosted a transaction, this is the call that creates
             // the log, and a NOT_COORDINATOR means the partition it
-            // lives on has no leader yet.
-            await_txn_coordinator(ctx, conn, transactional_id, correlation - 1).await?;
+            // lives on has no leader yet. On a cluster it can equally
+            // mean the coordinator is another broker, so follow the
+            // answer rather than merely waiting on it.
+            if let Some(addr) =
+                await_txn_coordinator(ctx, &mut bootstrap, transactional_id, correlation - 1)
+                    .await?
+            {
+                conn = connect(&addr).await?;
+            }
         }
         let resp: InitProducerIdResponse = api_call(
-            conn,
+            &mut conn,
             InitProducerIdRequest::API_KEY,
             version,
             correlation + i32::try_from(attempt).unwrap_or(0),
@@ -3901,7 +3940,7 @@ async fn init_producer_id(
         .await?;
         last = ErrorCode(resp.error_code);
         if last.is_ok() {
-            return Ok(resp);
+            return Ok((conn, resp));
         }
         // Coordinator-settling codes are a wait, not an answer: the
         // transaction log is being created and its partitions are
@@ -4132,17 +4171,13 @@ async fn txn_init_bumps_the_epoch(ctx: &ServerCtx) -> Verdict {
         Ok(v) => v,
         Err(skip) => return skip,
     };
-    let mut conn = match connect(&ctx.addr).await {
-        Ok(c) => c,
-        Err(e) => return e.into_verdict(),
-    };
     let id = unique_transactional_id("epoch");
 
-    let first = match init_producer_id(ctx, &mut conn, versions.init, &id, 400).await {
+    let (_, first) = match init_producer_id(ctx, versions.init, &id, 400).await {
         Ok(r) => r,
         Err(e) => return e.context("InitProducerId (first)").into_verdict(),
     };
-    let second = match init_producer_id(ctx, &mut conn, versions.init, &id, 420).await {
+    let (_, second) = match init_producer_id(ctx, versions.init, &id, 420).await {
         Ok(r) => r,
         Err(e) => return e.context("InitProducerId (second)").into_verdict(),
     };
@@ -4186,14 +4221,13 @@ async fn txn_stale_epoch_is_fenced(ctx: &ServerCtx) -> Verdict {
         Ok(p) => p,
         Err(verdict) => return verdict,
     };
-    let mut conn = produced.conn;
     let id = unique_transactional_id("fence");
 
-    let first = match init_producer_id(ctx, &mut conn, versions.init, &id, 440).await {
+    let (_, first) = match init_producer_id(ctx, versions.init, &id, 440).await {
         Ok(r) => r,
         Err(e) => return e.context("InitProducerId (first)").into_verdict(),
     };
-    let second = match init_producer_id(ctx, &mut conn, versions.init, &id, 460).await {
+    let (mut conn, second) = match init_producer_id(ctx, versions.init, &id, 460).await {
         Ok(r) => r,
         Err(e) => return e.context("InitProducerId (second)").into_verdict(),
     };
@@ -4260,10 +4294,10 @@ async fn txn_unannounced_write_stays_in_the_transaction(ctx: &ServerCtx) -> Verd
         Err(verdict) => return verdict,
     };
     let topic = produced.topic.clone();
-    let mut conn = produced.conn;
+    let mut leader = produced.conn;
     let id = unique_transactional_id("unannounced");
 
-    let identity = match init_producer_id(ctx, &mut conn, versions.init, &id, 500).await {
+    let (mut txn, identity) = match init_producer_id(ctx, versions.init, &id, 500).await {
         Ok(r) => r,
         Err(e) => return e.context("InitProducerId").into_verdict(),
     };
@@ -4271,7 +4305,7 @@ async fn txn_unannounced_write_stays_in_the_transaction(ctx: &ServerCtx) -> Verd
     // No AddPartitionsToTxn: straight to the write.
     let actor = TxnActor::new(&id, &identity);
     let base_offset = match produce_stamped(
-        &mut conn,
+        &mut leader,
         versions.produce,
         ProduceStamp::transactional(actor, 0),
         &topic,
@@ -4290,7 +4324,7 @@ async fn txn_unannounced_write_stays_in_the_transaction(ctx: &ServerCtx) -> Verd
     // It was accepted. Then the transaction had better own it — which
     // an abort is the sharpest way to ask: if these records survive
     // being thrown away, they were never in the transaction.
-    match end_txn(&mut conn, versions.end, actor, false, 530).await {
+    match end_txn(&mut txn, versions.end, actor, false, 530).await {
         Ok(code) if code.is_ok() => {}
         Ok(code) => {
             return Verdict::Fail {
@@ -4305,7 +4339,7 @@ async fn txn_unannounced_write_stays_in_the_transaction(ctx: &ServerCtx) -> Verd
 
     match await_abort_marker(
         ctx,
-        &mut conn,
+        &mut leader,
         versions.fetch,
         AbortedRun {
             topic: &topic,
@@ -4339,27 +4373,40 @@ async fn txn_open_transaction_holds_the_stable_offset(ctx: &ServerCtx) -> Verdic
         Err(verdict) => return verdict,
     };
     let topic = produced.topic.clone();
-    let mut conn = produced.conn;
+    let mut leader = produced.conn;
     let id = unique_transactional_id("lso");
 
-    let identity = match init_producer_id(ctx, &mut conn, versions.init, &id, 540).await {
+    let (mut txn, identity) = match init_producer_id(ctx, versions.init, &id, 540).await {
         Ok(r) => r,
         Err(e) => return e.context("InitProducerId").into_verdict(),
     };
     let actor = TxnActor::new(&id, &identity);
-    if let Err(verdict) = open_transaction(ctx, &mut conn, &versions, actor, &topic, 0, 560).await {
+    let conns = TxnConns {
+        txn: &mut txn,
+        leader: &mut leader,
+    };
+    if let Err(verdict) = open_transaction(ctx, conns, &versions, actor, &topic, 0, 560).await {
         return verdict;
     }
 
-    let data =
-        match fetch_partition(&mut conn, versions.fetch, &topic, 0, 0, READ_COMMITTED, 580).await {
-            Ok(d) => d,
-            Err(e) => return e.context("Fetch (read_committed)").into_verdict(),
-        };
+    let data = match fetch_partition(
+        &mut leader,
+        versions.fetch,
+        &topic,
+        0,
+        0,
+        READ_COMMITTED,
+        580,
+    )
+    .await
+    {
+        Ok(d) => d,
+        Err(e) => return e.context("Fetch (read_committed)").into_verdict(),
+    };
     // Whatever else happens, the transaction stays open only as long as
     // this check needs it; an abandoned one would hold the partition
     // back from every later check on the same broker.
-    let cleanup = end_txn(&mut conn, versions.end, actor, false, 599).await;
+    let cleanup = end_txn(&mut txn, versions.end, actor, false, 599).await;
 
     if data.high_watermark <= data.last_stable_offset {
         return Verdict::Fail {
@@ -4394,20 +4441,23 @@ async fn txn_abort_is_reported_to_readers(ctx: &ServerCtx) -> Verdict {
         Err(verdict) => return verdict,
     };
     let topic = produced.topic.clone();
-    let mut conn = produced.conn;
+    let mut leader = produced.conn;
     let id = unique_transactional_id("abort");
 
-    let identity = match init_producer_id(ctx, &mut conn, versions.init, &id, 600).await {
+    let (mut txn, identity) = match init_producer_id(ctx, versions.init, &id, 600).await {
         Ok(r) => r,
         Err(e) => return e.context("InitProducerId").into_verdict(),
     };
     let actor = TxnActor::new(&id, &identity);
-    let first_offset =
-        match open_transaction(ctx, &mut conn, &versions, actor, &topic, 0, 620).await {
-            Ok(offset) => offset,
-            Err(verdict) => return verdict,
-        };
-    match end_txn(&mut conn, versions.end, actor, false, 640).await {
+    let conns = TxnConns {
+        txn: &mut txn,
+        leader: &mut leader,
+    };
+    let first_offset = match open_transaction(ctx, conns, &versions, actor, &topic, 0, 620).await {
+        Ok(offset) => offset,
+        Err(verdict) => return verdict,
+    };
+    match end_txn(&mut txn, versions.end, actor, false, 640).await {
         Ok(code) if code.is_ok() => {}
         Ok(code) => {
             return Verdict::Fail {
@@ -4419,7 +4469,7 @@ async fn txn_abort_is_reported_to_readers(ctx: &ServerCtx) -> Verdict {
 
     match await_abort_marker(
         ctx,
-        &mut conn,
+        &mut leader,
         versions.fetch,
         AbortedRun {
             topic: &topic,
@@ -4525,16 +4575,30 @@ struct AbortedRun<'a> {
 
 /// Announce a partition and write one transactional batch to it,
 /// returning the base offset the transaction starts at.
+/// The two brokers a transaction is carried out against.
+///
+/// The coordinator owns the transaction — it grants the id, records
+/// which partitions are in, and writes the markers that end it — while
+/// the records themselves go to whichever broker leads the partition.
+/// A single-broker cluster collapses the pair onto one machine, which is
+/// how a suite can go a long way sending both down the same connection
+/// without noticing.
+struct TxnConns<'a> {
+    txn: &'a mut RawConnection,
+    leader: &'a mut RawConnection,
+}
+
 async fn open_transaction(
     ctx: &ServerCtx,
-    conn: &mut RawConnection,
+    conns: TxnConns<'_>,
     versions: &TxnVersions,
     actor: TxnActor<'_>,
     topic: &str,
     partition: i32,
     correlation: i32,
 ) -> Result<i64, Verdict> {
-    match add_partitions_to_txn(conn, versions.add, actor, topic, partition, correlation).await {
+    let TxnConns { txn, leader } = conns;
+    match add_partitions_to_txn(txn, versions.add, actor, topic, partition, correlation).await {
         Ok(code) if code.is_ok() => {}
         Ok(code) => {
             return Err(Verdict::Fail {
@@ -4552,7 +4616,7 @@ async fn open_transaction(
             tokio::time::sleep(ctx.config.settle_delay).await;
         }
         match produce_stamped(
-            conn,
+            leader,
             versions.produce,
             ProduceStamp::transactional(actor, 0),
             topic,
@@ -5084,6 +5148,73 @@ async fn metadata_of_topic(
     api_call(conn, MetadataRequest::API_KEY, version, correlation, &body).await
 }
 
+/// The address of the broker leading partition 0 of `topic`, or `None`
+/// while leadership is still settling.
+///
+/// Read out of the cluster's own Metadata, which is the only place a
+/// client could learn it either.
+async fn leader_endpoint(
+    conn: &mut RawConnection,
+    version: i16,
+    topic: &str,
+    correlation: i32,
+) -> Result<Option<String>, CheckError> {
+    let resp = metadata_of_topic(conn, version, topic, correlation).await?;
+    let Some(entry) = resp
+        .topics
+        .iter()
+        .find(|t| t.name.as_deref() == Some(topic))
+    else {
+        return Ok(None);
+    };
+    if !ErrorCode(entry.error_code).is_ok() {
+        return Ok(None);
+    }
+    let Some(partition) = entry.partitions.iter().find(|p| p.partition_index == 0) else {
+        return Ok(None);
+    };
+    if !ErrorCode(partition.error_code).is_ok() {
+        return Ok(None);
+    }
+    Ok(resp
+        .brokers
+        .iter()
+        .find(|b| b.node_id == partition.leader_id)
+        .filter(|b| !b.host.is_empty() && (1..=65535).contains(&b.port))
+        .map(|b| format!("{}:{}", b.host, b.port)))
+}
+
+/// A connection to the broker leading partition 0 of `topic`, waiting
+/// out the window in which a freshly created topic has no leader yet.
+///
+/// Writes are answered only by the leader; a follower says
+/// `NOT_LEADER_OR_FOLLOWER` and expects the client to consult Metadata
+/// and go elsewhere. Retrying against the same broker — which is what
+/// treating that code as merely retriable amounts to — can only work on
+/// a cluster of one, where the leader is the only broker there is.
+///
+/// Returns the bootstrap connection's own address when Metadata names no
+/// usable leader, so that a cluster in that state is reported by the
+/// check rather than by this helper.
+async fn connect_to_leader(
+    ctx: &ServerCtx,
+    bootstrap: &mut RawConnection,
+    version: i16,
+    topic: &str,
+    correlation_base: i32,
+) -> Result<RawConnection, CheckError> {
+    for attempt in 0..ctx.config.settle_attempts() {
+        if attempt > 0 {
+            tokio::time::sleep(ctx.config.settle_delay).await;
+        }
+        let correlation = correlation_base + i32::try_from(attempt).unwrap_or(0);
+        if let Some(addr) = leader_endpoint(bootstrap, version, topic, correlation).await? {
+            return connect(&addr).await;
+        }
+    }
+    connect(&ctx.addr).await
+}
+
 /// Commit metadata must come back exactly as it was given.
 ///
 /// The string is the client's, and the broker has no business in it:
@@ -5107,11 +5238,12 @@ async fn offsets_metadata_round_trips(ctx: &ServerCtx) -> Verdict {
     }
     let topic = produced.topic.clone();
     let topic_id = produced.topic_id;
-    let mut conn = produced.conn;
     let group = check_group("commitmeta");
-    if let Err(e) = await_coordinator(ctx, &group).await {
-        return e.into_verdict();
-    }
+    // The produce leg is over; what follows is all coordinator traffic.
+    let mut conn = match coordinator_conn(ctx, &group).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
 
     // Shaped to catch the ways a string gets mangled in transit:
     // non-ASCII, an embedded quote, and enough length to notice a
@@ -5344,14 +5476,11 @@ async fn groups_leave_unregisters_the_member(ctx: &ServerCtx) -> Verdict {
         Ok(v) => v,
         Err(skip) => return skip,
     };
-    let mut conn = match connect(&ctx.addr).await {
+    let group = check_group("leaving");
+    let mut conn = match coordinator_conn(ctx, &group).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
-    let group = check_group("leaving");
-    if let Err(e) = await_coordinator(ctx, &group).await {
-        return e.into_verdict();
-    }
     let (member_id, generation) =
         match join_as_leader(ctx, &mut conn, join_version, &group, 850).await {
             Ok(v) => v,
@@ -5725,14 +5854,11 @@ async fn describe_groups_reports_members(ctx: &ServerCtx) -> Verdict {
         Ok(v) => v,
         Err(skip) => return skip,
     };
-    let mut conn = match connect(&ctx.addr).await {
+    let group = check_group("described");
+    let mut conn = match coordinator_conn(ctx, &group).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
-    let group = check_group("described");
-    if let Err(e) = await_coordinator(ctx, &group).await {
-        return e.into_verdict();
-    }
     let (member_id, generation) =
         match join_as_leader(ctx, &mut conn, join_version, &group, 920).await {
             Ok(v) => v,
@@ -5841,12 +5967,27 @@ async fn produce_compressed_passthrough(ctx: &ServerCtx) -> Verdict {
         Err(skip) => return skip,
     };
 
-    let mut conn = match connect(&ctx.addr).await {
+    // This check builds its own batch rather than going through
+    // `produce_flow`, so it has to find the leader for itself too.
+    let metadata_version = match negotiate(
+        "Metadata",
+        match ctx.range(MetadataRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        1,
+        MetadataRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+
+    let mut bootstrap = match connect(&ctx.addr).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
     let topic = unique_topic("gzip");
-    match create_topic_call(ctx, &mut conn, create_version, &topic, false, 950).await {
+    match create_topic_call(ctx, &mut bootstrap, create_version, &topic, false, 950).await {
         Ok((code, _)) if code.is_ok() => {}
         Ok((code, _)) => {
             return Verdict::Fail {
@@ -5855,6 +5996,11 @@ async fn produce_compressed_passthrough(ctx: &ServerCtx) -> Verdict {
         }
         Err(e) => return e.context("CreateTopics").into_verdict(),
     }
+    let mut conn = match connect_to_leader(ctx, &mut bootstrap, metadata_version, &topic, 951).await
+    {
+        Ok(c) => c,
+        Err(e) => return e.context("locating the partition leader").into_verdict(),
+    };
 
     let sent = match gzip_batch() {
         Ok(bytes) => bytes,
@@ -5916,6 +6062,13 @@ async fn produce_compressed_passthrough(ctx: &ServerCtx) -> Verdict {
                 details: format!("producing a gzip batch answered {last}"),
             };
         }
+        // As in `produce_flow`: a retriable code here means this broker
+        // is the wrong one to ask, so ask Metadata again rather than
+        // asking the same broker again.
+        conn = match connect_to_leader(ctx, &mut bootstrap, metadata_version, &topic, 952).await {
+            Ok(c) => c,
+            Err(e) => return e.context("relocating the partition leader").into_verdict(),
+        };
     }
     if !produced {
         return Verdict::Fail {
@@ -6013,20 +6166,24 @@ async fn txn_commit_is_visible_to_readers(ctx: &ServerCtx) -> Verdict {
         Err(verdict) => return verdict,
     };
     let topic = produced.topic.clone();
-    let mut conn = produced.conn;
+    let mut leader = produced.conn;
     let id = unique_transactional_id("commit");
 
-    let identity = match init_producer_id(ctx, &mut conn, versions.init, &id, 980).await {
+    let (mut txn, identity) = match init_producer_id(ctx, versions.init, &id, 980).await {
         Ok(r) => r,
         Err(e) => return e.context("InitProducerId").into_verdict(),
     };
     let actor = TxnActor::new(&id, &identity);
-    let first_offset =
-        match open_transaction(ctx, &mut conn, &versions, actor, &topic, 0, 1_000).await {
-            Ok(offset) => offset,
-            Err(verdict) => return verdict,
-        };
-    match end_txn(&mut conn, versions.end, actor, true, 1_020).await {
+    let conns = TxnConns {
+        txn: &mut txn,
+        leader: &mut leader,
+    };
+    let first_offset = match open_transaction(ctx, conns, &versions, actor, &topic, 0, 1_000).await
+    {
+        Ok(offset) => offset,
+        Err(verdict) => return verdict,
+    };
+    match end_txn(&mut txn, versions.end, actor, true, 1_020).await {
         Ok(code) if code.is_ok() => {}
         Ok(code) => {
             return Verdict::Fail {
@@ -6044,7 +6201,7 @@ async fn txn_commit_is_visible_to_readers(ctx: &ServerCtx) -> Verdict {
             tokio::time::sleep(ctx.config.settle_delay).await;
         }
         let got = match fetch_partition(
-            &mut conn,
+            &mut leader,
             versions.fetch,
             &topic,
             0,
@@ -6153,14 +6310,20 @@ async fn txn_offsets_wait_for_the_commit(ctx: &ServerCtx) -> Verdict {
     };
     let topic = produced.topic.clone();
     let topic_id = produced.topic_id;
-    let mut conn = produced.conn;
     let id = unique_transactional_id("txnoffsets");
     let group = check_group("txnoffsets");
-    if let Err(e) = await_coordinator(ctx, &group).await {
-        return e.into_verdict();
-    }
+    // This check is the one that needs all three brokers at once: the
+    // transaction coordinator to open and end it, the group coordinator
+    // to hold the offsets, and — via `produced` — the partition leader
+    // the records went to. On one broker they are one connection, which
+    // is why sending all of it down `produced.conn` worked for as long
+    // as it did.
+    let mut offsets = match coordinator_conn(ctx, &group).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
 
-    let identity = match init_producer_id(ctx, &mut conn, versions.init, &id, 1_060).await {
+    let (mut conn, identity) = match init_producer_id(ctx, versions.init, &id, 1_060).await {
         Ok(r) => r,
         Err(e) => return e.context("InitProducerId").into_verdict(),
     };
@@ -6178,7 +6341,7 @@ async fn txn_offsets_wait_for_the_commit(ctx: &ServerCtx) -> Verdict {
     }
     let committed = 31;
     match txn_offset_commit(
-        &mut conn,
+        &mut offsets,
         commit_version,
         actor,
         &group,
@@ -6199,7 +6362,7 @@ async fn txn_offsets_wait_for_the_commit(ctx: &ServerCtx) -> Verdict {
 
     // Still open: the offset must not be readable yet.
     match fetch_committed(
-        &mut conn,
+        &mut offsets,
         fetch_offsets_version,
         &group,
         &topic,
@@ -6238,7 +6401,7 @@ async fn txn_offsets_wait_for_the_commit(ctx: &ServerCtx) -> Verdict {
             tokio::time::sleep(ctx.config.settle_delay).await;
         }
         match fetch_committed(
-            &mut conn,
+            &mut offsets,
             fetch_offsets_version,
             &group,
             &topic,
@@ -6362,10 +6525,10 @@ async fn txn_fenced_producer_cannot_produce(ctx: &ServerCtx) -> Verdict {
         Err(verdict) => return verdict,
     };
     let topic = produced.topic.clone();
-    let mut conn = produced.conn;
+    let mut leader = produced.conn;
     let id = unique_transactional_id("zombie");
 
-    let first = match init_producer_id(ctx, &mut conn, versions.init, &id, 1_200).await {
+    let (mut txn, first) = match init_producer_id(ctx, versions.init, &id, 1_200).await {
         Ok(r) => r,
         Err(e) => return e.context("InitProducerId (first)").into_verdict(),
     };
@@ -6373,13 +6536,15 @@ async fn txn_fenced_producer_cannot_produce(ctx: &ServerCtx) -> Verdict {
     // The doomed producer announces its partition while it still can,
     // so what the leader refuses later is the write itself rather than
     // an unannounced partition.
-    if let Err(verdict) =
-        open_transaction(ctx, &mut conn, &versions, zombie, &topic, 0, 1_220).await
-    {
+    let conns = TxnConns {
+        txn: &mut txn,
+        leader: &mut leader,
+    };
+    if let Err(verdict) = open_transaction(ctx, conns, &versions, zombie, &topic, 0, 1_220).await {
         return verdict;
     }
 
-    let second = match init_producer_id(ctx, &mut conn, versions.init, &id, 1_260).await {
+    let (mut txn, second) = match init_producer_id(ctx, versions.init, &id, 1_260).await {
         Ok(r) => r,
         Err(e) => return e.context("InitProducerId (second)").into_verdict(),
     };
@@ -6393,7 +6558,7 @@ async fn txn_fenced_producer_cannot_produce(ctx: &ServerCtx) -> Verdict {
 
     // The zombie writes on, at the epoch it still believes it holds.
     let outcome = produce_stamped(
-        &mut conn,
+        &mut leader,
         versions.produce,
         ProduceStamp::transactional(zombie, 1),
         &topic,
@@ -6404,7 +6569,7 @@ async fn txn_fenced_producer_cannot_produce(ctx: &ServerCtx) -> Verdict {
     // Whatever happens, do not leave the successor's transaction open
     // behind this check.
     let live = TxnActor::new(&id, &second);
-    let _ = end_txn(&mut conn, versions.end, live, false, 1_299).await;
+    let _ = end_txn(&mut txn, versions.end, live, false, 1_299).await;
 
     match outcome {
         Ok((code, _)) if is_fenced(code) => Verdict::Pass,
