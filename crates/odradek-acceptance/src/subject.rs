@@ -368,12 +368,17 @@ impl SubjectServer {
     pub async fn spawn(faults: Vec<Fault>) -> io::Result<SubjectServer> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?.to_string();
+        let cluster: Cluster = Cluster::default();
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
-                tokio::spawn(handle_connection(stream, faults.clone()));
+                tokio::spawn(handle_connection(
+                    stream,
+                    faults.clone(),
+                    std::sync::Arc::clone(&cluster),
+                ));
             }
         });
         Ok(SubjectServer { addr, handle })
@@ -581,22 +586,39 @@ struct TxnState {
     pending_offsets: HashMap<(String, String, i32), (i64, Option<String>)>,
 }
 
-/// Connection-scoped broker state — the suite's produce/fetch flow uses
-/// a single connection, and cross-connection state would leak between
-/// concurrently running checks.
+/// Broker state as the connections share it.
+///
+/// A plain `std` mutex, not an async one: every handler but the fetch is
+/// synchronous and holds the lock only for the length of one exchange.
+/// The fetch takes it twice instead of holding it across its long poll —
+/// see [`fetch_exchange`].
+type Cluster = std::sync::Arc<std::sync::Mutex<ClusterState>>;
+
+/// Broker state, shared by every connection to this subject.
+///
+/// It was per-connection once, on the reasoning that concurrent checks
+/// would otherwise leak into each other. That reasoning was wrong twice
+/// over. Checks already name their topics and groups per run and per
+/// check precisely so that sharing is safe, and a broker whose topics
+/// exist only on the connection that created them is not modelling a
+/// broker at all — it is modelling the suite's old habit of doing
+/// everything down one socket. The moment checks began routing to
+/// leaders and coordinators, a topic created on one connection had to be
+/// visible from another, exactly as on a real cluster.
+///
+/// Only the SASL exchange is genuinely per-connection, and it stays
+/// there.
 #[derive(Debug, Default)]
-struct ConnState {
+struct ClusterState {
     logs: HashMap<(String, i32), PartitionLog>,
     /// Topic ids minted by CreateTopics, keyed by id.
     topic_names: HashMap<[u8; 16], String>,
     /// Committed offsets, keyed by (group, topic, partition).
     committed: HashMap<(String, String, i32), (i64, Option<String>)>,
-    /// Consumer groups this connection has joined (classic protocol).
+    /// Consumer groups the cluster holds (classic protocol).
     groups: HashMap<String, GroupState>,
     /// KIP-848 members, keyed by (group, member id).
     members_848: HashMap<(String, String), Member848>,
-    /// Where this connection is in the SASL exchange.
-    sasl: SaslState,
     /// Transactions by transactional id.
     txns: HashMap<String, TxnState>,
     /// The next producer id to hand out.
@@ -724,12 +746,14 @@ fn mint_topic_id(name: &str) -> [u8; 16] {
     id
 }
 
-async fn handle_connection(mut stream: TcpStream, faults: Vec<Fault>) {
+async fn handle_connection(mut stream: TcpStream, faults: Vec<Fault>, cluster: Cluster) {
     let local_port = match stream.local_addr() {
         Ok(a) => i32::from(a.port()),
         Err(_) => return,
     };
-    let mut state = ConnState::default();
+    // The SASL exchange is this connection's; everything else belongs to
+    // the cluster and is locked per request.
+    let mut sasl = SaslState::default();
     loop {
         let mut len_bytes = [0u8; 4];
         if stream.read_exact(&mut len_bytes).await.is_err() {
@@ -752,65 +776,85 @@ async fn handle_connection(mut stream: TcpStream, faults: Vec<Fault>) {
         let api_version = i16::from_be_bytes([frame[2], frame[3]]);
         let out = match api_key {
             ApiVersionsRequest::API_KEY => api_versions_exchange(frame, api_version, &faults),
-            MetadataRequest::API_KEY => {
-                metadata_exchange(frame, api_version, local_port, &faults, &state)
-            }
+            MetadataRequest::API_KEY => metadata_exchange(
+                frame,
+                api_version,
+                local_port,
+                &faults,
+                &cluster.lock().unwrap(),
+            ),
             CreateTopicsRequest::API_KEY => {
-                create_topics_exchange(frame, api_version, &faults, &mut state)
+                create_topics_exchange(frame, api_version, &faults, &mut cluster.lock().unwrap())
             }
-            ProduceRequest::API_KEY => produce_exchange(frame, api_version, &faults, &mut state),
-            FetchRequest::API_KEY => fetch_exchange(frame, api_version, &faults, &state).await,
+            ProduceRequest::API_KEY => {
+                produce_exchange(frame, api_version, &faults, &mut cluster.lock().unwrap())
+            }
+            FetchRequest::API_KEY => fetch_exchange(frame, api_version, &faults, &cluster).await,
             ListOffsetsRequest::API_KEY => {
-                list_offsets_exchange(frame, api_version, &faults, &state)
+                list_offsets_exchange(frame, api_version, &faults, &cluster.lock().unwrap())
             }
             FindCoordinatorRequest::API_KEY => {
                 find_coordinator_exchange(frame, api_version, local_port, &faults)
             }
             OffsetCommitRequest::API_KEY => {
-                offset_commit_exchange(frame, api_version, &faults, &mut state)
+                offset_commit_exchange(frame, api_version, &faults, &mut cluster.lock().unwrap())
             }
             OffsetFetchRequest::API_KEY => {
-                offset_fetch_exchange(frame, api_version, &faults, &state)
+                offset_fetch_exchange(frame, api_version, &faults, &cluster.lock().unwrap())
             }
             JoinGroupRequest::API_KEY => {
-                join_group_exchange(frame, api_version, &faults, &mut state)
+                join_group_exchange(frame, api_version, &faults, &mut cluster.lock().unwrap())
             }
             SyncGroupRequest::API_KEY => {
-                sync_group_exchange(frame, api_version, &faults, &mut state)
+                sync_group_exchange(frame, api_version, &faults, &mut cluster.lock().unwrap())
             }
             HeartbeatRequest::API_KEY => {
-                heartbeat_exchange(frame, api_version, &faults, &mut state)
+                heartbeat_exchange(frame, api_version, &faults, &mut cluster.lock().unwrap())
             }
             LeaveGroupRequest::API_KEY => {
-                leave_group_exchange(frame, api_version, &faults, &mut state)
+                leave_group_exchange(frame, api_version, &faults, &mut cluster.lock().unwrap())
             }
-            ConsumerGroupHeartbeatRequest::API_KEY => {
-                consumer_group_heartbeat_exchange(frame, api_version, &faults, &mut state)
-            }
+            ConsumerGroupHeartbeatRequest::API_KEY => consumer_group_heartbeat_exchange(
+                frame,
+                api_version,
+                &faults,
+                &mut cluster.lock().unwrap(),
+            ),
             DescribeGroupsRequest::API_KEY => {
-                describe_groups_exchange(frame, api_version, &faults, &state)
+                describe_groups_exchange(frame, api_version, &faults, &cluster.lock().unwrap())
             }
             DeleteTopicsRequest::API_KEY => {
-                delete_topics_exchange(frame, api_version, &faults, &mut state)
+                delete_topics_exchange(frame, api_version, &faults, &mut cluster.lock().unwrap())
             }
             InitProducerIdRequest::API_KEY => {
-                init_producer_id_exchange(frame, api_version, &faults, &mut state)
+                init_producer_id_exchange(frame, api_version, &faults, &mut cluster.lock().unwrap())
             }
-            AddPartitionsToTxnRequest::API_KEY => {
-                add_partitions_to_txn_exchange(frame, api_version, &faults, &mut state)
+            AddPartitionsToTxnRequest::API_KEY => add_partitions_to_txn_exchange(
+                frame,
+                api_version,
+                &faults,
+                &mut cluster.lock().unwrap(),
+            ),
+            EndTxnRequest::API_KEY => {
+                end_txn_exchange(frame, api_version, &faults, &mut cluster.lock().unwrap())
             }
-            EndTxnRequest::API_KEY => end_txn_exchange(frame, api_version, &faults, &mut state),
-            AddOffsetsToTxnRequest::API_KEY => {
-                add_offsets_to_txn_exchange(frame, api_version, &faults, &mut state)
-            }
-            TxnOffsetCommitRequest::API_KEY => {
-                txn_offset_commit_exchange(frame, api_version, &faults, &mut state)
-            }
+            AddOffsetsToTxnRequest::API_KEY => add_offsets_to_txn_exchange(
+                frame,
+                api_version,
+                &faults,
+                &mut cluster.lock().unwrap(),
+            ),
+            TxnOffsetCommitRequest::API_KEY => txn_offset_commit_exchange(
+                frame,
+                api_version,
+                &faults,
+                &mut cluster.lock().unwrap(),
+            ),
             SaslHandshakeRequest::API_KEY => {
-                sasl_handshake_exchange(frame, api_version, &faults, &mut state)
+                sasl_handshake_exchange(frame, api_version, &faults, &mut sasl)
             }
             SaslAuthenticateRequest::API_KEY => {
-                sasl_authenticate_exchange(frame, api_version, &faults, &mut state)
+                sasl_authenticate_exchange(frame, api_version, &faults, &mut sasl)
             }
             _ => return,
         };
@@ -893,7 +937,7 @@ fn sasl_handshake_exchange(
     mut frame: Bytes,
     api_version: i16,
     faults: &[Fault],
-    state: &mut ConnState,
+    sasl: &mut SaslState,
 ) -> Option<BytesMut> {
     if !(SaslHandshakeRequest::MIN_VERSION..=SaslHandshakeRequest::MAX_VERSION)
         .contains(&api_version)
@@ -907,7 +951,7 @@ fn sasl_handshake_exchange(
     let supported = SASL_MECHANISMS.contains(&request.mechanism.as_str());
     let mut resp = SaslHandshakeResponse::default();
     if supported {
-        state.sasl = SaslState::Negotiated(request.mechanism.clone());
+        *sasl = SaslState::Negotiated(request.mechanism.clone());
         resp.error_code = 0;
     } else {
         resp.error_code = ErrorCode::UNSUPPORTED_SASL_MECHANISM.0;
@@ -939,7 +983,7 @@ fn sasl_authenticate_exchange(
     mut frame: Bytes,
     api_version: i16,
     faults: &[Fault],
-    state: &mut ConnState,
+    sasl: &mut SaslState,
 ) -> Option<BytesMut> {
     if !(SaslAuthenticateRequest::MIN_VERSION..=SaslAuthenticateRequest::MAX_VERSION)
         .contains(&api_version)
@@ -952,7 +996,7 @@ fn sasl_authenticate_exchange(
 
     let mut resp = SaslAuthenticateResponse::default();
     let token = String::from_utf8_lossy(&_request.auth_bytes).into_owned();
-    match &mut state.sasl {
+    match sasl {
         SaslState::Unstarted if !faults.contains(&Fault::SaslAuthenticateWithoutHandshake) => {
             resp.error_code = ErrorCode::ILLEGAL_SASL_STATE.0;
             resp.error_message = Some("no mechanism negotiated".into());
@@ -968,7 +1012,7 @@ fn sasl_authenticate_exchange(
                     resp.error_code = 0;
                     let server_first = mangle_server_first(server_first, faults);
                     resp.auth_bytes = Bytes::from(server_first.into_bytes());
-                    state.sasl = SaslState::ScramPending(Box::new(server));
+                    *sasl = SaslState::ScramPending(Box::new(server));
                 }
                 Err(message) => {
                     resp.error_code = ErrorCode::SASL_AUTHENTICATION_FAILED.0;
@@ -987,7 +1031,7 @@ fn sasl_authenticate_exchange(
                 } else {
                     Bytes::from(server_final.into_bytes())
                 };
-                state.sasl = SaslState::Authenticated;
+                *sasl = SaslState::Authenticated;
             }
             Err(e) => {
                 resp.error_code = ErrorCode::SASL_AUTHENTICATION_FAILED.0;
@@ -997,7 +1041,7 @@ fn sasl_authenticate_exchange(
         _ => {
             // Any other mechanism, or a token after the exchange ended:
             // this subject has no credentials to check beyond SCRAM.
-            state.sasl = SaslState::Authenticated;
+            *sasl = SaslState::Authenticated;
             resp.error_code = 0;
             resp.auth_bytes = Bytes::new();
         }
@@ -1020,7 +1064,7 @@ fn consumer_group_heartbeat_exchange(
     mut frame: Bytes,
     api_version: i16,
     faults: &[Fault],
-    state: &mut ConnState,
+    state: &mut ClusterState,
 ) -> Option<BytesMut> {
     if !(ConsumerGroupHeartbeatRequest::MIN_VERSION..=ConsumerGroupHeartbeatRequest::MAX_VERSION)
         .contains(&api_version)
@@ -1152,7 +1196,7 @@ fn join_group_exchange(
     mut frame: Bytes,
     api_version: i16,
     faults: &[Fault],
-    state: &mut ConnState,
+    state: &mut ClusterState,
 ) -> Option<BytesMut> {
     if !(JoinGroupRequest::MIN_VERSION..=JoinGroupRequest::MAX_VERSION).contains(&api_version) {
         return None;
@@ -1245,7 +1289,7 @@ fn sync_group_exchange(
     mut frame: Bytes,
     api_version: i16,
     faults: &[Fault],
-    state: &mut ConnState,
+    state: &mut ClusterState,
 ) -> Option<BytesMut> {
     if !(SyncGroupRequest::MIN_VERSION..=SyncGroupRequest::MAX_VERSION).contains(&api_version) {
         return None;
@@ -1300,7 +1344,7 @@ fn heartbeat_exchange(
     mut frame: Bytes,
     api_version: i16,
     faults: &[Fault],
-    state: &mut ConnState,
+    state: &mut ClusterState,
 ) -> Option<BytesMut> {
     if !(HeartbeatRequest::MIN_VERSION..=HeartbeatRequest::MAX_VERSION).contains(&api_version) {
         return None;
@@ -1326,7 +1370,7 @@ fn leave_group_exchange(
     mut frame: Bytes,
     api_version: i16,
     faults: &[Fault],
-    state: &mut ConnState,
+    state: &mut ClusterState,
 ) -> Option<BytesMut> {
     if !(LeaveGroupRequest::MIN_VERSION..=LeaveGroupRequest::MAX_VERSION).contains(&api_version) {
         return None;
@@ -1400,7 +1444,7 @@ fn list_offsets_exchange(
     mut frame: Bytes,
     api_version: i16,
     faults: &[Fault],
-    state: &ConnState,
+    state: &ClusterState,
 ) -> Option<BytesMut> {
     if !(ListOffsetsRequest::MIN_VERSION..=ListOffsetsRequest::MAX_VERSION).contains(&api_version) {
         return None;
@@ -1523,7 +1567,7 @@ fn offset_commit_exchange(
     mut frame: Bytes,
     api_version: i16,
     faults: &[Fault],
-    state: &mut ConnState,
+    state: &mut ClusterState,
 ) -> Option<BytesMut> {
     if !(OffsetCommitRequest::MIN_VERSION..=OffsetCommitRequest::MAX_VERSION).contains(&api_version)
     {
@@ -1592,7 +1636,7 @@ fn offset_fetch_exchange(
     mut frame: Bytes,
     api_version: i16,
     faults: &[Fault],
-    state: &ConnState,
+    state: &ClusterState,
 ) -> Option<BytesMut> {
     if !(OffsetFetchRequest::MIN_VERSION..=OffsetFetchRequest::MAX_VERSION).contains(&api_version) {
         return None;
@@ -1794,7 +1838,7 @@ fn metadata_exchange(
     api_version: i16,
     local_port: i32,
     faults: &[Fault],
-    state: &ConnState,
+    state: &ClusterState,
 ) -> Option<BytesMut> {
     let has = |f: Fault| faults.contains(&f);
     if !(MetadataRequest::MIN_VERSION..=MetadataRequest::MAX_VERSION).contains(&api_version) {
@@ -1901,7 +1945,7 @@ fn create_topics_exchange(
     mut frame: Bytes,
     api_version: i16,
     faults: &[Fault],
-    state: &mut ConnState,
+    state: &mut ClusterState,
 ) -> Option<BytesMut> {
     if !(CreateTopicsRequest::MIN_VERSION..=CreateTopicsRequest::MAX_VERSION).contains(&api_version)
     {
@@ -1962,7 +2006,7 @@ fn produce_exchange(
     mut frame: Bytes,
     api_version: i16,
     faults: &[Fault],
-    state: &mut ConnState,
+    state: &mut ClusterState,
 ) -> Option<BytesMut> {
     if !(ProduceRequest::MIN_VERSION..=ProduceRequest::MAX_VERSION).contains(&api_version) {
         return None;
@@ -2139,7 +2183,7 @@ async fn fetch_exchange(
     mut frame: Bytes,
     api_version: i16,
     faults: &[Fault],
-    state: &ConnState,
+    cluster: &Cluster,
 ) -> Option<BytesMut> {
     if !(FetchRequest::MIN_VERSION..=FetchRequest::MAX_VERSION).contains(&api_version) {
         return None;
@@ -2151,19 +2195,30 @@ async fn fetch_exchange(
     // The long-poll half of a fetch: when the request asks for bytes
     // that are not there yet, the wait is the answer. Returning at once
     // is correct data and a busy loop.
-    let satisfiable = request.min_bytes <= 0
-        || request.topics.iter().any(|topic| {
-            topic.partitions.iter().any(|p| {
-                state
-                    .logs
-                    .get(&(topic.topic.clone(), p.partition))
-                    .is_some_and(|log| p.fetch_offset < log.next_offset)
+    //
+    // The lock is taken for the question and dropped before the wait.
+    // Holding it across the sleep would stop the very produce the wait
+    // is waiting for — on a shared cluster that is not slowness, it is
+    // deadlock — and dropping it is also what makes the wait mean
+    // something: the response is built from the log as it stands
+    // *after* the poll, so a record that arrives during it is served.
+    let satisfiable = {
+        let state = cluster.lock().unwrap();
+        request.min_bytes <= 0
+            || request.topics.iter().any(|topic| {
+                topic.partitions.iter().any(|p| {
+                    state
+                        .logs
+                        .get(&(topic.topic.clone(), p.partition))
+                        .is_some_and(|log| p.fetch_offset < log.next_offset)
+                })
             })
-        });
+    };
     if !satisfiable && request.max_wait_ms > 0 && !faults.contains(&Fault::FetchIgnoresMaxWait) {
         let wait = u64::try_from(request.max_wait_ms).unwrap_or(0);
         tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
     }
+    let state = &*cluster.lock().unwrap();
 
     let responses = request
         .topics
@@ -2283,7 +2338,7 @@ fn init_producer_id_exchange(
     mut frame: Bytes,
     api_version: i16,
     faults: &[Fault],
-    state: &mut ConnState,
+    state: &mut ClusterState,
 ) -> Option<BytesMut> {
     if !(InitProducerIdRequest::MIN_VERSION..=InitProducerIdRequest::MAX_VERSION)
         .contains(&api_version)
@@ -2343,7 +2398,7 @@ fn add_partitions_to_txn_exchange(
     mut frame: Bytes,
     api_version: i16,
     faults: &[Fault],
-    state: &mut ConnState,
+    state: &mut ClusterState,
 ) -> Option<BytesMut> {
     if !(AddPartitionsToTxnRequest::MIN_VERSION..=AddPartitionsToTxnRequest::MAX_VERSION)
         .contains(&api_version)
@@ -2400,7 +2455,7 @@ fn end_txn_exchange(
     mut frame: Bytes,
     api_version: i16,
     faults: &[Fault],
-    state: &mut ConnState,
+    state: &mut ClusterState,
 ) -> Option<BytesMut> {
     if !(EndTxnRequest::MIN_VERSION..=EndTxnRequest::MAX_VERSION).contains(&api_version) {
         return None;
@@ -2485,7 +2540,7 @@ fn end_txn_exchange(
 /// took the id. Honouring it anyway would let both write into the same
 /// transaction, which is the failure transactions exist to prevent.
 fn txn_epoch_check(
-    state: &ConnState,
+    state: &ClusterState,
     transactional_id: &str,
     epoch: i16,
     faults: &[Fault],
@@ -2635,7 +2690,7 @@ fn delete_topics_exchange(
     mut frame: Bytes,
     api_version: i16,
     faults: &[Fault],
-    state: &mut ConnState,
+    state: &mut ClusterState,
 ) -> Option<BytesMut> {
     if !(DeleteTopicsRequest::MIN_VERSION..=DeleteTopicsRequest::MAX_VERSION).contains(&api_version)
     {
@@ -2691,7 +2746,7 @@ fn describe_groups_exchange(
     mut frame: Bytes,
     api_version: i16,
     faults: &[Fault],
-    state: &ConnState,
+    state: &ClusterState,
 ) -> Option<BytesMut> {
     if !(DescribeGroupsRequest::MIN_VERSION..=DescribeGroupsRequest::MAX_VERSION)
         .contains(&api_version)
@@ -2787,7 +2842,7 @@ fn add_offsets_to_txn_exchange(
     mut frame: Bytes,
     api_version: i16,
     faults: &[Fault],
-    state: &mut ConnState,
+    state: &mut ClusterState,
 ) -> Option<BytesMut> {
     if !(AddOffsetsToTxnRequest::MIN_VERSION..=AddOffsetsToTxnRequest::MAX_VERSION)
         .contains(&api_version)
@@ -2819,7 +2874,7 @@ fn txn_offset_commit_exchange(
     mut frame: Bytes,
     api_version: i16,
     faults: &[Fault],
-    state: &mut ConnState,
+    state: &mut ClusterState,
 ) -> Option<BytesMut> {
     if !(TxnOffsetCommitRequest::MIN_VERSION..=TxnOffsetCommitRequest::MAX_VERSION)
         .contains(&api_version)
