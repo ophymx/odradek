@@ -1141,6 +1141,52 @@ async fn commit_offset(
     Ok(())
 }
 
+/// Wait until the broker on the other end of `conn` has heard of
+/// `topic`.
+///
+/// A cluster propagates metadata between its brokers asynchronously, so
+/// a topic created a moment ago and already written to on its leader is
+/// briefly unknown to the group coordinator that is about to be asked to
+/// commit an offset for it. UNKNOWN_TOPIC_OR_PARTITION from that broker
+/// is a wait, not an answer — a client retries it and so must a suite
+/// that means to test clusters. On a single broker there is nothing to
+/// propagate and the first ask succeeds, which is why this was never
+/// needed before.
+///
+/// Best effort by design: if the topic never shows up, say nothing and
+/// let the call the caller actually cares about report what it gets.
+/// Turning a propagation delay into a verdict of its own would hide the
+/// question being asked behind the plumbing.
+async fn await_topic_known(
+    ctx: &ServerCtx,
+    conn: &mut RawConnection,
+    topic: &str,
+    correlation_base: i32,
+) -> Result<(), CheckError> {
+    let Ok(range) = ctx.range(MetadataRequest::API_KEY) else {
+        return Ok(());
+    };
+    let Ok(version) = negotiate("Metadata", range, 1, MetadataRequest::MAX_VERSION) else {
+        return Ok(());
+    };
+    for attempt in 0..ctx.config.settle_attempts() {
+        if attempt > 0 {
+            tokio::time::sleep(ctx.config.settle_delay).await;
+        }
+        let correlation = correlation_base + i32::try_from(attempt).unwrap_or(0);
+        let resp = metadata_of_topic(conn, version, topic, correlation).await?;
+        let known = resp
+            .topics
+            .iter()
+            .find(|t| t.name.as_deref() == Some(topic))
+            .is_some_and(|t| ErrorCode(t.error_code).is_ok() && !t.partitions.is_empty());
+        if known {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
 /// Read back what a group committed for one partition.
 async fn fetch_committed(
     conn: &mut RawConnection,
@@ -1259,6 +1305,9 @@ async fn offsets_commit_fetch_roundtrip(ctx: &ServerCtx) -> Verdict {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
+    if let Err(e) = await_topic_known(ctx, &mut conn, &produced.topic, 55).await {
+        return e.into_verdict();
+    }
     // Not 0, and not the log end either: a number nothing else would
     // produce by accident.
     let committed = 7;
@@ -1331,6 +1380,9 @@ async fn offsets_unset_is_sentinel(ctx: &ServerCtx) -> Verdict {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
+    if let Err(e) = await_topic_known(ctx, &mut conn, &produced.topic, 66).await {
+        return e.into_verdict();
+    }
     match fetch_committed(
         &mut conn,
         fetch_version,
@@ -3734,6 +3786,8 @@ const TXN_INIT_MAX: i16 = 5;
 const END_TXN_MAX: i16 = 4;
 /// The fetch isolation level that filters uncommitted data.
 const READ_COMMITTED: i8 = 1;
+/// The default: every record in the log, decided or not.
+const READ_UNCOMMITTED: i8 = 0;
 /// The record batch attribute marking a batch as transactional.
 const TRANSACTIONAL_ATTR: i16 = 1 << 4;
 
@@ -4118,30 +4172,46 @@ async fn produce_stamped(
 }
 
 /// One partition's fetch response at the given isolation level.
-async fn fetch_partition(
-    conn: &mut RawConnection,
-    version: i16,
-    topic: &str,
+/// Which partition to read, from where, and at what isolation.
+#[derive(Clone, Copy)]
+struct FetchAt<'a> {
+    topic: &'a str,
     partition: i32,
     offset: i64,
     isolation_level: i8,
+}
+
+/// One fetch of one partition, refusing to pass off an error as data.
+///
+/// A partition response that carries an error code carries no offsets
+/// with it: `high_watermark` and `last_stable_offset` come back as -1,
+/// and a caller that reads those as numbers concludes something false
+/// about the log. The stable-offset check did exactly that on a
+/// cluster — it compared -1 to -1, found the stable offset had "caught
+/// up to" the high watermark, and reported a broker for showing
+/// uncommitted records when what had really happened was that this
+/// broker had not answered about the partition at all.
+async fn fetch_partition(
+    conn: &mut RawConnection,
+    version: i16,
+    at: FetchAt<'_>,
     correlation: i32,
 ) -> Result<odradek_protocol::messages::fetch_response::PartitionData, CheckError> {
     let mut fetch_partition = FetchPartition::default();
-    fetch_partition.partition = partition;
+    fetch_partition.partition = at.partition;
     fetch_partition.current_leader_epoch = -1;
-    fetch_partition.fetch_offset = offset;
+    fetch_partition.fetch_offset = at.offset;
     fetch_partition.last_fetched_epoch = -1;
     fetch_partition.log_start_offset = -1;
     fetch_partition.partition_max_bytes = 1 << 20;
     let mut fetch_topic = FetchTopic::default();
-    fetch_topic.topic = topic.to_owned();
+    fetch_topic.topic = at.topic.to_owned();
     fetch_topic.partitions = vec![fetch_partition];
     let mut request = FetchRequest::default();
     request.max_wait_ms = 500;
     request.min_bytes = 0;
     request.max_bytes = 1 << 22;
-    request.isolation_level = isolation_level;
+    request.isolation_level = at.isolation_level;
     request.session_id = 0;
     request.session_epoch = -1;
     request.topics = vec![fetch_topic];
@@ -4151,11 +4221,88 @@ async fn fetch_partition(
         .map_err(|e| CheckError::Infra(format!("encoding Fetch: {e}")))?;
     let resp: FetchResponse =
         api_call(conn, FetchRequest::API_KEY, version, correlation, &body).await?;
-    resp.responses
+    let data = resp
+        .responses
         .first()
         .and_then(|t| t.partitions.first())
         .cloned()
-        .ok_or_else(|| CheckError::Violation("Fetch response names no partitions".into()))
+        .ok_or_else(|| CheckError::Violation("Fetch response names no partitions".into()))?;
+    let code = ErrorCode(data.error_code);
+    if !code.is_ok() {
+        return Err(CheckError::Violation(format!(
+            "Fetch for {}[{}] answered {code}",
+            at.topic, at.partition
+        )));
+    }
+    Ok(data)
+}
+
+/// The same fetch, waiting out the codes that mean "not from me, not
+/// yet".
+///
+/// On a cluster the broker leading a partition can change, and a broker
+/// that has just learned of a topic has not necessarily caught up on
+/// it. Both answer with a retriable code, which is a client's cue to
+/// look again rather than to conclude anything.
+async fn fetch_partition_settled(
+    ctx: &ServerCtx,
+    conn: &mut RawConnection,
+    version: i16,
+    at: FetchAt<'_>,
+    correlation: i32,
+) -> Result<odradek_protocol::messages::fetch_response::PartitionData, CheckError> {
+    let mut last = None;
+    for attempt in 0..ctx.config.settle_attempts() {
+        if attempt > 0 {
+            tokio::time::sleep(ctx.config.settle_delay).await;
+        }
+        let correlation = correlation + i32::try_from(attempt).unwrap_or(0);
+        match fetch_partition(conn, version, at, correlation).await {
+            Ok(data) => return Ok(data),
+            Err(CheckError::Violation(details)) if mentions_retriable(&details) => {
+                last = Some(CheckError::Violation(details));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| CheckError::Infra("no fetch attempts were made".into())))
+}
+
+/// Whether a fetch refusal reported by [`fetch_partition`] names one of
+/// `codes`.
+///
+/// Matched on the rendered code because that is what `fetch_partition`
+/// reports; the alternative is a second error type threaded through
+/// every caller to carry one `i16`.
+fn fetch_refusal_names(details: &str, codes: &[ErrorCode]) -> bool {
+    codes
+        .iter()
+        .any(|code| details.ends_with(&format!("answered {code}")))
+}
+
+/// Refusals that mean "not from me, not yet" rather than an answer.
+const FETCH_SETTLING: &[ErrorCode] = &[
+    ErrorCode::NOT_LEADER_OR_FOLLOWER,
+    ErrorCode::UNKNOWN_TOPIC_OR_PARTITION,
+    ErrorCode::LEADER_NOT_AVAILABLE,
+    ErrorCode::UNKNOWN_TOPIC_ID,
+    ErrorCode::REPLICA_NOT_AVAILABLE,
+];
+
+fn mentions_retriable(details: &str) -> bool {
+    fetch_refusal_names(details, FETCH_SETTLING)
+}
+
+/// The same, for a loop waiting on a transaction marker.
+///
+/// A `read_committed` fetch at an offset the stable offset has not
+/// reached yet is refused with OFFSET_OUT_OF_RANGE: the records are
+/// written, but they are not decided, so as far as a committed reader is
+/// concerned the log does not go that far. That is the same wait as a
+/// stable offset that has not moved, seen from the other side, and it is
+/// the answer for as long as the marker is still being written.
+fn still_resolving(details: &str) -> bool {
+    mentions_retriable(details) || fetch_refusal_names(details, &[ErrorCode::OFFSET_OUT_OF_RANGE])
 }
 
 /// Taking over a transactional id must hand out a *newer* epoch.
@@ -4389,17 +4536,13 @@ async fn txn_open_transaction_holds_the_stable_offset(ctx: &ServerCtx) -> Verdic
         return verdict;
     }
 
-    let data = match fetch_partition(
-        &mut leader,
-        versions.fetch,
-        &topic,
-        0,
-        0,
-        READ_COMMITTED,
-        580,
-    )
-    .await
-    {
+    let at = FetchAt {
+        topic: &topic,
+        partition: 0,
+        offset: 0,
+        isolation_level: READ_COMMITTED,
+    };
+    let data = match fetch_partition_settled(ctx, &mut leader, versions.fetch, at, 580).await {
         Ok(d) => d,
         Err(e) => return e.context("Fetch (read_committed)").into_verdict(),
     };
@@ -4517,18 +4660,24 @@ async fn await_abort_marker(
         if attempt > 0 {
             tokio::time::sleep(ctx.config.settle_delay).await;
         }
+        let at = FetchAt {
+            topic,
+            partition: 0,
+            offset: first_offset,
+            isolation_level: READ_COMMITTED,
+        };
         let got = match fetch_partition(
             conn,
             fetch_version,
-            topic,
-            0,
-            first_offset,
-            READ_COMMITTED,
+            at,
             correlation + i32::try_from(attempt).unwrap_or(0),
         )
         .await
         {
             Ok(d) => d,
+            // Still settling: this attempt says nothing, and there are
+            // more of them.
+            Err(CheckError::Violation(details)) if still_resolving(&details) => continue,
             Err(e) => return Err(e.context("Fetch (read_committed)").into_verdict()),
         };
         let settled = got.last_stable_offset > first_offset;
@@ -4537,8 +4686,16 @@ async fn await_abort_marker(
             break;
         }
     }
-    let data = data.ok_or(Verdict::Error {
-        details: "no fetch attempts were made".into(),
+    // No attempt ever got an answer: every one was refused for a reason
+    // that meant "not yet". That is the failure this check is about —
+    // the marker never landed — and saying so beats reporting the last
+    // refusal as if the fetch itself were the problem.
+    let data = data.ok_or_else(|| Verdict::Fail {
+        details: format!(
+            "{context} nothing was readable at {first_offset} within {:?}: every \
+             read_committed fetch was refused, so the transaction was never resolved",
+            ctx.config.settle_budget
+        ),
     })?;
 
     if data.last_stable_offset <= first_offset {
@@ -5244,6 +5401,9 @@ async fn offsets_metadata_round_trips(ctx: &ServerCtx) -> Verdict {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
+    if let Err(e) = await_topic_known(ctx, &mut conn, &topic, 815).await {
+        return e.into_verdict();
+    }
 
     // Shaped to catch the ways a string gets mangled in transit:
     // non-ASCII, an embedded quote, and enough length to notice a
@@ -6076,7 +6236,13 @@ async fn produce_compressed_passthrough(ctx: &ServerCtx) -> Verdict {
         };
     }
 
-    let data = match fetch_partition(&mut conn, fetch_version, &topic, 0, 0, 0, 970).await {
+    let at = FetchAt {
+        topic: &topic,
+        partition: 0,
+        offset: 0,
+        isolation_level: READ_UNCOMMITTED,
+    };
+    let data = match fetch_partition_settled(ctx, &mut conn, fetch_version, at, 970).await {
         Ok(data) => data,
         Err(e) => return e.context("Fetch").into_verdict(),
     };
@@ -6200,18 +6366,22 @@ async fn txn_commit_is_visible_to_readers(ctx: &ServerCtx) -> Verdict {
         if attempt > 0 {
             tokio::time::sleep(ctx.config.settle_delay).await;
         }
+        let at = FetchAt {
+            topic: &topic,
+            partition: 0,
+            offset: first_offset,
+            isolation_level: READ_COMMITTED,
+        };
         let got = match fetch_partition(
             &mut leader,
             versions.fetch,
-            &topic,
-            0,
-            first_offset,
-            READ_COMMITTED,
+            at,
             1_040 + i32::try_from(attempt).unwrap_or(0),
         )
         .await
         {
             Ok(got) => got,
+            Err(CheckError::Violation(details)) if still_resolving(&details) => continue,
             Err(e) => return e.context("Fetch (read_committed)").into_verdict(),
         };
         let settled = got.last_stable_offset > first_offset;
@@ -6223,8 +6393,13 @@ async fn txn_commit_is_visible_to_readers(ctx: &ServerCtx) -> Verdict {
     let data = match data {
         Some(data) => data,
         None => {
-            return Verdict::Error {
-                details: "no fetch attempts were made".into(),
+            return Verdict::Fail {
+                details: format!(
+                    "the commit was acknowledged but nothing was readable at {first_offset} \
+                     within {:?}: every read_committed fetch was refused, so the commit \
+                     marker never landed",
+                    ctx.config.settle_budget
+                ),
             };
         }
     };
@@ -6322,6 +6497,9 @@ async fn txn_offsets_wait_for_the_commit(ctx: &ServerCtx) -> Verdict {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
+    if let Err(e) = await_topic_known(ctx, &mut offsets, &topic, 1_055).await {
+        return e.into_verdict();
+    }
 
     let (mut conn, identity) = match init_producer_id(ctx, versions.init, &id, 1_060).await {
         Ok(r) => r,

@@ -54,6 +54,11 @@ struct Subject {
     /// Commands to run inside the container once it is ready, before the
     /// suite starts — for state that cannot be configured at boot.
     provision: &'static [&'static [&'static str]],
+    /// How many broker containers this subject runs. More than one gets
+    /// a docker network, a shared cluster id, and `{id}`/`{quorum}`
+    /// substitution; the suite is pointed at the first node and finds
+    /// the rest through Metadata, as a client would.
+    nodes: u8,
 }
 
 /// The subject matrix. The container must expose its plaintext Kafka
@@ -106,6 +111,7 @@ const SUBJECTS: &[Subject] = &[
             "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1",
         ],
         sasl_listener: true,
+        nodes: 1,
         // SCRAM credentials live in the metadata log, so they are added
         // after the broker is up rather than configured into it.
         provision: &[&[
@@ -152,6 +158,68 @@ const SUBJECTS: &[Subject] = &[
             // this configuration can be asked.
         ],
         sasl_listener: false,
+        nodes: 1,
+        provision: &[],
+    },
+    Subject {
+        // Three brokers, because a cluster of one cannot be asked the
+        // questions that matter most about routing. On a single node
+        // every partition's leader and every group's and transaction's
+        // coordinator is the broker you are already talking to, so a
+        // suite that never consults Metadata passes anyway. Pointed at
+        // this subject, the suite failed 31 of 51 checks and failed
+        // different ones each run until it learned to route.
+        //
+        // Deliberately no SASL listener: what this subject is here to
+        // exercise is routing, and the `sasl/*` checks are covered by
+        // the single-node Kafka above.
+        name: "apache-kafka-4.1.0-cluster",
+        image: "apache/kafka:4.1.0",
+        run_args: &[
+            "-e",
+            // Every node must format its storage with the same cluster
+            // id or they will refuse to form a quorum together.
+            "CLUSTER_ID=5L6g3nShT-eMCtK--X86sw",
+            "-e",
+            "KAFKA_NODE_ID={id}",
+            "-e",
+            "KAFKA_PROCESS_ROLES=broker,controller",
+            "-e",
+            "KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,INTERNAL://0.0.0.0:9099",
+            // Two addresses for two audiences. Clients are on the host
+            // and reach this node through its published port; the other
+            // brokers are on the docker network and reach it by
+            // container name. A node that advertised only the published
+            // address would tell its peers to connect somewhere that,
+            // from inside the network, is themselves.
+            "-e",
+            "KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:{port},INTERNAL://{node}:9099",
+            "-e",
+            "KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER",
+            "-e",
+            "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT",
+            "-e",
+            "KAFKA_INTER_BROKER_LISTENER_NAME=INTERNAL",
+            "-e",
+            "KAFKA_CONTROLLER_QUORUM_VOTERS={quorum}",
+            // Replicated for real, which is the point: with RF=3 the
+            // leader of a partition is one of three brokers rather than
+            // the only one there is.
+            "-e",
+            "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=3",
+            "-e",
+            "KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=3",
+            "-e",
+            "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=2",
+            "-e",
+            "KAFKA_DEFAULT_REPLICATION_FACTOR=3",
+            // Three JVMs on a two-core CI runner: the default heap is
+            // more than any of them needs for a suite's worth of data.
+            "-e",
+            "KAFKA_HEAP_OPTS=-Xmx512m -Xms256m",
+        ],
+        sasl_listener: false,
+        nodes: 3,
         provision: &[],
     },
 ];
@@ -281,21 +349,26 @@ fn run_subject(
     record: bool,
     log: &mut String,
 ) -> Result<()> {
-    let port = ephemeral_port()?;
     let sasl_port = ephemeral_port()?;
-    let container = Container::start(subject, port, sasl_port)?;
-    let addr = format!("127.0.0.1:{port}");
+    let cluster = Cluster::start(subject, sasl_port)?;
+    // The suite is pointed at one node and finds the rest through
+    // Metadata, which is the only way a client could find them either.
+    let addr = cluster.bootstrap().to_owned();
     let sasl_addr = subject
         .sasl_listener
         .then(|| format!("127.0.0.1:{sasl_port}"));
 
-    if let Err(e) = wait_ready(&addr) {
-        container.dump_logs(log);
-        return Err(e);
+    // Every node, not just the bootstrap: a partition led by a broker
+    // that is not up yet is a check failing on the harness's impatience.
+    for node in cluster.addrs() {
+        if let Err(e) = wait_ready(node) {
+            cluster.dump_logs(log);
+            return Err(e);
+        }
     }
 
     for command in subject.provision {
-        container
+        cluster
             .exec(command)
             .with_context(|| format!("provisioning {} with {:?}", subject.name, command))?;
     }
@@ -313,13 +386,21 @@ fn run_subject(
                 subject.name
             );
         } else {
-            container.dump_logs(log);
+            cluster.dump_logs(log);
             bail!("acceptance run failed against {}", subject.name);
         }
     }
 
-    if let Some(proxy) = proxy {
-        proxy_pass(
+    // The proxy has one upstream and rewrites every broker in Metadata
+    // to its own address, so in front of a cluster it would route all
+    // three brokers' traffic to whichever one it was pointed at and
+    // misdeliver most of it. That is not a flaw in the proxy — it is the
+    // one-upstream design saying what it is for — but it does mean the
+    // proxied pass belongs to the single-node subjects. Proxying a
+    // cluster properly needs a listener per broker, which is a different
+    // example than the one this is a witness for.
+    match (proxy, subject.nodes) {
+        (Some(proxy), 1) => proxy_pass(
             subject,
             accept,
             proxy,
@@ -327,7 +408,15 @@ fn run_subject(
             sasl_addr.as_deref(),
             &baseline,
             log,
-        )?;
+        )?,
+        (Some(_), _) => {
+            let _ = writeln!(
+                log,
+                "note: no proxied pass for {} — the proxy example fronts a single broker",
+                subject.name
+            );
+        }
+        (None, _) => {}
     }
     Ok(())
 }
@@ -484,62 +573,94 @@ impl Drop for Proxy {
     }
 }
 
+/// One broker container, and the host address its client listener is
+/// published on.
 struct Container {
     name: String,
+    addr: String,
 }
 
-impl Container {
-    fn start(subject: &Subject, port: u16, sasl_port: u16) -> Result<Container> {
-        let name = format!("odradek-accept-{}-{port}", subject.name);
-        let mut args: Vec<String> = vec![
-            "run".into(),
-            "-d".into(),
-            "--rm".into(),
-            "--name".into(),
-            name.clone(),
-            "-p".into(),
-            format!("127.0.0.1:{port}:9092"),
-        ];
-        if subject.sasl_listener {
-            args.push("-p".into());
-            args.push(format!("127.0.0.1:{sasl_port}:9094"));
+/// Every broker container a subject runs, plus the docker network they
+/// share when there is more than one.
+///
+/// One node is the common case and gets no network: it talks to nobody.
+/// Several need container-name DNS to find each other, because a broker
+/// tells its peers where it is and the published host port is not an
+/// address any of them can use.
+struct Cluster {
+    nodes: Vec<Container>,
+    network: Option<Network>,
+}
+
+impl Cluster {
+    fn start(subject: &Subject, sasl_port: u16) -> Result<Cluster> {
+        let count = usize::from(subject.nodes.max(1));
+        let ports: Vec<u16> = (0..count)
+            .map(|_| ephemeral_port())
+            .collect::<Result<_>>()?;
+        // The names have to be known before the first container starts:
+        // each node's quorum string names all of them, including the
+        // ones that do not exist yet.
+        let names: Vec<String> = (1..=count)
+            .map(|id| format!("odradek-accept-{}-{}-{id}", subject.name, ports[0]))
+            .collect();
+        let quorum: Vec<String> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| format!("{}@{name}:9093", i + 1))
+            .collect();
+        let quorum = quorum.join(",");
+
+        let network = if count > 1 {
+            Some(Network::create(&format!(
+                "odradek-accept-net-{}",
+                ports[0]
+            ))?)
+        } else {
+            None
+        };
+
+        // Started in one pass and waited for afterwards: a KRaft node
+        // holds an election with peers that are not up yet, so starting
+        // them one-at-a-time-and-wait would wait for a quorum that
+        // cannot form until the last one is running.
+        let mut cluster = Cluster {
+            nodes: Vec::new(),
+            network,
+        };
+        for (i, name) in names.iter().enumerate() {
+            let node = Container::start(
+                subject,
+                NodeSpec {
+                    name,
+                    id: i + 1,
+                    port: ports[i],
+                    sasl_port,
+                    quorum: &quorum,
+                    network: cluster.network.as_ref().map(Network::name),
+                },
+            )?;
+            cluster.nodes.push(node);
         }
-        let mut trailing = false;
-        for a in subject.run_args {
-            if *a == "--" {
-                trailing = true;
-                args.push(subject.image.into());
-                continue;
-            }
-            args.push(
-                a.replace("{port}", &port.to_string())
-                    .replace("{sasl_port}", &sasl_port.to_string()),
-            );
-        }
-        if !trailing {
-            args.push(subject.image.into());
-        }
-        let out = Command::new("docker")
-            .args(&args)
-            .output()
-            .context("running docker")?;
-        if !out.status.success() {
-            bail!(
-                "docker run {} failed: {}",
-                subject.image,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(Container { name })
+        Ok(cluster)
     }
 
-    /// Run a command inside the container, failing loudly if it does.
+    /// The node the suite is pointed at. It finds the others itself.
+    fn bootstrap(&self) -> &str {
+        &self.nodes[0].addr
+    }
+
+    fn addrs(&self) -> impl Iterator<Item = &str> {
+        self.nodes.iter().map(|n| n.addr.as_str())
+    }
+
+    /// Run a provisioning command on the first node.
     ///
     /// Provisioning that silently failed would leave the SASL checks
     /// skipping or failing for a reason that looks like the subject's
     /// fault, so this reports the command's own output.
     fn exec(&self, command: &[&str]) -> Result<()> {
-        let mut args: Vec<&str> = vec!["exec", &self.name];
+        let mut args: Vec<&str> = vec!["exec", &self.nodes[0].name];
         args.extend_from_slice(command);
         let out = Command::new("docker")
             .args(&args)
@@ -556,19 +677,87 @@ impl Container {
     }
 
     fn dump_logs(&self, log: &mut String) {
-        let _ = writeln!(log, "--- docker logs {} (tail) ---", self.name);
-        match Command::new("docker")
-            .args(["logs", "--tail", "40", &self.name])
-            .output()
-        {
-            Ok(out) => {
-                log.push_str(&String::from_utf8_lossy(&out.stdout));
-                log.push_str(&String::from_utf8_lossy(&out.stderr));
-            }
-            Err(e) => {
-                let _ = writeln!(log, "(docker logs failed: {e})");
+        for node in &self.nodes {
+            let _ = writeln!(log, "--- docker logs {} (tail) ---", node.name);
+            match Command::new("docker")
+                .args(["logs", "--tail", "40", &node.name])
+                .output()
+            {
+                Ok(out) => {
+                    log.push_str(&String::from_utf8_lossy(&out.stdout));
+                    log.push_str(&String::from_utf8_lossy(&out.stderr));
+                }
+                Err(e) => {
+                    let _ = writeln!(log, "(docker logs failed: {e})");
+                }
             }
         }
+    }
+}
+
+/// What one node needs to know that the others do not: which it is,
+/// where it is published, and how to reach the quorum.
+struct NodeSpec<'a> {
+    name: &'a str,
+    id: usize,
+    port: u16,
+    sasl_port: u16,
+    quorum: &'a str,
+    network: Option<&'a str>,
+}
+
+impl Container {
+    fn start(subject: &Subject, spec: NodeSpec<'_>) -> Result<Container> {
+        let mut args: Vec<String> = vec![
+            "run".into(),
+            "-d".into(),
+            "--rm".into(),
+            "--name".into(),
+            spec.name.into(),
+            "-p".into(),
+            format!("127.0.0.1:{}:9092", spec.port),
+        ];
+        if let Some(network) = spec.network {
+            args.push("--network".into());
+            args.push(network.into());
+        }
+        if subject.sasl_listener {
+            args.push("-p".into());
+            args.push(format!("127.0.0.1:{}:9094", spec.sasl_port));
+        }
+        let mut trailing = false;
+        for a in subject.run_args {
+            if *a == "--" {
+                trailing = true;
+                args.push(subject.image.into());
+                continue;
+            }
+            args.push(
+                a.replace("{port}", &spec.port.to_string())
+                    .replace("{sasl_port}", &spec.sasl_port.to_string())
+                    .replace("{id}", &spec.id.to_string())
+                    .replace("{node}", spec.name)
+                    .replace("{quorum}", spec.quorum),
+            );
+        }
+        if !trailing {
+            args.push(subject.image.into());
+        }
+        let out = Command::new("docker")
+            .args(&args)
+            .output()
+            .context("running docker")?;
+        if !out.status.success() {
+            bail!(
+                "docker run {} failed: {}",
+                subject.image,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(Container {
+            name: spec.name.to_owned(),
+            addr: format!("127.0.0.1:{}", spec.port),
+        })
     }
 }
 
@@ -593,6 +782,54 @@ impl Drop for Container {
             std::thread::spawn(move || {
                 let _ = child.wait();
             });
+        }
+    }
+}
+
+/// A docker network the brokers of one cluster share.
+struct Network {
+    name: String,
+}
+
+impl Network {
+    fn create(name: &str) -> Result<Network> {
+        let out = Command::new("docker")
+            .args(["network", "create", name])
+            .output()
+            .context("running docker network create")?;
+        if !out.status.success() {
+            bail!(
+                "docker network create {name} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(Network {
+            name: name.to_owned(),
+        })
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl Drop for Network {
+    fn drop(&mut self) {
+        // Dropped after the containers on it (declaration order in
+        // `Cluster`), but their removal is fire-and-forget, so the
+        // network may still be in use for a moment. Retrying briefly
+        // beats leaking a network per run.
+        for _ in 0..20 {
+            let out = Command::new("docker")
+                .args(["network", "rm", &self.name])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            if matches!(out, Ok(status) if status.success()) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(250));
         }
     }
 }
