@@ -420,6 +420,31 @@ pub static SERVER_CHECKS: &[Check] = &[
                       they were thrown away",
         runner: Runner::Server(|ctx| Box::pin(txn_abort_is_reported_to_readers(ctx))),
     },
+    Check {
+        id: "cluster/brokers-agree-on-the-leader",
+        requirement: "every broker names the same leader for a partition, so a                       client that refreshes metadata against a different broker                       than last time is not sent somewhere else",
+        runner: Runner::Server(|ctx| Box::pin(cluster_brokers_agree_on_the_leader(ctx))),
+    },
+    Check {
+        id: "cluster/brokers-agree-on-the-coordinator",
+        requirement: "every broker names the same coordinator for a group, so a                       group does not end up with as many coordinators as it has                       bootstrap addresses",
+        runner: Runner::Server(|ctx| Box::pin(cluster_brokers_agree_on_the_coordinator(ctx))),
+    },
+    Check {
+        id: "cluster/replicas-span-brokers",
+        requirement: "places a topic asked for n replicas on n distinct brokers,                       with the leader among them and the in-sync set drawn from                       them",
+        runner: Runner::Server(|ctx| Box::pin(cluster_replicas_span_brokers(ctx))),
+    },
+    Check {
+        id: "cluster/writes-go-to-the-leader",
+        requirement: "refuses a produce to a broker that does not lead the                       partition, rather than appending to a log the leader knows                       nothing about",
+        runner: Runner::Server(|ctx| Box::pin(cluster_writes_go_to_the_leader(ctx))),
+    },
+    Check {
+        id: "cluster/group-offsets-need-the-coordinator",
+        requirement: "refuses an offset commit on a broker that does not                       coordinate the group, rather than storing it where the                       coordinator will never see it",
+        runner: Runner::Server(|ctx| Box::pin(cluster_group_offsets_need_the_coordinator(ctx))),
+    },
 ];
 
 /// Limits for one server-side run.
@@ -4113,6 +4138,18 @@ impl<'a> ProduceStamp<'a> {
         }
     }
 
+    /// An ordinary write: no producer identity, no transaction. The
+    /// sentinels are what a producer that has never called
+    /// InitProducerId sends.
+    fn plain() -> ProduceStamp<'static> {
+        ProduceStamp {
+            producer_id: -1,
+            producer_epoch: -1,
+            base_sequence: -1,
+            transactional_id: None,
+        }
+    }
+
     fn idempotent(identity: &InitProducerIdResponse, base_sequence: i32) -> ProduceStamp<'static> {
         ProduceStamp {
             producer_id: identity.producer_id,
@@ -6993,4 +7030,634 @@ fn frame_request(
         .map_err(|e| format!("encoding a request header: {e}"))?;
     out.extend_from_slice(body);
     Ok(out.to_vec())
+}
+
+// ---------------------------------------------------------------------
+// Cluster checks
+//
+// Everything above this line can be asked of a single broker. Nothing
+// below it can. On one node every partition's leader and every group's
+// coordinator is the broker you are already connected to, so the
+// questions these ask — does *every* broker agree, and does the wrong
+// broker refuse — have no content there. They skip, and say so.
+//
+// They are not about failure or recovery. Nothing here kills a broker.
+// They are about a cluster's answers being consistent while everything
+// is working, which is the precondition for anything about failure
+// meaning something.
+// ---------------------------------------------------------------------
+
+/// One broker of the subject cluster, as Metadata describes it.
+struct ClusterNode {
+    node_id: i32,
+    addr: String,
+}
+
+/// Every broker the subject reports, or a skip when there is only one.
+///
+/// Discovered through Metadata rather than configured, because that is
+/// the only way a client could discover them either — and a suite that
+/// was told the topology out of band could not notice a subject whose
+/// Metadata failed to describe it.
+async fn cluster_nodes(ctx: &ServerCtx) -> Result<Vec<ClusterNode>, Verdict> {
+    let version = negotiate(
+        "Metadata",
+        ctx.range(MetadataRequest::API_KEY)?,
+        1,
+        MetadataRequest::MAX_VERSION,
+    )?;
+    let mut conn = connect(&ctx.addr).await.map_err(CheckError::into_verdict)?;
+    let mut request = MetadataRequest::default();
+    request.topics = Some(Vec::new());
+    request.allow_auto_topic_creation = false;
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| Verdict::Error {
+            details: format!("encoding Metadata: {e}"),
+        })?;
+    let resp: MetadataResponse =
+        api_call(&mut conn, MetadataRequest::API_KEY, version, 1_400, &body)
+            .await
+            .map_err(|e| e.context("Metadata").into_verdict())?;
+
+    let nodes: Vec<ClusterNode> = resp
+        .brokers
+        .iter()
+        .filter(|b| !b.host.is_empty() && (1..=65535).contains(&b.port))
+        .map(|b| ClusterNode {
+            node_id: b.node_id,
+            addr: format!("{}:{}", b.host, b.port),
+        })
+        .collect();
+    if nodes.len() < 2 {
+        return Err(Verdict::Skipped {
+            reason: format!(
+                "the subject reports {} broker(s); this check is about what \
+                 brokers must agree on, which a cluster of one cannot be asked",
+                nodes.len()
+            ),
+        });
+    }
+    Ok(nodes)
+}
+
+/// Where Metadata at `conn` says partition 0 of `topic` is led, and by
+/// which replicas.
+async fn leadership_at(
+    conn: &mut RawConnection,
+    version: i16,
+    topic: &str,
+    correlation: i32,
+) -> Result<Option<(i32, Vec<i32>, Vec<i32>)>, CheckError> {
+    let resp = metadata_of_topic(conn, version, topic, correlation).await?;
+    let Some(entry) = resp
+        .topics
+        .iter()
+        .find(|t| t.name.as_deref() == Some(topic))
+    else {
+        return Ok(None);
+    };
+    if !ErrorCode(entry.error_code).is_ok() {
+        return Ok(None);
+    }
+    Ok(entry
+        .partitions
+        .iter()
+        .find(|p| p.partition_index == 0)
+        .filter(|p| ErrorCode(p.error_code).is_ok())
+        .map(|p| (p.leader_id, p.replica_nodes.clone(), p.isr_nodes.clone())))
+}
+
+/// Every broker must name the same leader for the same partition.
+///
+/// Leadership is a fact about the partition, not about who you ask. Two
+/// brokers that answer differently give two producers two different
+/// places to write, and a partition with two writers has two histories
+/// — which is the single thing leadership exists to prevent. It is also
+/// invisible to each client individually: both are told something
+/// plausible by a broker that sounds sure.
+async fn cluster_brokers_agree_on_the_leader(ctx: &ServerCtx) -> Verdict {
+    let nodes = match cluster_nodes(ctx).await {
+        Ok(nodes) => nodes,
+        Err(verdict) => return verdict,
+    };
+    let version = match negotiate(
+        "Metadata",
+        match ctx.range(MetadataRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        1,
+        MetadataRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let produced = match produce_flow(ctx, "agreeleader", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+
+    let mut answers: Vec<(i32, i32)> = Vec::new();
+    for (i, node) in nodes.iter().enumerate() {
+        let mut conn = match connect(&node.addr).await {
+            Ok(c) => c,
+            Err(e) => {
+                return e
+                    .context(&format!("connecting to node {}", node.node_id))
+                    .into_verdict();
+            }
+        };
+        let correlation = 1_410 + i32::try_from(i).unwrap_or(0);
+        // A broker that has not yet heard of the topic has not
+        // disagreed about it; it has not answered.
+        if let Err(e) = await_topic_known(ctx, &mut conn, &produced.topic, correlation).await {
+            return e.into_verdict();
+        }
+        match leadership_at(&mut conn, version, &produced.topic, correlation + 100).await {
+            Ok(Some((leader, _, _))) => answers.push((node.node_id, leader)),
+            Ok(None) => {}
+            Err(e) => {
+                return e
+                    .context(&format!("Metadata at node {}", node.node_id))
+                    .into_verdict();
+            }
+        }
+    }
+    if answers.len() < 2 {
+        return Verdict::Skipped {
+            reason: format!(
+                "only {} broker(s) could describe {} within the settle budget, so \
+                 there is no disagreement to detect",
+                answers.len(),
+                produced.topic
+            ),
+        };
+    }
+    let (_, first) = answers[0];
+    if let Some((node_id, leader)) = answers.iter().find(|(_, leader)| *leader != first) {
+        return Verdict::Fail {
+            details: format!(
+                "brokers disagree about who leads {}[0]: node {} says {leader}, node {} \
+                 says {first}. Two clients refreshing metadata against different \
+                 brokers would write to different leaders",
+                produced.topic, node_id, answers[0].0
+            ),
+        };
+    }
+    Verdict::Pass
+}
+
+/// Every broker must name the same coordinator for the same group.
+///
+/// The same argument as leadership, for the other half of the protocol.
+/// FindCoordinator exists so a client can be told where to go; a cluster
+/// whose brokers each name themselves has told every client something
+/// different, and the group's committed offsets are then spread over
+/// however many brokers its members happened to bootstrap against.
+async fn cluster_brokers_agree_on_the_coordinator(ctx: &ServerCtx) -> Verdict {
+    let nodes = match cluster_nodes(ctx).await {
+        Ok(nodes) => nodes,
+        Err(verdict) => return verdict,
+    };
+    let version = match negotiate(
+        "FindCoordinator",
+        match ctx.range(FindCoordinatorRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        FindCoordinatorRequest::MIN_VERSION,
+        FindCoordinatorRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let group = check_group("agreecoord");
+    // Warm it first: a group whose coordinator is still being elected
+    // is a wait, and the checks that report that are elsewhere.
+    if let Err(e) = await_coordinator(ctx, &group).await {
+        return e.into_verdict();
+    }
+
+    let mut request = FindCoordinatorRequest::default();
+    request.key_type = 0;
+    if version >= FIND_COORDINATOR_BATCHED {
+        request.coordinator_keys = vec![group.clone()];
+    } else {
+        request.key = group.clone();
+    }
+    let mut body = BytesMut::new();
+    if let Err(e) = request.encode(&mut body, version) {
+        return Verdict::Error {
+            details: format!("encoding FindCoordinator: {e}"),
+        };
+    }
+
+    let mut answers: Vec<(i32, String)> = Vec::new();
+    for (i, node) in nodes.iter().enumerate() {
+        let mut conn = match connect(&node.addr).await {
+            Ok(c) => c,
+            Err(e) => {
+                return e
+                    .context(&format!("connecting to node {}", node.node_id))
+                    .into_verdict();
+            }
+        };
+        let resp: FindCoordinatorResponse = match api_call(
+            &mut conn,
+            FindCoordinatorRequest::API_KEY,
+            version,
+            1_430 + i32::try_from(i).unwrap_or(0),
+            &body,
+        )
+        .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                return e
+                    .context(&format!("FindCoordinator at node {}", node.node_id))
+                    .into_verdict();
+            }
+        };
+        if is_coordinator_settling(coordinator_error(&resp, version)) {
+            continue;
+        }
+        if let Some(endpoint) = coordinator_endpoint(&resp, version) {
+            answers.push((node.node_id, endpoint));
+        }
+    }
+    if answers.len() < 2 {
+        return Verdict::Skipped {
+            reason: format!(
+                "only {} broker(s) named a coordinator for {group}, so there is no \
+                 disagreement to detect",
+                answers.len()
+            ),
+        };
+    }
+    let first = answers[0].1.clone();
+    if let Some((node_id, endpoint)) = answers.iter().find(|(_, e)| *e != first) {
+        return Verdict::Fail {
+            details: format!(
+                "brokers disagree about who coordinates {group}: node {node_id} says \
+                 {endpoint}, node {} says {first}. The group's offsets would be split \
+                 across brokers by which one each member asked",
+                answers[0].0
+            ),
+        };
+    }
+    Verdict::Pass
+}
+
+/// A topic asked for n replicas must get n distinct brokers.
+///
+/// Replication that lands twice on one broker is not replication: the
+/// copies share a disk and a process, and the cluster has quietly
+/// promised a durability it cannot deliver. The leader must also be one
+/// of the replicas, and the in-sync set drawn from them, or the numbers
+/// describe a partition that does not exist.
+async fn cluster_replicas_span_brokers(ctx: &ServerCtx) -> Verdict {
+    let nodes = match cluster_nodes(ctx).await {
+        Ok(nodes) => nodes,
+        Err(verdict) => return verdict,
+    };
+    let create_version = match negotiate(
+        "CreateTopics",
+        match ctx.range(CreateTopicsRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        CreateTopicsRequest::MIN_VERSION,
+        CreateTopicsRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let metadata_version = match negotiate(
+        "Metadata",
+        match ctx.range(MetadataRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        1,
+        MetadataRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let known: Vec<i32> = nodes.iter().map(|n| n.node_id).collect();
+    // Every broker there is, so the answer is unambiguous: with fewer
+    // replicas than brokers, a subject could satisfy this by accident.
+    let wanted = i16::try_from(nodes.len()).unwrap_or(i16::MAX);
+
+    let mut conn = match connect(&ctx.addr).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
+    let topic = unique_topic("spanned");
+    let mut creatable = CreatableTopic::default();
+    creatable.name = topic.clone();
+    creatable.num_partitions = 1;
+    creatable.replication_factor = wanted;
+    let mut create = CreateTopicsRequest::default();
+    create.topics = vec![creatable];
+    create.timeout_ms = 30_000;
+    create.validate_only = false;
+    let mut body = BytesMut::new();
+    if let Err(e) = create.encode(&mut body, create_version) {
+        return Verdict::Error {
+            details: format!("encoding CreateTopics: {e}"),
+        };
+    }
+    let resp: CreateTopicsResponse = match api_call(
+        &mut conn,
+        CreateTopicsRequest::API_KEY,
+        create_version,
+        1_450,
+        &body,
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(e) => return e.context("CreateTopics").into_verdict(),
+    };
+    let code = resp
+        .topics
+        .first()
+        .map_or(ErrorCode::NONE, |t| ErrorCode(t.error_code));
+    if !code.is_ok() {
+        return Verdict::Skipped {
+            reason: format!(
+                "the subject would not create a {wanted}-replica topic on its \
+                 {} broker(s): {code}",
+                nodes.len()
+            ),
+        };
+    }
+
+    let mut seen = None;
+    for attempt in 0..ctx.config.settle_attempts() {
+        if attempt > 0 {
+            tokio::time::sleep(ctx.config.settle_delay).await;
+        }
+        match leadership_at(
+            &mut conn,
+            metadata_version,
+            &topic,
+            1_460 + i32::try_from(attempt).unwrap_or(0),
+        )
+        .await
+        {
+            Ok(Some(found)) => {
+                seen = Some(found);
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => return e.context("Metadata").into_verdict(),
+        }
+    }
+    let Some((leader, replicas, isr)) = seen else {
+        return Verdict::Error {
+            details: format!("{topic} was created but never described within the settle budget"),
+        };
+    };
+
+    let mut distinct = replicas.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if distinct.len() != replicas.len() {
+        return Verdict::Fail {
+            details: format!(
+                "{topic}[0] asked for {wanted} replicas and was given {replicas:?} — the \
+                 same broker more than once, so the copies share a disk"
+            ),
+        };
+    }
+    if replicas.len() != usize::from(u16::try_from(wanted).unwrap_or(0)) {
+        return Verdict::Fail {
+            details: format!(
+                "{topic}[0] was created asking for {wanted} replicas and is reported on \
+                 {replicas:?}; the cluster has brokers {known:?}"
+            ),
+        };
+    }
+    if let Some(stranger) = replicas.iter().find(|r| !known.contains(r)) {
+        return Verdict::Fail {
+            details: format!(
+                "{topic}[0] names replica {stranger}, which is not one of the brokers \
+                 the same cluster reports ({known:?})"
+            ),
+        };
+    }
+    if !replicas.contains(&leader) {
+        return Verdict::Fail {
+            details: format!(
+                "{topic}[0] is led by {leader}, which is not among its replicas \
+                 {replicas:?}; the leader holds a copy by definition"
+            ),
+        };
+    }
+    if let Some(stranger) = isr.iter().find(|r| !replicas.contains(r)) {
+        return Verdict::Fail {
+            details: format!(
+                "{topic}[0] reports {stranger} in sync, which is not one of its replicas \
+                 {replicas:?}"
+            ),
+        };
+    }
+    Verdict::Pass
+}
+
+/// A broker that does not lead the partition must refuse the write.
+///
+/// Accepting it is the worst available outcome: the records land in a
+/// log the leader knows nothing about, the partition has two histories,
+/// and the producer is told everything is fine. The refusal is also the
+/// client's only cue to re-read Metadata, so a broker that silently
+/// accepted would leave the client pointed at the wrong broker forever.
+async fn cluster_writes_go_to_the_leader(ctx: &ServerCtx) -> Verdict {
+    let nodes = match cluster_nodes(ctx).await {
+        Ok(nodes) => nodes,
+        Err(verdict) => return verdict,
+    };
+    let produce_version = match negotiate(
+        "Produce",
+        match ctx.range(ProduceRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        ProduceRequest::MIN_VERSION,
+        PRODUCE_NAME_MAX,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let metadata_version = match negotiate(
+        "Metadata",
+        match ctx.range(MetadataRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        1,
+        MetadataRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let produced = match produce_flow(ctx, "notleader", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+
+    let mut conn = match connect(&ctx.addr).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
+    let leader = match leadership_at(&mut conn, metadata_version, &produced.topic, 1_470).await {
+        Ok(Some((leader, _, _))) => leader,
+        Ok(None) => {
+            return Verdict::Error {
+                details: format!("{} has no described leader", produced.topic),
+            };
+        }
+        Err(e) => return e.context("Metadata").into_verdict(),
+    };
+    let Some(other) = nodes.iter().find(|n| n.node_id != leader) else {
+        return Verdict::Skipped {
+            reason: format!(
+                "every broker the subject reports is node {leader}, so there is no \
+                 non-leader to send to"
+            ),
+        };
+    };
+
+    let mut conn = match connect(&other.addr).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
+    let (code, _) = match produce_stamped(
+        &mut conn,
+        produce_version,
+        ProduceStamp::plain(),
+        &produced.topic,
+        0,
+        1_480,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => return e.context("Produce (to a non-leader)").into_verdict(),
+    };
+    if code == ErrorCode::NOT_LEADER_OR_FOLLOWER {
+        return Verdict::Pass;
+    }
+    if code.is_ok() {
+        return Verdict::Fail {
+            details: format!(
+                "node {} accepted a write to {}[0], which node {leader} leads; those \
+                 records are in a log the leader does not have, and the producer was \
+                 told nothing",
+                other.node_id, produced.topic
+            ),
+        };
+    }
+    // Some other refusal still keeps the records out, which is the part
+    // that matters; the code is how the client learns to look again.
+    Verdict::Fail {
+        details: format!(
+            "node {} refused a write to {}[0] with {code} rather than \
+             NOT_LEADER_OR_FOLLOWER, so the producer is not told to re-read \
+             metadata and find node {leader}",
+            other.node_id, produced.topic
+        ),
+    }
+}
+
+/// A broker that does not coordinate the group must refuse the commit.
+///
+/// Offsets stored anywhere else are stored where nothing will read
+/// them: a consumer that resumes goes to the coordinator, sees an older
+/// position or none, and reprocesses everything since. Exactly-once
+/// becomes at-least-twice, silently, and only on restart.
+async fn cluster_group_offsets_need_the_coordinator(ctx: &ServerCtx) -> Verdict {
+    let nodes = match cluster_nodes(ctx).await {
+        Ok(nodes) => nodes,
+        Err(verdict) => return verdict,
+    };
+    let (commit_version, _) = match offsets_versions(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let produced = match produce_flow(ctx, "notcoord", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    if let Some(skip) = skip_without_topic_id(&produced, commit_version) {
+        return skip;
+    }
+    let group = check_group("notcoord");
+    let Some(coordinator) = (match await_coordinator(ctx, &group).await {
+        Ok(addr) => addr,
+        Err(e) => return e.into_verdict(),
+    }) else {
+        return Verdict::Skipped {
+            reason: format!("the subject named no coordinator for {group}"),
+        };
+    };
+    let Some(other) = nodes.iter().find(|n| n.addr != coordinator) else {
+        return Verdict::Skipped {
+            reason: format!(
+                "every broker the subject reports is at {coordinator}, so there is no \
+                 non-coordinator to commit against"
+            ),
+        };
+    };
+
+    let mut conn = match connect(&other.addr).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
+    // The topic has to be known there, or the refusal could be about
+    // the topic rather than about the group.
+    if let Err(e) = await_topic_known(ctx, &mut conn, &produced.topic, 1_490).await {
+        return e.into_verdict();
+    }
+    match commit_offset(
+        &mut conn,
+        commit_version,
+        &group,
+        &produced.topic,
+        produced.topic_id,
+        13,
+        1_495,
+    )
+    .await
+    {
+        Ok(()) => Verdict::Fail {
+            details: format!(
+                "node {} accepted a commit for {group}, which {coordinator} coordinates; \
+                 a consumer resuming through the coordinator would never see that offset \
+                 and would reprocess everything after it",
+                other.node_id
+            ),
+        },
+        // `commit_offset` reports a non-zero code as a violation, which
+        // here is the passing answer — so read the code back out of it.
+        Err(CheckError::Violation(details))
+            if details.ends_with(&format!("{}", ErrorCode::NOT_COORDINATOR)) =>
+        {
+            Verdict::Pass
+        }
+        Err(CheckError::Violation(details)) => Verdict::Fail {
+            details: format!(
+                "node {} refused the commit, but not with NOT_COORDINATOR, so the client \
+                 is not told where to go instead: {details}",
+                other.node_id
+            ),
+        },
+        Err(e) => e
+            .context("OffsetCommit (to a non-coordinator)")
+            .into_verdict(),
+    }
 }

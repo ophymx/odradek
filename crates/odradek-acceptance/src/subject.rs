@@ -94,7 +94,23 @@ use tokio::task::JoinHandle;
 pub const MAX_SUPPORTED_API_VERSIONS: i16 = ApiVersionsRequest::MAX_VERSION;
 
 /// The single broker this subject presents itself as.
+/// The node id of the broker a client bootstraps against.
 const BROKER_NODE_ID: i32 = 1;
+
+/// How many brokers the reference subject presents.
+///
+/// Three, and not one, because the questions that matter most about a
+/// Kafka cluster cannot be asked of a cluster of one. On a single
+/// broker every partition's leader and every group's and transaction's
+/// coordinator is the broker you are already connected to, so a client
+/// — or a suite — that never consults Metadata is indistinguishable
+/// from one that does. Three is also what the docker cluster subject
+/// runs, which keeps the model and the thing it models the same shape.
+///
+/// Not two: with two nodes, "some other broker" is always the same
+/// broker, and a check that meant to find a non-leader could find one by
+/// accident rather than by looking.
+const NODES: usize = 3;
 /// ListOffsets sentinel timestamps: the log start and the log end.
 const EARLIEST_TIMESTAMP: i64 = -2;
 const LATEST_TIMESTAMP: i64 = -1;
@@ -166,6 +182,23 @@ pub enum Fault {
     /// Complete the exchange without the `v=` signature, so the client
     /// has no way to know whether the server holds the account at all.
     ScramSkipsServerSignature,
+    /// Every broker names itself the leader of every partition, so a
+    /// client is routed to a different broker depending on which one it
+    /// last refreshed metadata against.
+    BrokersDisagreeOnLeader,
+    /// Report a replicated partition as living on one broker, so a
+    /// client has no idea how much of the cluster it would take to lose
+    /// the data.
+    ReplicasCollapseToTheLeader,
+    /// Every broker names itself the coordinator, so a group has as
+    /// many coordinators as it has bootstrap addresses.
+    CoordinatorIsWhoeverAsked,
+    /// Take a write on a broker that does not lead the partition,
+    /// giving it two histories.
+    AnyBrokerAcceptsWrites,
+    /// Store a group's offsets on whichever broker was asked, where its
+    /// coordinator will never see them.
+    AnyBrokerServesGroups,
     /// Refuse an unsupported mechanism without naming any supported
     /// one, leaving the client nothing to fall back to.
     SaslHandshakeHidesMechanisms,
@@ -353,6 +386,11 @@ impl Fault {
         Fault::ScramNonceReplacesClients,
         Fault::ScramWeakIterations,
         Fault::ScramSkipsServerSignature,
+        Fault::BrokersDisagreeOnLeader,
+        Fault::ReplicasCollapseToTheLeader,
+        Fault::CoordinatorIsWhoeverAsked,
+        Fault::AnyBrokerAcceptsWrites,
+        Fault::AnyBrokerServesGroups,
     ];
 }
 
@@ -360,30 +398,55 @@ impl Fault {
 #[derive(Debug)]
 pub struct SubjectServer {
     addr: String,
-    handle: JoinHandle<()>,
+    handles: Vec<JoinHandle<()>>,
 }
 
 impl SubjectServer {
     /// Spawn a subject exhibiting `faults` (none = conformant).
+    ///
+    /// [`NODES`] listeners over one [`ClusterState`], which between them
+    /// are a cluster: each leads the partitions and coordinates the
+    /// groups that hash to it, and refers a client that asks the wrong
+    /// one onwards. [`addr`](Self::addr) is the bootstrap; the rest are
+    /// found through Metadata, as on any cluster.
     pub async fn spawn(faults: Vec<Fault>) -> io::Result<SubjectServer> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let addr = listener.local_addr()?.to_string();
+        let mut listeners = Vec::with_capacity(NODES);
+        for _ in 0..NODES {
+            listeners.push(TcpListener::bind("127.0.0.1:0").await?);
+        }
+        let addr = listeners[0].local_addr()?.to_string();
         let cluster: Cluster = Cluster::default();
-        let handle = tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    return;
-                };
-                tokio::spawn(handle_connection(
-                    stream,
-                    faults.clone(),
-                    std::sync::Arc::clone(&cluster),
-                ));
+        // The ports have to be in the state before the first request is
+        // served: a Metadata answer names every broker, including the
+        // ones nothing has connected to yet.
+        {
+            let mut state = cluster.lock().unwrap();
+            for listener in &listeners {
+                state.ports.push(i32::from(listener.local_addr()?.port()));
             }
-        });
-        Ok(SubjectServer { addr, handle })
+        }
+
+        let mut handles = Vec::with_capacity(NODES);
+        for listener in listeners {
+            let faults = faults.clone();
+            let cluster = std::sync::Arc::clone(&cluster);
+            handles.push(tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    tokio::spawn(handle_connection(
+                        stream,
+                        faults.clone(),
+                        std::sync::Arc::clone(&cluster),
+                    ));
+                }
+            }));
+        }
+        Ok(SubjectServer { addr, handles })
     }
 
+    /// The broker a client bootstraps against.
     pub fn addr(&self) -> &str {
         &self.addr
     }
@@ -391,7 +454,9 @@ impl SubjectServer {
 
 impl Drop for SubjectServer {
     fn drop(&mut self) {
-        self.handle.abort();
+        for handle in &self.handles {
+            handle.abort();
+        }
     }
 }
 
@@ -627,6 +692,57 @@ struct ClusterState {
     /// only gains an entry once something is produced, and from
     /// `topic_names`, which maps ids: a topic can exist and be empty.
     created: HashMap<String, [u8; 16]>,
+    /// The port each broker listens on, indexed by node id minus one.
+    /// Filled in at spawn, once the listeners have their ports.
+    ports: Vec<i32>,
+}
+
+impl ClusterState {
+    /// Which node leads every partition of `topic`, or coordinates the
+    /// group or transactional id `key`.
+    ///
+    /// A hash of the name rather than anything stored, so it is the same
+    /// answer from every broker without any agreement protocol between
+    /// them — and different names land on different nodes, which is what
+    /// makes "go and ask the right one" a thing a check can observe.
+    fn placement(&self, key: &str) -> i32 {
+        if self.ports.is_empty() {
+            return BROKER_NODE_ID;
+        }
+        let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in key.bytes() {
+            acc ^= u64::from(byte);
+            acc = acc.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let index = usize::try_from(acc % self.ports.len() as u64).unwrap_or(0);
+        i32::try_from(index + 1).unwrap_or(BROKER_NODE_ID)
+    }
+
+    /// The port a node id listens on.
+    fn port_of(&self, node_id: i32) -> i32 {
+        usize::try_from(node_id - 1)
+            .ok()
+            .and_then(|i| self.ports.get(i))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Which node listens on `port`.
+    fn node_of(&self, port: i32) -> i32 {
+        self.ports
+            .iter()
+            .position(|p| *p == port)
+            .and_then(|i| i32::try_from(i + 1).ok())
+            .unwrap_or(BROKER_NODE_ID)
+    }
+
+    /// Every broker, as node id and port.
+    fn nodes(&self) -> impl Iterator<Item = (i32, i32)> + '_ {
+        self.ports
+            .iter()
+            .enumerate()
+            .map(|(i, port)| (i32::try_from(i + 1).unwrap_or(BROKER_NODE_ID), *port))
+    }
 }
 
 /// One consumer group, as much of it as the classic protocol needs.
@@ -751,6 +867,10 @@ async fn handle_connection(mut stream: TcpStream, faults: Vec<Fault>, cluster: C
         Ok(a) => i32::from(a.port()),
         Err(_) => return,
     };
+    // Which of the cluster's brokers this connection reached. Fixed for
+    // the life of the connection, as it is for a real client: you do not
+    // become a different broker part way through.
+    let node_id = cluster.lock().unwrap().node_of(local_port);
     // The SASL exchange is this connection's; everything else belongs to
     // the cluster and is locked per request.
     let mut sasl = SaslState::default();
@@ -779,26 +899,38 @@ async fn handle_connection(mut stream: TcpStream, faults: Vec<Fault>, cluster: C
             MetadataRequest::API_KEY => metadata_exchange(
                 frame,
                 api_version,
-                local_port,
+                node_id,
                 &faults,
                 &cluster.lock().unwrap(),
             ),
             CreateTopicsRequest::API_KEY => {
                 create_topics_exchange(frame, api_version, &faults, &mut cluster.lock().unwrap())
             }
-            ProduceRequest::API_KEY => {
-                produce_exchange(frame, api_version, &faults, &mut cluster.lock().unwrap())
-            }
+            ProduceRequest::API_KEY => produce_exchange(
+                frame,
+                api_version,
+                node_id,
+                &faults,
+                &mut cluster.lock().unwrap(),
+            ),
             FetchRequest::API_KEY => fetch_exchange(frame, api_version, &faults, &cluster).await,
             ListOffsetsRequest::API_KEY => {
                 list_offsets_exchange(frame, api_version, &faults, &cluster.lock().unwrap())
             }
-            FindCoordinatorRequest::API_KEY => {
-                find_coordinator_exchange(frame, api_version, local_port, &faults)
-            }
-            OffsetCommitRequest::API_KEY => {
-                offset_commit_exchange(frame, api_version, &faults, &mut cluster.lock().unwrap())
-            }
+            FindCoordinatorRequest::API_KEY => find_coordinator_exchange(
+                frame,
+                api_version,
+                node_id,
+                &faults,
+                &cluster.lock().unwrap(),
+            ),
+            OffsetCommitRequest::API_KEY => offset_commit_exchange(
+                frame,
+                api_version,
+                node_id,
+                &faults,
+                &mut cluster.lock().unwrap(),
+            ),
             OffsetFetchRequest::API_KEY => {
                 offset_fetch_exchange(frame, api_version, &faults, &cluster.lock().unwrap())
             }
@@ -1517,8 +1649,9 @@ fn list_offsets_exchange(
 fn find_coordinator_exchange(
     mut frame: Bytes,
     api_version: i16,
-    local_port: i32,
+    node_id: i32,
     faults: &[Fault],
+    state: &ClusterState,
 ) -> Option<BytesMut> {
     if !(FindCoordinatorRequest::MIN_VERSION..=FindCoordinatorRequest::MAX_VERSION)
         .contains(&api_version)
@@ -1541,18 +1674,35 @@ fn find_coordinator_exchange(
                 } else {
                     key.clone()
                 };
-                c.node_id = BROKER_NODE_ID;
+                // The coordinator for this key, which any broker can
+                // be asked about and every broker answers the same.
+                // As with leadership: the answer is a property of the
+                // key, not of who was asked. A broker that named itself
+                // would send every client to whichever broker it
+                // happened to ask, and the group would have as many
+                // coordinators as it had bootstrap addresses.
+                let owner = if faults.contains(&Fault::CoordinatorIsWhoeverAsked) {
+                    node_id
+                } else {
+                    state.placement(key)
+                };
+                c.node_id = owner;
                 c.host = "127.0.0.1".to_owned();
-                c.port = local_port;
+                c.port = state.port_of(owner);
                 c.error_code = 0;
                 c
             })
             .collect();
     } else {
+        let owner = if faults.contains(&Fault::CoordinatorIsWhoeverAsked) {
+            node_id
+        } else {
+            state.placement(&request.key)
+        };
         resp.error_code = 0;
-        resp.node_id = BROKER_NODE_ID;
+        resp.node_id = owner;
         resp.host = "127.0.0.1".to_owned();
-        resp.port = local_port;
+        resp.port = state.port_of(owner);
     }
     frame_response(
         req_header.correlation_id,
@@ -1566,6 +1716,7 @@ fn find_coordinator_exchange(
 fn offset_commit_exchange(
     mut frame: Bytes,
     api_version: i16,
+    node_id: i32,
     faults: &[Fault],
     state: &mut ClusterState,
 ) -> Option<BytesMut> {
@@ -1576,6 +1727,44 @@ fn offset_commit_exchange(
     let hv = header::request_header_version(OffsetCommitRequest::API_KEY, api_version)?;
     let req_header = RequestHeader::decode(&mut frame, hv).ok()?;
     let request = OffsetCommitRequest::decode(&mut frame, api_version).ok()?;
+
+    // A group's offsets live with its coordinator and nowhere else. A
+    // broker that stored them anyway would hold a commit the
+    // coordinator cannot see, so a consumer that resumed through the
+    // coordinator would rewind to before it — reprocessing everything
+    // between, exactly once having become at least twice. NOT_COORDINATOR
+    // tells the client to go and ask the broker that owns the group,
+    // which it can find with FindCoordinator.
+    let owner = state.placement(&request.group_id);
+    if owner != node_id && !faults.contains(&Fault::AnyBrokerServesGroups) {
+        let mut resp = OffsetCommitResponse::default();
+        resp.topics = request
+            .topics
+            .iter()
+            .map(|topic| {
+                let mut out = OffsetCommitResponseTopic::default();
+                out.name = topic.name.clone();
+                out.topic_id = topic.topic_id;
+                out.partitions = topic
+                    .partitions
+                    .iter()
+                    .map(|p| {
+                        let mut entry = OffsetCommitResponsePartition::default();
+                        entry.partition_index = p.partition_index;
+                        entry.error_code = ErrorCode::NOT_COORDINATOR.0;
+                        entry
+                    })
+                    .collect();
+                out
+            })
+            .collect();
+        return frame_response(
+            req_header.correlation_id,
+            response_header_version(OffsetCommitRequest::API_KEY, api_version),
+            |out| resp.encode(out, api_version).unwrap(),
+            false,
+        );
+    }
 
     let mut resp = OffsetCommitResponse::default();
     resp.topics = request
@@ -1836,7 +2025,7 @@ fn api_versions_exchange(mut frame: Bytes, api_version: i16, faults: &[Fault]) -
 fn metadata_exchange(
     mut frame: Bytes,
     api_version: i16,
-    local_port: i32,
+    node_id: i32,
     faults: &[Fault],
     state: &ClusterState,
 ) -> Option<BytesMut> {
@@ -1852,11 +2041,19 @@ fn metadata_exchange(
     let brokers = if has(Fault::MetadataEmptyBrokers) {
         Vec::new()
     } else {
-        let mut broker = MetadataResponseBroker::default();
-        broker.node_id = BROKER_NODE_ID;
-        broker.host = "127.0.0.1".into();
-        broker.port = local_port;
-        vec![broker]
+        // Every broker in the cluster, not just this one. A client that
+        // was told only about the broker it is already connected to
+        // could never reach a partition this one does not lead.
+        state
+            .nodes()
+            .map(|(node_id, port)| {
+                let mut broker = MetadataResponseBroker::default();
+                broker.node_id = node_id;
+                broker.host = "127.0.0.1".into();
+                broker.port = port;
+                broker
+            })
+            .collect()
     };
     // A response names exactly the topics the request named: the ones
     // that exist, and the ones that do not with a code saying so. A
@@ -1905,14 +2102,36 @@ fn metadata_exchange(
                         // The leader has to be a node the same response
                         // names, or a client is handed a healthy topic
                         // with nowhere to send to.
-                        p.leader_id = if has(Fault::MetadataLeaderIsUnknown) {
-                            BROKER_NODE_ID + 999
+                        // Every broker computes this the same way, so
+                        // every broker gives the same answer. The fault
+                        // makes each claim leadership for itself, which
+                        // is the shape of the real bug: a client that
+                        // refreshes metadata against a different broker
+                        // than last time is sent somewhere else, and
+                        // two producers can believe in two leaders.
+                        let leader = if has(Fault::BrokersDisagreeOnLeader) {
+                            node_id
                         } else {
-                            BROKER_NODE_ID
+                            state.placement(name)
+                        };
+                        p.leader_id = if has(Fault::MetadataLeaderIsUnknown) {
+                            leader + 999
+                        } else {
+                            leader
                         };
                         p.leader_epoch = 0;
-                        p.replica_nodes = vec![BROKER_NODE_ID];
-                        p.isr_nodes = vec![BROKER_NODE_ID];
+                        // Replicated across every node, the leader
+                        // first, and all of them in sync — this subject
+                        // has no failure to model, only placement.
+                        let replicas: Vec<i32> = if has(Fault::ReplicasCollapseToTheLeader) {
+                            vec![leader]
+                        } else {
+                            std::iter::once(leader)
+                                .chain(state.nodes().map(|(id, _)| id).filter(|id| *id != leader))
+                                .collect()
+                        };
+                        p.isr_nodes.clone_from(&replicas);
+                        p.replica_nodes = replicas;
                         topic.partitions = vec![p];
                     }
                     None => topic.error_code = ErrorCode::UNKNOWN_TOPIC_OR_PARTITION.0,
@@ -1973,11 +2192,12 @@ fn create_topics_exchange(
             result.topic_id = topic_id;
             result.num_partitions = t.num_partitions.max(1);
             result.replication_factor = t.replication_factor.max(1);
-            // This subject is one broker, so anything above one replica
-            // is a durability level it cannot give — and saying yes to
-            // it anyway is the failure the check looks for: the caller
+            // More replicas than there are brokers is a durability
+            // level this cluster cannot give — and saying yes to it
+            // anyway is the failure the check looks for: the caller
             // would be told it has replication it does not have.
-            let overreplicated = t.replication_factor > 1
+            let brokers = i16::try_from(state.ports.len().max(1)).unwrap_or(i16::MAX);
+            let overreplicated = t.replication_factor > brokers
                 && !faults.contains(&Fault::CreateTopicsIgnoresReplicationFactor);
             result.error_code = if exists && !faults.contains(&Fault::CreateTopicsDuplicateSucceeds)
             {
@@ -2005,6 +2225,7 @@ fn create_topics_exchange(
 fn produce_exchange(
     mut frame: Bytes,
     api_version: i16,
+    node_id: i32,
     faults: &[Fault],
     state: &mut ClusterState,
 ) -> Option<BytesMut> {
@@ -2045,6 +2266,22 @@ fn produce_exchange(
                 partition_responses.push(entry);
                 continue;
             };
+            // Only the leader may append. A follower that took the write
+            // instead of refusing it would put records in a log the
+            // leader knows nothing about, and the partition would have
+            // two histories — the divergence that leadership exists to
+            // prevent. The refusal is the client's cue to re-read
+            // Metadata, which is why it must not be silent.
+            if state.placement(name) != node_id && !faults.contains(&Fault::AnyBrokerAcceptsWrites)
+            {
+                let mut entry = PartitionProduceResponse::default();
+                entry.index = partition.index;
+                entry.error_code = ErrorCode::NOT_LEADER_OR_FOLLOWER.0;
+                entry.base_offset = -1;
+                entry.log_append_time_ms = -1;
+                partition_responses.push(entry);
+                continue;
+            }
             let log = state
                 .logs
                 .entry((name.clone(), partition.index))

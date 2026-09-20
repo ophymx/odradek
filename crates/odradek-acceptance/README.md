@@ -61,10 +61,10 @@ catalog worth anything — a check that cannot fail passes everywhere.
 
 `api-versions/*`, `metadata/*`, `produce/*`, `fetch/*`,
 `list-offsets/*`, `find-coordinator/*`, `offsets/*`, `create-topics/*`,
-`groups/*`, `consumer-group/*` (KIP-848), `sasl/*`, `txn/*`, and
-`admin/*` — everything a producer or consumer needs, plus the group
-protocols, the SASL handshake sequence, transactions, and topic
-deletion.
+`groups/*`, `consumer-group/*` (KIP-848), `sasl/*`, `txn/*`, `admin/*`,
+and `cluster/*` — everything a producer or consumer needs, plus the
+group protocols, the SASL handshake sequence, transactions, topic
+deletion, and what the brokers of a cluster must agree on.
 
 Success paths are the easy half. The checks that earn their keep are
 the ones where the *wrong* answer is plausible:
@@ -265,9 +265,15 @@ must not end up outside the transaction, by either route.
 
 ## What the baselines record
 
-Nothing fails today. The differences are capability and version ones,
-recorded rather than scored:
+Three subjects: Apache Kafka 4.1 and Redpanda 25.2 as single brokers,
+and Apache Kafka 4.1 again as a three-node cluster.
 
+Nothing fails today. The differences are capability, version and
+topology ones, recorded rather than scored:
+
+- The five `cluster/*` checks skip on both single-broker subjects and
+  pass on the cluster. That is a property of the deployment, not of the
+  implementation: there is nothing for one broker to agree with.
 - Redpanda 25.2 advertises Metadata only to v8, Produce to v7, and
   Fetch to v11, so the flexible-metadata-header and topic-id-addressed
   produce/fetch checks skip there.
@@ -287,6 +293,44 @@ recorded rather than scored:
   Kafka scopes SASL per listener and has no such coupling. So that check
   passes on Kafka and skips on Redpanda, and the skip reason says which
   of the two situations it is.
+
+## The `cluster/*` checks
+
+Every other check can be asked of a single broker. These cannot. On one
+node, every partition's leader and every group's coordinator *is* the
+broker you are already connected to, so "do all the brokers agree" and
+"does the wrong broker refuse" have no content — and a client that never
+consults Metadata is indistinguishable from one that does. Against a
+single-broker subject they skip and say so; against a cluster they ask:
+
+- every broker names the same leader for a partition, and the same
+  coordinator for a group — disagreement gives two producers two places
+  to write, or splits a group's offsets across brokers by which one each
+  member happened to ask;
+- a topic asked for n replicas lands on n *distinct* brokers, the leader
+  among them, the in-sync set drawn from them;
+- a broker that does not lead a partition refuses the write rather than
+  appending to a log the leader knows nothing about;
+- a broker that does not coordinate a group refuses the offset commit
+  rather than storing it where the coordinator will never read it.
+
+None of them kill a broker. They are about a cluster's answers being
+consistent while everything is working, which is the precondition for
+anything about failure meaning something.
+
+Adding them was not the expensive part. Pointing the existing suite at
+three brokers was: it failed 31 of 51 checks, and failed different ones
+each run, because it had assumed throughout that the broker it
+bootstrapped from led every partition and coordinated every group. On a
+cluster of one that is true by construction, which is how the assumption
+survived 51 checks and two implementations. The harness routes now — to
+the partition leader for writes, to the group's coordinator for group
+calls, to the transaction coordinator for transactions, re-reading
+Metadata when a broker says it is the wrong one to ask.
+
+The reference subject is a three-node cluster for the same reason: a
+fault like "every broker names itself the leader" cannot be injected
+into a subject that has only one broker to name.
 
 ## The proxied pass
 

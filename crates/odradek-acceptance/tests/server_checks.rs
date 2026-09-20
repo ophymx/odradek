@@ -219,6 +219,26 @@ const SENSITIVITY: &[(Fault, &str)] = &[
         Fault::ScramSkipsServerSignature,
         "sasl/scram-server-proves-itself",
     ),
+    (
+        Fault::BrokersDisagreeOnLeader,
+        "cluster/brokers-agree-on-the-leader",
+    ),
+    (
+        Fault::CoordinatorIsWhoeverAsked,
+        "cluster/brokers-agree-on-the-coordinator",
+    ),
+    (
+        Fault::ReplicasCollapseToTheLeader,
+        "cluster/replicas-span-brokers",
+    ),
+    (
+        Fault::AnyBrokerAcceptsWrites,
+        "cluster/writes-go-to-the-leader",
+    ),
+    (
+        Fault::AnyBrokerServesGroups,
+        "cluster/group-offsets-need-the-coordinator",
+    ),
 ];
 
 /// The calibration registry is exhaustive in both directions against the
