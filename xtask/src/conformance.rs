@@ -222,6 +222,53 @@ const SUBJECTS: &[Subject] = &[
         nodes: 3,
         provision: &[],
     },
+    Subject {
+        // The same questions put to a second implementation. Cluster
+        // semantics were the one part of the matrix tested against a
+        // single implementation, which for a suite whose premise is
+        // that Kafka is a protocol rather than a program is the wrong
+        // place to have an n of 1.
+        name: "redpanda-25.2.1-cluster",
+        image: "redpandadata/redpanda:v25.2.1",
+        run_args: &[
+            "--",
+            "redpanda",
+            "start",
+            "--mode",
+            "dev-container",
+            "--smp",
+            "1",
+            "--kafka-addr",
+            "PLAINTEXT://0.0.0.0:9092",
+            "--advertise-kafka-addr",
+            "PLAINTEXT://127.0.0.1:{port}",
+            // Brokers find each other over RPC on the docker network,
+            // by container name; clients reach them on the published
+            // port. Two audiences, two addresses, as for Kafka.
+            "--rpc-addr",
+            "{node}:33145",
+            "--advertise-rpc-addr",
+            "{node}:33145",
+            // Every node seeded from the first, including the first —
+            // the documented shape for a cluster of fixed membership.
+            // Redpanda assigns its own node ids from this, which is why
+            // the cluster control is addressed by endpoint rather than
+            // by id.
+            "--seeds",
+            "{node1}:33145",
+            // dev-container mode keeps internal topics unreplicated,
+            // which would make the coordinator-failure check a test of
+            // this configuration rather than of Redpanda: the offsets
+            // would be gone because nobody was keeping a copy.
+            "--set",
+            "redpanda.default_topic_replications=3",
+            "--set",
+            "redpanda.internal_topic_replication_factor=3",
+        ],
+        sasl_listener: false,
+        nodes: 3,
+        provision: &[],
+    },
 ];
 
 pub fn conformance(args: &[String]) -> Result<()> {
@@ -261,8 +308,9 @@ pub fn conformance(args: &[String]) -> Result<()> {
     // subject is done.
     if selected.len() > 1 {
         eprintln!(
-            "running {} subjects in parallel: {}",
+            "running {} subjects, up to {} brokers at a time: {}",
             selected.len(),
+            broker_cap(),
             selected
                 .iter()
                 .map(|s| s.name)
@@ -270,13 +318,23 @@ pub fn conformance(args: &[String]) -> Result<()> {
                 .join(", ")
         );
     }
+    // Subjects are independent and want to overlap, but they are not
+    // free: a three-node subject is three brokers, and several of those
+    // at once on a two-core CI runner is enough load to make a broker
+    // take seconds over work it normally does in milliseconds. The
+    // checks that wait on such work then fail for want of patience, and
+    // report the subject rather than the machine. So the matrix
+    // overlaps by *brokers* rather than by subjects.
+    let budget = Arc::new(BrokerBudget::new(broker_cap()));
     let running: Vec<_> = selected
         .iter()
         .map(|&subject| {
             let accept = accept.clone();
             let proxy = proxy.clone();
             let conf_dir = conf_dir.clone();
+            let budget = Arc::clone(&budget);
             std::thread::spawn(move || {
+                let _permit = budget.acquire(usize::from(subject.nodes.max(1)));
                 let mut log = String::new();
                 let result = run_subject(
                     subject,
@@ -312,6 +370,79 @@ pub fn conformance(args: &[String]) -> Result<()> {
         bail!("subjects failed: {}", failures.join(", "));
     }
     Ok(())
+}
+
+/// How many brokers the matrix may have running at once.
+///
+/// Half the cores, because a broker is a JVM or a Seastar runtime
+/// rather than a thread and will take more than one core when it wants
+/// them — with a floor of three so a three-node subject is never asked
+/// to wait for a budget that could never satisfy it, and a ceiling
+/// because beyond a point the constraint is memory instead.
+///
+/// The number matters more than it looks. Every wait in the suite is
+/// for work a broker does asynchronously, and an oversubscribed machine
+/// stretches that work until the waits expire — at which point the
+/// report blames the subject for the harness's choice of how much to
+/// run at once.
+fn broker_cap() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(2)
+        .div_euclid(2)
+        .clamp(3, 6)
+}
+
+/// A count of brokers the matrix is allowed to be running.
+///
+/// Plain `Mutex`/`Condvar` rather than a semaphore crate: this is a
+/// counter and a wait, and the xtask has no async runtime to borrow one
+/// from.
+struct BrokerBudget {
+    cap: usize,
+    state: Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+impl BrokerBudget {
+    fn new(cap: usize) -> BrokerBudget {
+        BrokerBudget {
+            cap,
+            state: Mutex::new(0),
+            freed: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Wait until `want` brokers fit, then claim them until the
+    /// returned guard is dropped.
+    ///
+    /// A subject wanting more than the whole budget is let through
+    /// alone rather than deadlocked: the cap is a way to share a
+    /// machine, not a rule about what may run on it.
+    fn acquire(self: &Arc<Self>, want: usize) -> BrokerPermit {
+        let want = want.min(self.cap);
+        let mut running = self.state.lock().unwrap();
+        while *running > 0 && *running + want > self.cap {
+            running = self.freed.wait(running).unwrap();
+        }
+        *running += want;
+        BrokerPermit {
+            budget: Arc::clone(self),
+            held: want,
+        }
+    }
+}
+
+struct BrokerPermit {
+    budget: Arc<BrokerBudget>,
+    held: usize,
+}
+
+impl Drop for BrokerPermit {
+    fn drop(&mut self) {
+        *self.budget.state.lock().unwrap() -= self.held;
+        self.budget.freed.notify_all();
+    }
 }
 
 fn build_accept(root: &Path) -> Result<()> {
@@ -374,7 +505,21 @@ fn run_subject(
     }
 
     let baseline = conf_dir.join(format!("{}.json", subject.name));
-    let direct = run_accept(accept, &addr, sasl_addr.as_deref(), &baseline, record, log)?;
+    // Only a cluster gets one. Stopping the only broker of a
+    // single-node subject does not test failing over, it tests being
+    // down — the checks would be about nothing, and they skip instead.
+    let control = (subject.nodes > 1)
+        .then(|| cluster.control_command())
+        .transpose()?;
+    let direct = run_accept(
+        accept,
+        &addr,
+        sasl_addr.as_deref(),
+        control.as_deref(),
+        &baseline,
+        record,
+        log,
+    )?;
     if !direct {
         // In record mode the accept run may exit non-zero because the
         // subject deviates; the point of recording is to capture exactly
@@ -467,6 +612,9 @@ fn proxy_pass(
         accept,
         front.addr(),
         sasl_front.as_ref().map(Proxy::addr),
+        // No control through the proxy: the proxied pass only runs for
+        // single-node subjects, which have no failover to watch.
+        None,
         baseline,
         false,
         log,
@@ -491,6 +639,7 @@ fn run_accept(
     accept: &Path,
     addr: &str,
     sasl_addr: Option<&str>,
+    control: Option<&str>,
     baseline: &Path,
     record: bool,
     log: &mut String,
@@ -499,6 +648,9 @@ fn run_accept(
     cmd.args(["--server", addr]);
     if let Some(sasl_addr) = sasl_addr {
         cmd.args(["--sasl-server", sasl_addr]);
+    }
+    if let Some(control) = control {
+        cmd.args(["--cluster-control", control]);
     }
     if record {
         cmd.args(["--write-baseline".as_ref(), baseline.as_os_str()]);
@@ -509,6 +661,71 @@ fn run_accept(
     log.push_str(&String::from_utf8_lossy(&out.stdout));
     log.push_str(&String::from_utf8_lossy(&out.stderr));
     Ok(out.status.success())
+}
+
+/// `xtask cluster-node <name:port,...> <stop|start> <node-id> <host:port>`
+/// — the command the recovery checks are given as `--cluster-control`.
+///
+/// This exists as an xtask subcommand rather than a shell script for one
+/// reason: `start` must not return until the broker is *serving*, and
+/// "serving" is an ApiVersions exchange, not an open port. A script
+/// could poll a TCP connect, which brokers accept well before they
+/// answer anything — and a check that resumed there would blame the
+/// subject for the harness's impatience. [`wait_ready`] is already the
+/// right probe, so the control reuses it.
+///
+/// The container list is passed in because the xtask that chose those
+/// ports is a different process from this one, and a container keeps its
+/// published port across a stop.
+pub fn node_control(args: &[String]) -> Result<()> {
+    let [names, verb, _node_id, addr] = args else {
+        bail!("usage: xtask cluster-node <name:port,...> <stop|start> <node-id> <host:port>");
+    };
+    // Looked up by the address the broker advertised, not by node id.
+    // The two coincide for Kafka, where the id is configured; they do
+    // not for an implementation that assigns its own, and the address
+    // is what the suite actually connected to either way.
+    let port = addr.rsplit_once(':').map_or(addr.as_str(), |(_, p)| p);
+    let name = names
+        .split(',')
+        .find_map(|entry| {
+            let (name, mapped) = entry.rsplit_once(':')?;
+            (mapped == port).then_some(name)
+        })
+        .ok_or_else(|| anyhow::anyhow!("no container for {addr} among {names}"))?
+        .to_owned();
+    match verb.as_str() {
+        "stop" => {
+            // A graceful stop, so the broker hands off cleanly and the
+            // cluster elects around it promptly. The harsher question —
+            // what a cluster does when a broker is killed outright and
+            // has to be noticed missing — is a different check than the
+            // ones written so far.
+            docker(&["stop", "-t", "20", &name])?;
+            Ok(())
+        }
+        "start" => {
+            docker(&["start", &name])?;
+            wait_ready(addr).with_context(|| format!("{name} restarted but never served"))
+        }
+        other => bail!("unknown verb {other:?}; expected stop or start"),
+    }
+}
+
+/// Run a docker command, returning its stdout.
+fn docker(args: &[&str]) -> Result<String> {
+    let out = Command::new("docker")
+        .args(args)
+        .output()
+        .context("running docker")?;
+    if !out.status.success() {
+        bail!(
+            "docker {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Pick a free TCP port. Racy in principle; in practice docker publishes
@@ -601,8 +818,13 @@ impl Cluster {
         // The names have to be known before the first container starts:
         // each node's quorum string names all of them, including the
         // ones that do not exist yet.
+        // Dots stripped from the subject name: these become container
+        // names, container names become hostnames, and a hostname with
+        // a version number in it ("redpanda-25.2.1-cluster") is one
+        // rpk's seed parser refuses as neither a host nor a host:port.
+        let stem = subject.name.replace('.', "-");
         let names: Vec<String> = (1..=count)
-            .map(|id| format!("odradek-accept-{}-{}-{id}", subject.name, ports[0]))
+            .map(|id| format!("odradek-accept-{stem}-{}-{id}", ports[0]))
             .collect();
         let quorum: Vec<String> = names
             .iter()
@@ -633,6 +855,7 @@ impl Cluster {
                 subject,
                 NodeSpec {
                     name,
+                    first: &names[0],
                     id: i + 1,
                     port: ports[i],
                     sasl_port,
@@ -643,6 +866,29 @@ impl Cluster {
             cluster.nodes.push(node);
         }
         Ok(cluster)
+    }
+
+    /// The `--cluster-control` command for this cluster: this very
+    /// binary, told which containers it is about.
+    ///
+    /// Pointing at `current_exe` rather than at a written-out script
+    /// keeps the readiness probe honest — see [`node_control`] — and
+    /// leaves no temporary file to clean up.
+    fn control_command(&self) -> Result<String> {
+        let exe = std::env::current_exe().context("locating the xtask binary")?;
+        let names: Vec<String> = self
+            .nodes
+            .iter()
+            .map(|n| {
+                let port = n.addr.rsplit_once(':').map_or("", |(_, p)| p);
+                format!("{}:{port}", n.name)
+            })
+            .collect();
+        Ok(format!(
+            "{} cluster-node {}",
+            exe.display(),
+            names.join(",")
+        ))
     }
 
     /// The node the suite is pointed at. It finds the others itself.
@@ -699,6 +945,10 @@ impl Cluster {
 /// where it is published, and how to reach the quorum.
 struct NodeSpec<'a> {
     name: &'a str,
+    /// The first node's name, for implementations that bootstrap a
+    /// cluster by pointing every node at one seed rather than by
+    /// enumerating a quorum.
+    first: &'a str,
     id: usize,
     port: u16,
     sasl_port: u16,
@@ -708,10 +958,14 @@ struct NodeSpec<'a> {
 
 impl Container {
     fn start(subject: &Subject, spec: NodeSpec<'_>) -> Result<Container> {
+        // Deliberately not `--rm`. A container that removes itself on
+        // stop cannot be started again, and the recovery checks stop a
+        // broker precisely so they can watch it come back. Cleanup is
+        // `Drop for Container`'s job either way — `--rm` was only ever
+        // belt and braces, and the brace it cost was this.
         let mut args: Vec<String> = vec![
             "run".into(),
             "-d".into(),
-            "--rm".into(),
             "--name".into(),
             spec.name.into(),
             "-p".into(),
@@ -737,11 +991,18 @@ impl Container {
                     .replace("{sasl_port}", &spec.sasl_port.to_string())
                     .replace("{id}", &spec.id.to_string())
                     .replace("{node}", spec.name)
+                    .replace("{node1}", spec.first)
                     .replace("{quorum}", spec.quorum),
             );
         }
         if !trailing {
             args.push(subject.image.into());
+        }
+        // The container's own logs are gone by the time a broker that
+        // refused its arguments has exited, so being able to see the
+        // arguments is the difference between a diagnosis and a guess.
+        if std::env::var_os("ODRADEK_DEBUG_DOCKER").is_some() {
+            eprintln!("docker {}", args.join(" "));
         }
         let out = Command::new("docker")
             .args(&args)
@@ -765,11 +1026,15 @@ impl Drop for Container {
     fn drop(&mut self) {
         // `docker rm -f` blocks for seconds on daemon-side teardown
         // (network namespace and published port release), and nothing
-        // here needs to see the end of it: the container was started with
-        // `--rm`, so the daemon reaps it either way, and the next run
-        // picks a fresh ephemeral port rather than reusing this one. Fire
-        // it and walk away — including on the error and panic paths this
-        // guard exists for.
+        // here needs to see the end of it: the next run picks a fresh
+        // ephemeral port rather than reusing this one. Fire it and walk
+        // away — including on the error and panic paths this guard
+        // exists for.
+        //
+        // This is now the only thing that removes a container, since
+        // dropping `--rm` was what made the recovery checks possible.
+        // An xtask killed outright therefore leaves containers behind;
+        // they are named `odradek-accept-*` and cost a `docker rm -f`.
         let child = Command::new("docker")
             .args(["rm", "-f", &self.name])
             .stdin(Stdio::null())

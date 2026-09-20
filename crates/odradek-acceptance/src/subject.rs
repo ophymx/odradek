@@ -10,6 +10,8 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 
+use crate::checks::BoxFuture;
+use crate::checks::server::{Broker, ClusterControl};
 use bytes::{Bytes, BytesMut};
 use odradek_protocol::messages::add_offsets_to_txn_request::AddOffsetsToTxnRequest;
 use odradek_protocol::messages::add_offsets_to_txn_response::AddOffsetsToTxnResponse;
@@ -199,6 +201,13 @@ pub enum Fault {
     /// Store a group's offsets on whichever broker was asked, where its
     /// coordinator will never see them.
     AnyBrokerServesGroups,
+    /// Keep naming a stopped broker as the leader, leaving the
+    /// partition unwritable for as long as it stays down.
+    LeadershipStaysWithTheStoppedBroker,
+    /// Lose a group's committed offsets with the broker that
+    /// coordinated them, so a consumer that resumes after a failure
+    /// reprocesses everything since.
+    OffsetsDieWithTheirCoordinator,
     /// Refuse an unsupported mechanism without naming any supported
     /// one, leaving the client nothing to fall back to.
     SaslHandshakeHidesMechanisms,
@@ -391,6 +400,8 @@ impl Fault {
         Fault::CoordinatorIsWhoeverAsked,
         Fault::AnyBrokerAcceptsWrites,
         Fault::AnyBrokerServesGroups,
+        Fault::LeadershipStaysWithTheStoppedBroker,
+        Fault::OffsetsDieWithTheirCoordinator,
     ];
 }
 
@@ -399,6 +410,7 @@ impl Fault {
 pub struct SubjectServer {
     addr: String,
     handles: Vec<JoinHandle<()>>,
+    cluster: Cluster,
 }
 
 impl SubjectServer {
@@ -421,34 +433,106 @@ impl SubjectServer {
         // ones nothing has connected to yet.
         {
             let mut state = cluster.lock().unwrap();
+            state.faults.clone_from(&faults);
             for listener in &listeners {
                 state.ports.push(i32::from(listener.local_addr()?.port()));
             }
         }
 
         let mut handles = Vec::with_capacity(NODES);
-        for listener in listeners {
+        for (index, listener) in listeners.into_iter().enumerate() {
             let faults = faults.clone();
             let cluster = std::sync::Arc::clone(&cluster);
+            let node_id = i32::try_from(index + 1).unwrap_or(BROKER_NODE_ID);
             handles.push(tokio::spawn(async move {
                 loop {
                     let Ok((stream, _)) = listener.accept().await else {
                         return;
                     };
+                    // A stopped broker is still bound — rebinding the
+                    // same port later is a race worth not running — but
+                    // it serves nobody. Dropping the stream here is what
+                    // a client sees as the broker being gone.
+                    if cluster.lock().unwrap().is_down(node_id) {
+                        continue;
+                    }
                     tokio::spawn(handle_connection(
                         stream,
                         faults.clone(),
                         std::sync::Arc::clone(&cluster),
+                        node_id,
                     ));
                 }
             }));
         }
-        Ok(SubjectServer { addr, handles })
+        Ok(SubjectServer {
+            addr,
+            handles,
+            cluster,
+        })
     }
 
     /// The broker a client bootstraps against.
     pub fn addr(&self) -> &str {
         &self.addr
+    }
+
+    /// A handle that stops and starts this subject's brokers, for the
+    /// checks that need one.
+    ///
+    /// In-process rather than out: the calibration subject's brokers are
+    /// tasks, not containers, so there is nothing to shell out to. The
+    /// point is that the checks cannot tell — they are handed a
+    /// [`ClusterControl`] either way, and the one the CLI builds runs
+    /// somebody's `docker stop`.
+    pub fn control(&self) -> std::sync::Arc<dyn ClusterControl> {
+        std::sync::Arc::new(SubjectControl {
+            cluster: std::sync::Arc::clone(&self.cluster),
+        })
+    }
+}
+
+/// [`ClusterControl`] over a [`SubjectServer`]'s own brokers.
+#[derive(Debug)]
+struct SubjectControl {
+    cluster: Cluster,
+}
+
+impl ClusterControl for SubjectControl {
+    fn stop(&self, broker: Broker<'_>) -> BoxFuture<'_, Result<(), String>> {
+        let node_id = broker.node_id;
+        Box::pin(async move {
+            let mut state = self.cluster.lock().unwrap();
+            // Committed offsets are replicated across the cluster, so
+            // the broker that served them going away loses nothing.
+            // The fault models the cluster that kept each group's
+            // offsets on its coordinator alone: they go when it does.
+            if state
+                .faults
+                .contains(&Fault::OffsetsDieWithTheirCoordinator)
+            {
+                let all: Vec<i32> = state.nodes().map(|(id, _)| id).collect();
+                let orphaned: Vec<(String, String, i32)> = state
+                    .committed
+                    .keys()
+                    .filter(|(group, _, _)| state.placement_over(group, &all) == node_id)
+                    .cloned()
+                    .collect();
+                for key in orphaned {
+                    state.committed.remove(&key);
+                }
+            }
+            state.down.insert(node_id);
+            Ok(())
+        })
+    }
+
+    fn start(&self, broker: Broker<'_>) -> BoxFuture<'_, Result<(), String>> {
+        let node_id = broker.node_id;
+        Box::pin(async move {
+            self.cluster.lock().unwrap().down.remove(&node_id);
+            Ok(())
+        })
     }
 }
 
@@ -695,6 +779,18 @@ struct ClusterState {
     /// The port each broker listens on, indexed by node id minus one.
     /// Filled in at spawn, once the listeners have their ports.
     ports: Vec<i32>,
+    /// The faults this subject exhibits. Fixed for its lifetime, and
+    /// kept here as well as per connection because stopping a broker is
+    /// a cluster-wide event with no connection to hang off.
+    faults: Vec<Fault>,
+    /// Nodes currently stopped.
+    ///
+    /// A stopped node keeps its listener bound — rebinding the same port
+    /// later is a race this has no need to run — but refuses every
+    /// connection the moment it is accepted, and drops the ones it
+    /// already had. To a client that is a broker that has gone away,
+    /// which is all the checks need it to be.
+    down: HashSet<i32>,
 }
 
 impl ClusterState {
@@ -706,7 +802,18 @@ impl ClusterState {
     /// them — and different names land on different nodes, which is what
     /// makes "go and ask the right one" a thing a check can observe.
     fn placement(&self, key: &str) -> i32 {
-        if self.ports.is_empty() {
+        self.placement_over(key, &self.live())
+    }
+
+    /// The same, restricted to a given set of candidates.
+    ///
+    /// Leadership and coordination are only ever assigned to brokers
+    /// that are up: a cluster that kept naming a stopped broker would
+    /// leave its partitions unwritable and its groups uncommittable for
+    /// as long as it stayed down, which is the whole of what failing
+    /// over means.
+    fn placement_over(&self, key: &str, candidates: &[i32]) -> i32 {
+        if candidates.is_empty() {
             return BROKER_NODE_ID;
         }
         let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
@@ -714,8 +821,20 @@ impl ClusterState {
             acc ^= u64::from(byte);
             acc = acc.wrapping_mul(0x0000_0100_0000_01b3);
         }
-        let index = usize::try_from(acc % self.ports.len() as u64).unwrap_or(0);
-        i32::try_from(index + 1).unwrap_or(BROKER_NODE_ID)
+        let index = usize::try_from(acc % candidates.len() as u64).unwrap_or(0);
+        candidates.get(index).copied().unwrap_or(BROKER_NODE_ID)
+    }
+
+    /// Node ids that are up, in order.
+    fn live(&self) -> Vec<i32> {
+        self.nodes()
+            .map(|(id, _)| id)
+            .filter(|id| !self.down.contains(id))
+            .collect()
+    }
+
+    fn is_down(&self, node_id: i32) -> bool {
+        self.down.contains(&node_id)
     }
 
     /// The port a node id listens on.
@@ -725,15 +844,6 @@ impl ClusterState {
             .and_then(|i| self.ports.get(i))
             .copied()
             .unwrap_or_default()
-    }
-
-    /// Which node listens on `port`.
-    fn node_of(&self, port: i32) -> i32 {
-        self.ports
-            .iter()
-            .position(|p| *p == port)
-            .and_then(|i| i32::try_from(i + 1).ok())
-            .unwrap_or(BROKER_NODE_ID)
     }
 
     /// Every broker, as node id and port.
@@ -862,15 +972,12 @@ fn mint_topic_id(name: &str) -> [u8; 16] {
     id
 }
 
-async fn handle_connection(mut stream: TcpStream, faults: Vec<Fault>, cluster: Cluster) {
-    let local_port = match stream.local_addr() {
-        Ok(a) => i32::from(a.port()),
-        Err(_) => return,
-    };
-    // Which of the cluster's brokers this connection reached. Fixed for
-    // the life of the connection, as it is for a real client: you do not
-    // become a different broker part way through.
-    let node_id = cluster.lock().unwrap().node_of(local_port);
+async fn handle_connection(
+    mut stream: TcpStream,
+    faults: Vec<Fault>,
+    cluster: Cluster,
+    node_id: i32,
+) {
     // The SASL exchange is this connection's; everything else belongs to
     // the cluster and is locked per request.
     let mut sasl = SaslState::default();
@@ -890,6 +997,12 @@ async fn handle_connection(mut stream: TcpStream, faults: Vec<Fault>, cluster: C
         }
         let frame = Bytes::from(frame);
         if frame.len() < 4 {
+            return;
+        }
+        // Stopped part way through a connection: the broker is gone,
+        // so the connection goes with it. A client that kept getting
+        // answers from a stopped broker would never look elsewhere.
+        if cluster.lock().unwrap().is_down(node_id) {
             return;
         }
         let api_key = i16::from_be_bytes([frame[0], frame[1]]);
@@ -2111,6 +2224,12 @@ fn metadata_exchange(
                         // two producers can believe in two leaders.
                         let leader = if has(Fault::BrokersDisagreeOnLeader) {
                             node_id
+                        } else if has(Fault::LeadershipStaysWithTheStoppedBroker) {
+                            // Placed over every broker rather than the
+                            // live ones, so a stopped leader keeps the
+                            // partition.
+                            let all: Vec<i32> = state.nodes().map(|(id, _)| id).collect();
+                            state.placement_over(name, &all)
                         } else {
                             state.placement(name)
                         };

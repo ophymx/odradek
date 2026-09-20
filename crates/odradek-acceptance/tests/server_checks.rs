@@ -19,9 +19,23 @@ use odradek_acceptance::{SubjectRole, Verdict};
 /// burns the whole budget before reaching the correct verdict. Three
 /// tenths of a second is still an order of magnitude more than these
 /// subjects ever need.
-async fn run(addr: &str) -> Report {
+async fn run(subject: &SubjectServer) -> Report {
+    run_at(subject.addr(), Some(subject.control())).await
+}
+
+/// The same, by address — for the test that has no subject to speak of.
+async fn run_at(addr: &str, control: Option<std::sync::Arc<dyn server::ClusterControl>>) -> Report {
     let mut config = ProbeConfig::default();
     config.settle_budget = Duration::from_millis(300);
+    // Failing over costs a real cluster seconds of failure detection and
+    // this one nothing at all, so the recovery budget can be tight here.
+    // Left at the default it would only slow the suite down when a
+    // faulty subject never recovers.
+    config.recovery_budget = Duration::from_millis(300);
+    // Its brokers are tasks rather than containers, so the control is
+    // in-process — but the checks cannot tell, which is the point of
+    // taking one rather than assuming how to stop a broker.
+    config.control = control;
     // The reference subject speaks SASL on its only listener, so it is
     // its own SASL address. A real broker needs two, because a listener
     // without SASL cannot answer a question about mechanisms.
@@ -38,7 +52,7 @@ fn server_check_ids() -> Vec<&'static str> {
 #[tokio::test]
 async fn compliant_subject_passes_all_checks() {
     let subject = SubjectServer::spawn(vec![]).await.unwrap();
-    let report = run(subject.addr()).await;
+    let report = run(&subject).await;
     assert!(report.is_conformant(), "false positives:\n{report}");
     let expected = server_check_ids();
     assert_eq!(
@@ -239,6 +253,14 @@ const SENSITIVITY: &[(Fault, &str)] = &[
         Fault::AnyBrokerServesGroups,
         "cluster/group-offsets-need-the-coordinator",
     ),
+    (
+        Fault::LeadershipStaysWithTheStoppedBroker,
+        "cluster/leadership-moves-when-a-broker-stops",
+    ),
+    (
+        Fault::OffsetsDieWithTheirCoordinator,
+        "cluster/committed-offsets-outlive-the-coordinator",
+    ),
 ];
 
 /// The calibration registry is exhaustive in both directions against the
@@ -272,7 +294,7 @@ fn every_check_has_a_fault_and_every_fault_a_check() {
 async fn each_fault_trips_its_targeted_check() {
     for &(fault, target) in SENSITIVITY {
         let subject = SubjectServer::spawn(vec![fault]).await.unwrap();
-        let report = run(subject.addr()).await;
+        let report = run(&subject).await;
         assert!(
             matches!(report.verdict(target), Some(Verdict::Fail { .. })),
             "fault {fault:?} was not detected by {target}:\n{report}"
@@ -312,7 +334,7 @@ async fn isolated_faults_cause_no_collateral_failures() {
             .map(|(_, t)| *t)
             .unwrap();
         let subject = SubjectServer::spawn(vec![fault]).await.unwrap();
-        let report = run(subject.addr()).await;
+        let report = run(&subject).await;
         for outcome in &report.outcomes {
             if outcome.id.0 == target {
                 assert!(
@@ -340,7 +362,7 @@ async fn unreachable_subject_errors_instead_of_failing() {
     let addr = listener.local_addr().unwrap().to_string();
     drop(listener);
 
-    let report = run(&addr).await;
+    let report = run_at(&addr, None).await;
     assert_eq!(report.outcomes.len(), server_check_ids().len());
     for outcome in &report.outcomes {
         assert!(
@@ -354,7 +376,7 @@ async fn unreachable_subject_errors_instead_of_failing() {
     assert!(report.is_conformant());
 
     let compliant = SubjectServer::spawn(vec![]).await.unwrap();
-    let baseline = run(compliant.addr()).await.to_baseline();
+    let baseline = run(&compliant).await.to_baseline();
     let diffs = report.diff_against(&baseline);
     assert_eq!(diffs.len(), report.outcomes.len(), "{diffs:?}");
     for diff in &diffs {
@@ -370,7 +392,7 @@ async fn baseline_roundtrip_and_diff() {
     let subject = SubjectServer::spawn(vec![Fault::FlexibleHeaderOnV3])
         .await
         .unwrap();
-    let report = run(subject.addr()).await;
+    let report = run(&subject).await;
 
     // A run always matches the baseline derived from itself, even with a
     // known deviation recorded as an expected failure.
@@ -383,7 +405,7 @@ async fn baseline_roundtrip_and_diff() {
     // Against the compliant subject's baseline the deviation surfaces as
     // a regression (the check exists in both, its outcome changed).
     let compliant = SubjectServer::spawn(vec![]).await.unwrap();
-    let compliant_report = run(compliant.addr()).await;
+    let compliant_report = run(&compliant).await;
     let diffs = report.diff_against(&compliant_report.to_baseline());
     assert_eq!(diffs.len(), 1, "{diffs:?}");
     match &diffs[0] {
@@ -406,7 +428,7 @@ async fn baseline_roundtrip_and_diff() {
 #[tokio::test]
 async fn baseline_diff_distinguishes_new_and_removed_checks() {
     let subject = SubjectServer::spawn(vec![]).await.unwrap();
-    let report = run(subject.addr()).await;
+    let report = run(&subject).await;
     let mut baseline = report.to_baseline();
     let (known_id, _) = baseline.checks.pop_first().unwrap();
     baseline
@@ -436,7 +458,7 @@ async fn baseline_diff_distinguishes_new_and_removed_checks() {
 #[tokio::test]
 async fn report_envelope_round_trips() {
     let subject = SubjectServer::spawn(vec![]).await.unwrap();
-    let report = run(subject.addr()).await;
+    let report = run(&subject).await;
     assert_eq!(report.format, FORMAT);
     assert_eq!(report.suite, env!("CARGO_PKG_VERSION"));
 

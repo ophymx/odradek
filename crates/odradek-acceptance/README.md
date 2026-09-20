@@ -265,15 +265,23 @@ must not end up outside the transaction, by either route.
 
 ## What the baselines record
 
-Three subjects: Apache Kafka 4.1 and Redpanda 25.2 as single brokers,
-and Apache Kafka 4.1 again as a three-node cluster.
+Four subjects: Apache Kafka 4.1 and Redpanda 25.2, each as a single
+broker and again as a three-node cluster.
+
+The matrix overlaps by *brokers* rather than by subjects. Eight at once
+on a two-core runner is enough load to make a broker take seconds over
+work it usually does in milliseconds, and every wait in the suite is
+for work a broker does asynchronously — so an oversubscribed machine
+produces failures that blame the subject for the harness's choice of
+how much to run at the same time.
 
 Nothing fails today. The differences are capability, version and
 topology ones, recorded rather than scored:
 
-- The five `cluster/*` checks skip on both single-broker subjects and
-  pass on the cluster. That is a property of the deployment, not of the
-  implementation: there is nothing for one broker to agree with.
+- The seven `cluster/*` checks skip on both single-broker subjects and
+  pass on both clusters. That is a property of the deployment, not of
+  the implementation: there is nothing for one broker to agree with,
+  and nothing to fail over to.
 - Redpanda 25.2 advertises Metadata only to v8, Produce to v7, and
   Fetch to v11, so the flexible-metadata-header and topic-id-addressed
   produce/fetch checks skip there.
@@ -314,9 +322,32 @@ single-broker subject they skip and say so; against a cluster they ask:
 - a broker that does not coordinate a group refuses the offset commit
   rather than storing it where the coordinator will never read it.
 
-None of them kill a broker. They are about a cluster's answers being
-consistent while everything is working, which is the precondition for
-anything about failure meaning something.
+Those do not kill a broker. They are about a cluster's answers being
+consistent while everything works, which is the precondition for
+anything about failure meaning something. Two more then take that step:
+
+- leadership moves off a stopped broker to one of its replicas, and the
+  new leader accepts writes — otherwise the replicas were decoration;
+- a group gets a new coordinator when its own stops, still reporting the
+  offset it acknowledged. A commit is only as durable as whatever
+  answers after the failure; if the offsets die with the broker, a
+  consumer resuming after an outage reprocesses everything since, and
+  finds out on the worst day.
+
+Stopping a broker is not something the protocol can express, so the
+suite does not guess how. It takes `--cluster-control <cmd>` and runs
+`<cmd> <stop|start> <node-id> <host:port>`, leaving `docker stop`,
+`kubectl delete pod` or an ssh hop to whoever knows the deployment —
+the same bargain `--sasl-server` strikes. Without one, these checks
+skip. Both names are passed because not every implementation lets you
+choose node ids: Kafka takes a configured `node.id`, Redpanda assigns
+its own.
+
+They are the only checks that change the subject rather than observe
+it, so each restores the cluster on every path out, including the paths
+where it has already decided the subject is wrong. A check that left a
+broker down would hand its failure to whatever ran next, and the report
+would blame the wrong thing.
 
 Adding them was not the expensive part. Pointing the existing suite at
 three brokers was: it failed 31 of 51 checks, and failed different ones
@@ -330,7 +361,21 @@ Metadata when a broker says it is the wrong one to ask.
 
 The reference subject is a three-node cluster for the same reason: a
 fault like "every broker names itself the leader" cannot be injected
-into a subject that has only one broker to name.
+into a subject that has only one broker to name. Its brokers are tasks
+rather than containers, so its `ClusterControl` stops them in-process —
+and the checks cannot tell, which is the point of taking one rather
+than assuming how a broker is stopped.
+
+Adding Redpanda as a second cluster found two more suite bugs
+immediately, both of the same family as the first. Topic deletion
+belongs to the *controller*: Kafka forwards an admin request sent
+elsewhere, Redpanda answers `NOT_CONTROLLER` and expects the client to
+consult Metadata, which names the controller in every response. Both
+are within their rights, and the suite had been relying on the first.
+And a coordinator that has just taken a group over has to load its
+state before it can answer about it — until then the group's partitions
+are absent from its reply, which the suite read as offsets lost rather
+than as a wait.
 
 ## The proxied pass
 

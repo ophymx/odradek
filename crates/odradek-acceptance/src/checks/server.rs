@@ -78,7 +78,7 @@ use odradek_protocol::messages::txn_offset_commit_response::TxnOffsetCommitRespo
 use odradek_protocol::records::{Record, RecordBatch, RecordHeader, Records, decode_set};
 use odradek_protocol::{ErrorCode, Message, frame, header};
 
-use crate::checks::{Check, Runner};
+use crate::checks::{BoxFuture, Check, Runner};
 use crate::raw::{RawConnection, WireError};
 use crate::report::{CheckOutcome, Report};
 use crate::{CheckId, SubjectRole, Verdict};
@@ -445,7 +445,62 @@ pub static SERVER_CHECKS: &[Check] = &[
         requirement: "refuses an offset commit on a broker that does not                       coordinate the group, rather than storing it where the                       coordinator will never see it",
         runner: Runner::Server(|ctx| Box::pin(cluster_group_offsets_need_the_coordinator(ctx))),
     },
+    Check {
+        id: "cluster/leadership-moves-when-a-broker-stops",
+        requirement: "moves a partition's leadership to one of its replicas when                       the leader stops, and the new leader accepts writes —                       otherwise the replicas were decoration",
+        runner: Runner::Server(|ctx| Box::pin(cluster_leadership_moves_when_a_broker_stops(ctx))),
+    },
+    Check {
+        id: "cluster/committed-offsets-outlive-the-coordinator",
+        requirement: "gives the group a new coordinator when its own stops, still                       reporting the offset it acknowledged — a commit is only as                       durable as what answers after the failure",
+        runner: Runner::Server(|ctx| {
+            Box::pin(cluster_committed_offsets_outlive_the_coordinator(ctx))
+        }),
+    },
 ];
+
+/// How to take one of the subject's brokers away, and give it back.
+///
+/// Nothing in the Kafka protocol says "stop". A check that needs a
+/// broker to go away therefore has to ask something outside the
+/// protocol, and what that something is belongs entirely to the
+/// deployment: `docker stop`, `kubectl delete pod`, `systemctl stop`, a
+/// cloud API. The suite refuses to guess. It is handed a way to do it
+/// or, given none, skips the checks that need one and says so — which
+/// is the same bargain `--sasl-server` strikes.
+///
+/// Implementations must be idempotent. A check restores the cluster on
+/// every path out, including the ones where it has already decided the
+/// subject is wrong, so `start` is routinely called on a node that was
+/// never stopped.
+pub trait ClusterControl: std::fmt::Debug + Send + Sync {
+    /// Take a broker out of the cluster and do not return until it is
+    /// gone. A check that proceeded while the broker was still
+    /// answering would be testing nothing.
+    fn stop(&self, broker: Broker<'_>) -> BoxFuture<'_, Result<(), String>>;
+
+    /// Put it back, and do not return until it is serving again.
+    /// Whatever runs next is entitled to a whole cluster.
+    fn start(&self, broker: Broker<'_>) -> BoxFuture<'_, Result<(), String>>;
+}
+
+/// Which broker a [`ClusterControl`] is being asked about, named both
+/// ways the suite knows it.
+///
+/// Both, because neither alone suits every deployment. The node id is
+/// the cluster's own name for the broker and the one an operator thinks
+/// in — but not every implementation lets you choose it: Kafka takes a
+/// configured `node.id`, while Redpanda assigns its own, so a control
+/// script that mapped id to container would be guessing. The advertised
+/// address is what the suite actually connected to, and is unambiguous
+/// by construction.
+#[derive(Debug, Clone, Copy)]
+pub struct Broker<'a> {
+    /// The node id Metadata gave for this broker.
+    pub node_id: i32,
+    /// The `host:port` Metadata advertised for it.
+    pub addr: &'a str,
+}
 
 /// Limits for one server-side run.
 ///
@@ -455,6 +510,18 @@ pub static SERVER_CHECKS: &[Check] = &[
 /// [`crate::subject`], or any in-process stub) never needs the wait — and
 /// a subject that answers a *permanent* error the flow treats as
 /// retriable burns the whole budget before reaching the right verdict.
+///
+/// It covers every wait on work a broker does *after* acknowledging
+/// something: electing a leader for a new topic, propagating a topic to
+/// another broker, writing a transaction marker and advancing the
+/// stable offset past it. Those are all "when it gets round to it", and
+/// how long that is depends on how busy the machine is rather than on
+/// anything the suite controls — a matrix that runs several brokers at
+/// once on a two-core runner is a different proposition from one broker
+/// on an idle laptop. The default is therefore set by what a loaded
+/// machine needs, not by what a quiet one does; every loop that uses it
+/// exits as soon as the work lands, so patience costs nothing when
+/// things work.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ProbeConfig {
@@ -463,13 +530,28 @@ pub struct ProbeConfig {
     pub settle_budget: Duration,
     /// How long to wait between attempts within that budget.
     pub settle_delay: Duration,
+    /// How to stop and start the subject's brokers. Without one, the
+    /// checks that need a broker to fail skip.
+    pub control: Option<std::sync::Arc<dyn ClusterControl>>,
+    /// How long to let a cluster notice a broker has gone and finish
+    /// electing around it.
+    ///
+    /// Separate from the settle budget, and much larger, because it is
+    /// bounded by the subject's own failure detection rather than by
+    /// anything the suite does: Kafka's KRaft controller waits out a
+    /// broker session timeout before declaring it gone, which is seconds
+    /// by default. A budget tight enough for topic creation would report
+    /// every healthy cluster as one that never recovers.
+    pub recovery_budget: Duration,
 }
 
 impl Default for ProbeConfig {
     fn default() -> Self {
         ProbeConfig {
-            settle_budget: Duration::from_secs(5),
+            settle_budget: Duration::from_secs(20),
             settle_delay: Duration::from_millis(100),
+            control: None,
+            recovery_budget: Duration::from_secs(60),
         }
     }
 }
@@ -479,8 +561,17 @@ impl ProbeConfig {
     /// at least one: a zero budget still gets a single try, so the flow
     /// can never skip the exchange it is there to make.
     fn settle_attempts(&self) -> u32 {
-        let delay = self.settle_delay.as_millis().max(1);
-        let attempts = self.settle_budget.as_millis() / delay;
+        Self::attempts(self.settle_budget, self.settle_delay)
+    }
+
+    /// The same, over the recovery budget.
+    fn recovery_attempts(&self) -> u32 {
+        Self::attempts(self.recovery_budget, self.settle_delay)
+    }
+
+    fn attempts(budget: Duration, delay: Duration) -> u32 {
+        let delay = delay.as_millis().max(1);
+        let attempts = budget.as_millis() / delay;
         u32::try_from(attempts).unwrap_or(u32::MAX).max(1)
     }
 }
@@ -1056,6 +1147,22 @@ async fn coordinator_conn(ctx: &ServerCtx, group: &str) -> Result<RawConnection,
 /// `find-coordinator/group` warmed the cluster — an order dependency
 /// between checks is a bug in the suite, not a property of the subject.
 async fn await_coordinator(ctx: &ServerCtx, group: &str) -> Result<Option<String>, CheckError> {
+    await_coordinator_at(ctx, &ctx.addr, group).await
+}
+
+/// The same, asking a broker of the caller's choosing.
+///
+/// Which broker is asked is normally nobody's business — every broker
+/// gives the same answer, and `cluster/brokers-agree-on-the-coordinator`
+/// is the check that says so. It matters in exactly one situation: when
+/// the bootstrap broker is the one that has just been stopped, and
+/// asking it would fail for the obvious reason rather than the
+/// interesting one.
+async fn await_coordinator_at(
+    ctx: &ServerCtx,
+    addr: &str,
+    group: &str,
+) -> Result<Option<String>, CheckError> {
     let advertised = match ctx.range(FindCoordinatorRequest::API_KEY) {
         Ok(a) => a,
         // No FindCoordinator advertised: let the offsets exchange itself
@@ -1082,7 +1189,7 @@ async fn await_coordinator(ctx: &ServerCtx, group: &str) -> Result<Option<String
         .encode(&mut body, version)
         .map_err(|e| CheckError::Infra(format!("encoding FindCoordinator: {e}")))?;
 
-    let mut conn = connect(&ctx.addr).await?;
+    let mut conn = connect(addr).await?;
     for attempt in 0..ctx.config.settle_attempts() {
         if attempt > 0 {
             tokio::time::sleep(ctx.config.settle_delay).await;
@@ -1212,6 +1319,55 @@ async fn await_topic_known(
     Ok(())
 }
 
+/// Commit an offset, following the cluster when it says the group's
+/// coordinator is somewhere else, and hand back the connection that
+/// took it.
+///
+/// `NOT_COORDINATOR` is a redirect, not a refusal: coordinators move,
+/// and they move most while a cluster is still settling, which is
+/// exactly when the suite is asking. A client re-reads FindCoordinator
+/// and asks the broker it names; a check that treated the first answer
+/// as final would report a healthy cluster for having changed its mind
+/// between two requests. The connection comes back so the read-back
+/// goes to the same broker the write did.
+async fn commit_offset_settled(
+    ctx: &ServerCtx,
+    group: &str,
+    produced: &ProducedTopic,
+    offset: i64,
+    version: i16,
+    correlation: i32,
+) -> Result<RawConnection, CheckError> {
+    let mut last = CheckError::Infra("no commit attempts were made".into());
+    for attempt in 0..ctx.config.settle_attempts() {
+        if attempt > 0 {
+            tokio::time::sleep(ctx.config.settle_delay).await;
+        }
+        let mut conn = coordinator_conn(ctx, group).await?;
+        await_topic_known(ctx, &mut conn, &produced.topic, correlation).await?;
+        match commit_offset(
+            &mut conn,
+            version,
+            group,
+            &produced.topic,
+            produced.topic_id,
+            offset,
+            correlation + 1,
+        )
+        .await
+        {
+            Ok(()) => return Ok(conn),
+            Err(CheckError::Violation(details))
+                if details.contains(&format!("{}", ErrorCode::NOT_COORDINATOR)) =>
+            {
+                last = CheckError::Violation(details);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last)
+}
+
 /// Read back what a group committed for one partition.
 async fn fetch_committed(
     conn: &mut RawConnection,
@@ -1324,32 +1480,17 @@ async fn offsets_commit_fetch_roundtrip(ctx: &ServerCtx) -> Verdict {
         return skip;
     }
     let group = check_group(&produced.topic);
-    // The offsets live with the group's coordinator, which is not in
-    // general the broker that leads the topic just produced to.
-    let mut conn = match coordinator_conn(ctx, &group).await {
-        Ok(c) => c,
-        Err(e) => return e.into_verdict(),
-    };
-    if let Err(e) = await_topic_known(ctx, &mut conn, &produced.topic, 55).await {
-        return e.into_verdict();
-    }
     // Not 0, and not the log end either: a number nothing else would
     // produce by accident.
     let committed = 7;
-
-    if let Err(e) = commit_offset(
-        &mut conn,
-        commit_version,
-        &group,
-        &produced.topic,
-        produced.topic_id,
-        committed,
-        61,
-    )
-    .await
-    {
-        return e.into_verdict();
-    }
+    // The offsets live with the group's coordinator, which is not in
+    // general the broker that leads the topic just produced to — and
+    // which may move while the cluster settles.
+    let mut conn =
+        match commit_offset_settled(ctx, &group, &produced, committed, commit_version, 55).await {
+            Ok(c) => c,
+            Err(e) => return e.into_verdict(),
+        };
     // One commit, read back at every OffsetFetch version on offer. A
     // durable position that only survives being read at one version is
     // not durable: v8 moved the exchange into a `groups` array and v10
@@ -2847,7 +2988,15 @@ async fn create_topic_call(
     validate_only: bool,
     correlation_id: i32,
 ) -> Result<(ErrorCode, [u8; 16]), CheckError> {
-    let _ = ctx;
+    // Creating a topic changes cluster metadata, which is the
+    // controller's to change. Every broker names the controller in its
+    // Metadata response so a client can go there, and an implementation
+    // is free to answer NOT_CONTROLLER rather than forward — Redpanda
+    // does. That only shows up on a cluster, and only once something
+    // has moved the controller off whichever broker the suite
+    // bootstrapped from, which is exactly what the recovery checks do.
+    let mut controller = admin_conn(ctx, conn, correlation_id.wrapping_sub(1)).await?;
+    let conn = &mut controller;
     let mut creatable = CreatableTopic::default();
     creatable.name = topic.to_owned();
     creatable.num_partitions = 1;
@@ -3434,8 +3583,12 @@ async fn produce_flow(
     create
         .encode(&mut body, create_version)
         .map_err(|e| infra(e.to_string()))?;
+    // To the controller, not to whichever broker we bootstrapped from.
+    let mut controller = admin_conn(ctx, &mut bootstrap, 9)
+        .await
+        .map_err(|e| e.context("locating the controller").into_verdict())?;
     let resp: CreateTopicsResponse = api_call(
-        &mut bootstrap,
+        &mut controller,
         CreateTopicsRequest::API_KEY,
         create_version,
         10,
@@ -4266,9 +4419,14 @@ async fn fetch_partition(
         .ok_or_else(|| CheckError::Violation("Fetch response names no partitions".into()))?;
     let code = ErrorCode(data.error_code);
     if !code.is_ok() {
+        // The offset and isolation are in the message because for this
+        // family of codes they *are* the explanation — OFFSET_OUT_OF_RANGE
+        // means nothing without saying which offset was asked for, and
+        // under read_committed it usually means the stable offset has
+        // not reached it rather than that the log has not.
         return Err(CheckError::Violation(format!(
-            "Fetch for {}[{}] answered {code}",
-            at.topic, at.partition
+            "Fetch for {}[{}] at offset {} (isolation {}) answered {code}",
+            at.topic, at.partition, at.offset, at.isolation_level
         )));
     }
     Ok(data)
@@ -4296,7 +4454,15 @@ async fn fetch_partition_settled(
         let correlation = correlation + i32::try_from(attempt).unwrap_or(0);
         match fetch_partition(conn, version, at, correlation).await {
             Ok(data) => return Ok(data),
-            Err(CheckError::Violation(details)) if mentions_retriable(&details) => {
+            // Under read_committed, OFFSET_OUT_OF_RANGE is the stable
+            // offset saying "not this far yet" — the same wait as an
+            // unmoved stable offset, seen from the other side, and the
+            // reason `still_resolving` exists. It is not a wait under
+            // read_uncommitted, where the log really does end there.
+            Err(CheckError::Violation(details))
+                if mentions_retriable(&details)
+                    || (at.isolation_level == READ_COMMITTED && still_resolving(&details)) =>
+            {
                 last = Some(CheckError::Violation(details));
             }
             Err(e) => return Err(e),
@@ -4314,7 +4480,7 @@ async fn fetch_partition_settled(
 fn fetch_refusal_names(details: &str, codes: &[ErrorCode]) -> bool {
     codes
         .iter()
-        .any(|code| details.ends_with(&format!("answered {code}")))
+        .any(|code| details.contains(&format!("answered {code}")))
 }
 
 /// Refusals that mean "not from me, not yet" rather than an answer.
@@ -4693,7 +4859,15 @@ async fn await_abort_marker(
         producer_id,
     } = run;
     let mut data = None;
-    for attempt in 0..ctx.config.settle_attempts() {
+    // The recovery budget, not the settle one. Ending a transaction is
+    // acknowledged by the coordinator, but the marker that unblocks the
+    // partition is written afterwards and, on a replicated transaction
+    // log, has to reach enough replicas first. How long that takes is
+    // the cluster's business rather than the suite's — the same kind of
+    // wait as an election, and the same reason for a budget sized by
+    // what a working cluster needs rather than by what a single idle
+    // broker manages.
+    for attempt in 0..ctx.config.recovery_attempts() {
         if attempt > 0 {
             tokio::time::sleep(ctx.config.settle_delay).await;
         }
@@ -4731,7 +4905,7 @@ async fn await_abort_marker(
         details: format!(
             "{context} nothing was readable at {first_offset} within {:?}: every \
              read_committed fetch was refused, so the transaction was never resolved",
-            ctx.config.settle_budget
+            ctx.config.recovery_budget
         ),
     })?;
 
@@ -5237,6 +5411,16 @@ async fn delete_topics_removes_the_topic(ctx: &ServerCtx) -> Verdict {
     };
     let topic = produced.topic.clone();
     let mut conn = produced.conn;
+    // Deleting a topic is the controller's business, not the partition
+    // leader's, and on a cluster those are rarely the same broker.
+    // Redpanda answers NOT_CONTROLLER to anyone else; Kafka forwards.
+    // Both are within their rights — the protocol names the controller
+    // in every Metadata response precisely so a client can go there —
+    // so the suite goes there.
+    let mut admin = match connect_to_controller(ctx, &mut conn, metadata_version, 861).await {
+        Ok(c) => c,
+        Err(e) => return e.context("locating the controller").into_verdict(),
+    };
 
     let mut request = DeleteTopicsRequest::default();
     if delete_version >= DELETE_TOPICS_BY_STATE {
@@ -5254,7 +5438,7 @@ async fn delete_topics_removes_the_topic(ctx: &ServerCtx) -> Verdict {
         };
     }
     let resp: DeleteTopicsResponse = match api_call(
-        &mut conn,
+        &mut admin,
         DeleteTopicsRequest::API_KEY,
         delete_version,
         800,
@@ -5376,6 +5560,75 @@ async fn leader_endpoint(
         .find(|b| b.node_id == partition.leader_id)
         .filter(|b| !b.host.is_empty() && (1..=65535).contains(&b.port))
         .map(|b| format!("{}:{}", b.host, b.port)))
+}
+
+/// The address of the broker this cluster's Metadata names as its
+/// controller, or `None` when it names none this response knows about.
+async fn controller_endpoint(
+    conn: &mut RawConnection,
+    version: i16,
+    correlation: i32,
+) -> Result<Option<String>, CheckError> {
+    let mut request = MetadataRequest::default();
+    request.topics = Some(Vec::new());
+    request.allow_auto_topic_creation = false;
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding Metadata: {e}")))?;
+    let resp: MetadataResponse =
+        api_call(conn, MetadataRequest::API_KEY, version, correlation, &body).await?;
+    Ok(resp
+        .brokers
+        .iter()
+        .find(|b| b.node_id == resp.controller_id)
+        .filter(|b| !b.host.is_empty() && (1..=65535).contains(&b.port))
+        .map(|b| format!("{}:{}", b.host, b.port)))
+}
+
+/// A connection to the cluster's controller.
+///
+/// Topic administration belongs to the controller: it owns the cluster
+/// metadata that creating and deleting topics changes. Other brokers
+/// may forward the request or may answer `NOT_CONTROLLER` and expect
+/// the client to consult Metadata, which names the controller in every
+/// response — Kafka does the first, Redpanda the second, and both are
+/// within their rights. A suite that only ever talked to one broker
+/// could not tell them apart, because on a cluster of one the broker
+/// you have is the controller.
+///
+/// Falls back to the bootstrap address when Metadata names no
+/// controller, so the request the caller cares about reports what the
+/// cluster says rather than this helper inventing a verdict.
+async fn connect_to_controller(
+    ctx: &ServerCtx,
+    bootstrap: &mut RawConnection,
+    version: i16,
+    correlation: i32,
+) -> Result<RawConnection, CheckError> {
+    let located = controller_endpoint(bootstrap, version, correlation).await?;
+    connect(located.as_deref().unwrap_or(&ctx.addr)).await
+}
+
+/// The same, negotiating Metadata for itself — for the callers that
+/// only want somewhere to send an administrative request and have no
+/// other use for the version.
+///
+/// A subject that does not advertise Metadata gets a connection to the
+/// bootstrap: there is then no way to find the controller, and the
+/// request will report whatever it reports.
+async fn admin_conn(
+    ctx: &ServerCtx,
+    bootstrap: &mut RawConnection,
+    correlation: i32,
+) -> Result<RawConnection, CheckError> {
+    let Ok(range) = ctx.range(MetadataRequest::API_KEY) else {
+        return connect(&ctx.addr).await;
+    };
+    let Ok(version) = negotiate("Metadata", range, 1, MetadataRequest::MAX_VERSION) else {
+        return connect(&ctx.addr).await;
+    };
+    connect_to_controller(ctx, bootstrap, version, correlation).await
 }
 
 /// A connection to the broker leading partition 0 of `topic`, waiting
@@ -6397,9 +6650,11 @@ async fn txn_commit_is_visible_to_readers(ctx: &ServerCtx) -> Verdict {
     }
 
     // The marker lands after EndTxn answers, so the stable offset moves
-    // a moment later; reading immediately would prove nothing.
+    // a moment later; reading immediately would prove nothing. On the
+    // recovery budget, as in `await_abort_marker` and for the same
+    // reason: the wait is on replication, not on the suite.
     let mut data = None;
-    for attempt in 0..ctx.config.settle_attempts() {
+    for attempt in 0..ctx.config.recovery_attempts() {
         if attempt > 0 {
             tokio::time::sleep(ctx.config.settle_delay).await;
         }
@@ -6435,7 +6690,7 @@ async fn txn_commit_is_visible_to_readers(ctx: &ServerCtx) -> Verdict {
                     "the commit was acknowledged but nothing was readable at {first_offset} \
                      within {:?}: every read_committed fetch was refused, so the commit \
                      marker never landed",
-                    ctx.config.settle_budget
+                    ctx.config.recovery_budget
                 ),
             };
         }
@@ -7129,6 +7384,89 @@ async fn leadership_at(
         .map(|p| (p.leader_id, p.replica_nodes.clone(), p.isr_nodes.clone())))
 }
 
+/// Create a single-partition topic with `replicas` replicas.
+async fn create_replicated_topic(
+    ctx: &ServerCtx,
+    conn: &mut RawConnection,
+    topic: &str,
+    replicas: i16,
+    correlation: i32,
+) -> Result<(), Verdict> {
+    let version = negotiate(
+        "CreateTopics",
+        ctx.range(CreateTopicsRequest::API_KEY)?,
+        CreateTopicsRequest::MIN_VERSION,
+        CreateTopicsRequest::MAX_VERSION,
+    )?;
+    let mut creatable = CreatableTopic::default();
+    creatable.name = topic.to_owned();
+    creatable.num_partitions = 1;
+    creatable.replication_factor = replicas;
+    let mut create = CreateTopicsRequest::default();
+    create.topics = vec![creatable];
+    create.timeout_ms = 30_000;
+    create.validate_only = false;
+    let mut body = BytesMut::new();
+    create
+        .encode(&mut body, version)
+        .map_err(|e| Verdict::Error {
+            details: format!("encoding CreateTopics: {e}"),
+        })?;
+    let mut controller = admin_conn(ctx, conn, correlation.wrapping_sub(1))
+        .await
+        .map_err(|e| e.context("locating the controller").into_verdict())?;
+    let resp: CreateTopicsResponse = api_call(
+        &mut controller,
+        CreateTopicsRequest::API_KEY,
+        version,
+        correlation,
+        &body,
+    )
+    .await
+    .map_err(|e| e.context("CreateTopics").into_verdict())?;
+    let code = resp
+        .topics
+        .first()
+        .map_or(ErrorCode::NONE, |t| ErrorCode(t.error_code));
+    if !code.is_ok() {
+        return Err(Verdict::Skipped {
+            reason: format!("the subject would not create a {replicas}-replica topic: {code}"),
+        });
+    }
+    Ok(())
+}
+
+/// Wait for a freshly created topic to have a leader, and report it
+/// with the replica set the cluster placed it on.
+async fn settle_leadership(
+    ctx: &ServerCtx,
+    conn: &mut RawConnection,
+    version: i16,
+    topic: &str,
+    correlation: i32,
+) -> Result<(i32, Vec<i32>), Verdict> {
+    for attempt in 0..ctx.config.settle_attempts() {
+        if attempt > 0 {
+            tokio::time::sleep(ctx.config.settle_delay).await;
+        }
+        match leadership_at(
+            conn,
+            version,
+            topic,
+            correlation + i32::try_from(attempt).unwrap_or(0),
+        )
+        .await
+        {
+            Ok(Some((leader, replicas, _))) if leader >= 0 => return Ok((leader, replicas)),
+            Ok(_) => {}
+            Err(e) => return Err(e.context("Metadata").into_verdict()),
+        }
+    }
+    Err(Verdict::Error {
+        details: format!("{topic} was created but never given a leader within the settle budget"),
+    })
+}
+
 /// Every broker must name the same leader for the same partition.
 ///
 /// Leadership is a fact about the partition, not about who you ask. Two
@@ -7645,7 +7983,7 @@ async fn cluster_group_offsets_need_the_coordinator(ctx: &ServerCtx) -> Verdict 
         // `commit_offset` reports a non-zero code as a violation, which
         // here is the passing answer — so read the code back out of it.
         Err(CheckError::Violation(details))
-            if details.ends_with(&format!("{}", ErrorCode::NOT_COORDINATOR)) =>
+            if details.contains(&format!("{}", ErrorCode::NOT_COORDINATOR)) =>
         {
             Verdict::Pass
         }
@@ -7660,4 +7998,412 @@ async fn cluster_group_offsets_need_the_coordinator(ctx: &ServerCtx) -> Verdict 
             .context("OffsetCommit (to a non-coordinator)")
             .into_verdict(),
     }
+}
+
+// ---------------------------------------------------------------------
+// Recovery checks
+//
+// The `cluster/*` checks above ask whether a working cluster's answers
+// are consistent. These ask what happens when it stops working — which
+// is the question every deployment eventually asks, and the one a suite
+// that only ever sees healthy brokers can never answer.
+//
+// They are the only checks that change the subject rather than
+// observing it, so two rules govern them. They need a
+// [`ClusterControl`] and skip without one, because a suite is not
+// entitled to assume it may stop somebody's broker. And each restores
+// the cluster before returning, on every path out — a check that left a
+// broker down would hand its failure to whatever ran next, and the
+// report would blame the wrong thing.
+// ---------------------------------------------------------------------
+
+/// Stop `node_id` for the duration of `body`, and start it again
+/// whatever happens.
+///
+/// Rust has no async drop, so restoration cannot be left to a guard:
+/// it is done here, once, around a closure that cannot return early
+/// past it. A failure to restore outranks whatever `body` concluded,
+/// because from that point on the report describes a cluster the
+/// subject's operator did not agree to.
+async fn while_stopped(
+    ctx: &ServerCtx,
+    broker: Broker<'_>,
+    body: BoxFuture<'_, Verdict>,
+) -> Verdict {
+    let Some(control) = ctx.config.control.clone() else {
+        return Verdict::Skipped {
+            reason: "no --cluster-control was given, so the suite has no way to stop \
+                     a broker and no business assuming one"
+                .into(),
+        };
+    };
+    if let Err(e) = control.stop(broker).await {
+        return Verdict::Error {
+            details: format!(
+                "could not stop node {} at {}: {e}",
+                broker.node_id, broker.addr
+            ),
+        };
+    }
+    let verdict = body.await;
+    match control.start(broker).await {
+        Ok(()) => verdict,
+        Err(e) => Verdict::Error {
+            details: format!(
+                "node {} could not be restarted after the check ({e}); the cluster is \
+                 short a broker and every later check is suspect. The check itself had \
+                 reached: {verdict:?}",
+                broker.node_id
+            ),
+        },
+    }
+}
+
+/// Leadership must move off a broker that has stopped.
+///
+/// A partition whose leader is gone is a partition nothing can write
+/// to. The replicas hold the data and one of them has to take over, or
+/// the copies were decoration: a cluster that kept naming the stopped
+/// broker would leave the partition unwritable for as long as the
+/// broker stayed down, which is exactly the outage replication is sold
+/// as preventing.
+///
+/// The check is not that the new leader is any particular broker — that
+/// is the cluster's business — but that a leader exists, that it is one
+/// of the replicas the cluster named while healthy, and that it accepts
+/// a write.
+async fn cluster_leadership_moves_when_a_broker_stops(ctx: &ServerCtx) -> Verdict {
+    let nodes = match cluster_nodes(ctx).await {
+        Ok(nodes) => nodes,
+        Err(verdict) => return verdict,
+    };
+    if ctx.config.control.is_none() {
+        return Verdict::Skipped {
+            reason: "no --cluster-control was given, so the suite has no way to stop \
+                     a broker and no business assuming one"
+                .into(),
+        };
+    }
+    let metadata_version = match negotiate(
+        "Metadata",
+        match ctx.range(MetadataRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        1,
+        MetadataRequest::MAX_VERSION,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let produce_version = match negotiate(
+        "Produce",
+        match ctx.range(ProduceRequest::API_KEY) {
+            Ok(range) => range,
+            Err(skip) => return skip,
+        },
+        ProduceRequest::MIN_VERSION,
+        PRODUCE_NAME_MAX,
+    ) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+
+    // Replicated across every broker, so that stopping the leader
+    // leaves someone able to take over. A single-replica partition has
+    // no story here and the check would be about nothing.
+    let topic = unique_topic("failover");
+    let wanted = i16::try_from(nodes.len()).unwrap_or(1);
+    let mut bootstrap = match connect(&ctx.addr).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
+    match create_replicated_topic(ctx, &mut bootstrap, &topic, wanted, 1_500).await {
+        Ok(()) => {}
+        Err(verdict) => return verdict,
+    }
+
+    let (leader, replicas) =
+        match settle_leadership(ctx, &mut bootstrap, metadata_version, &topic, 1_510).await {
+            Ok(found) => found,
+            Err(verdict) => return verdict,
+        };
+    let Some(leader_addr) = nodes
+        .iter()
+        .find(|n| n.node_id == leader)
+        .map(|n| n.addr.clone())
+    else {
+        return Verdict::Fail {
+            details: format!(
+                "{topic}[0] is led by node {leader}, which is not one of the brokers the \
+                 same cluster reports"
+            ),
+        };
+    };
+    // Ask somewhere that will still be answering afterwards.
+    let Some(survivor) = nodes.iter().find(|n| n.node_id != leader) else {
+        return Verdict::Skipped {
+            reason: format!("every broker is node {leader}, so stopping it leaves nobody to ask"),
+        };
+    };
+    let survivor_addr = survivor.addr.clone();
+
+    let stopping = Broker {
+        node_id: leader,
+        addr: &leader_addr,
+    };
+    while_stopped(
+        ctx,
+        stopping,
+        Box::pin(async {
+            let mut conn = match connect(&survivor_addr).await {
+                Ok(c) => c,
+                Err(e) => return e.context("connecting to a surviving broker").into_verdict(),
+            };
+            let mut moved = None;
+            for attempt in 0..ctx.config.recovery_attempts() {
+                if attempt > 0 {
+                    tokio::time::sleep(ctx.config.settle_delay).await;
+                }
+                // No let-chain: this crate builds on the declared MSRV,
+                // which predates them.
+                if let Ok(Some((new_leader, _, _))) =
+                    leadership_at(&mut conn, metadata_version, &topic, 1_520).await
+                {
+                    if new_leader != leader && new_leader >= 0 {
+                        moved = Some(new_leader);
+                        break;
+                    }
+                }
+            }
+            let Some(new_leader) = moved else {
+                return Verdict::Fail {
+                    details: format!(
+                        "node {leader} was stopped and {topic}[0] still has no other leader \
+                     after {:?}; its replicas were {replicas:?}, so there was somewhere \
+                     for leadership to go and it did not",
+                        ctx.config.recovery_budget
+                    ),
+                };
+            };
+            if !replicas.contains(&new_leader) {
+                return Verdict::Fail {
+                    details: format!(
+                        "{topic}[0] failed over to node {new_leader}, which was not among the \
+                     replicas the cluster named while healthy ({replicas:?}); that broker \
+                     cannot have had the data"
+                    ),
+                };
+            }
+            // A leader that cannot be written to has not taken over.
+            let Some(node) = nodes.iter().find(|n| n.node_id == new_leader) else {
+                return Verdict::Fail {
+                    details: format!(
+                        "{topic}[0] failed over to node {new_leader}, which is not one of the \
+                     brokers the cluster reports"
+                    ),
+                };
+            };
+            let mut leader_conn = match connect(&node.addr).await {
+                Ok(c) => c,
+                Err(e) => return e.context("connecting to the new leader").into_verdict(),
+            };
+            let mut last = ErrorCode::NONE;
+            let mut accepted = false;
+            for attempt in 0..ctx.config.recovery_attempts() {
+                if attempt > 0 {
+                    tokio::time::sleep(ctx.config.settle_delay).await;
+                }
+                match produce_stamped(
+                    &mut leader_conn,
+                    produce_version,
+                    ProduceStamp::plain(),
+                    &topic,
+                    0,
+                    1_530,
+                )
+                .await
+                {
+                    Ok((code, _)) if code.is_ok() => {
+                        accepted = true;
+                        break;
+                    }
+                    Ok((code, _)) => last = code,
+                    Err(_) => {}
+                }
+            }
+            if accepted {
+                Verdict::Pass
+            } else {
+                Verdict::Fail {
+                    details: format!(
+                        "{topic}[0] reports node {new_leader} as its leader with node {leader} \
+                     stopped, but a write there answers {last}; the partition has a leader \
+                     in name only"
+                    ),
+                }
+            }
+        }),
+    )
+    .await
+}
+
+/// Committed offsets must outlive the broker that coordinated them.
+///
+/// A group's offsets are the only record of what it has processed. If
+/// they live on one broker and die with it, a consumer that resumes
+/// after that broker fails rewinds to whatever survived — reprocessing
+/// everything since, silently, and only on the day something went
+/// wrong. The commit was acknowledged; the acknowledgement has to mean
+/// the offset is as durable as the cluster is.
+async fn cluster_committed_offsets_outlive_the_coordinator(ctx: &ServerCtx) -> Verdict {
+    let nodes = match cluster_nodes(ctx).await {
+        Ok(nodes) => nodes,
+        Err(verdict) => return verdict,
+    };
+    if ctx.config.control.is_none() {
+        return Verdict::Skipped {
+            reason: "no --cluster-control was given, so the suite has no way to stop \
+                     a broker and no business assuming one"
+                .into(),
+        };
+    }
+    let (commit_version, fetch_version) = match offsets_versions(ctx) {
+        Ok(v) => v,
+        Err(skip) => return skip,
+    };
+    let produced = match produce_flow(ctx, "coordloss", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    if let Some(skip) = skip_without_topic_id(&produced, commit_version) {
+        return skip;
+    }
+    let group = check_group("coordloss");
+    let Some(coordinator) = (match await_coordinator(ctx, &group).await {
+        Ok(addr) => addr,
+        Err(e) => return e.into_verdict(),
+    }) else {
+        return Verdict::Skipped {
+            reason: format!("the subject named no coordinator for {group}"),
+        };
+    };
+    let Some(owner) = nodes.iter().find(|n| n.addr == coordinator) else {
+        return Verdict::Skipped {
+            reason: format!(
+                "the coordinator for {group} is at {coordinator}, which is not one of the \
+                 brokers Metadata reports, so there is no node to stop"
+            ),
+        };
+    };
+    let owner_id = owner.node_id;
+    let Some(survivor) = nodes.iter().find(|n| n.node_id != owner_id) else {
+        return Verdict::Skipped {
+            reason: "the coordinator is the only broker, so stopping it leaves nobody to ask"
+                .into(),
+        };
+    };
+    let survivor_addr = survivor.addr.clone();
+
+    // A number nothing else would produce by accident.
+    let committed = 23;
+    let mut conn = match connect(&coordinator).await {
+        Ok(c) => c,
+        Err(e) => return e.into_verdict(),
+    };
+    if let Err(e) = await_topic_known(ctx, &mut conn, &produced.topic, 1_540).await {
+        return e.into_verdict();
+    }
+    if let Err(e) = commit_offset(
+        &mut conn,
+        commit_version,
+        &group,
+        &produced.topic,
+        produced.topic_id,
+        committed,
+        1_545,
+    )
+    .await
+    {
+        return e.context("OffsetCommit").into_verdict();
+    }
+    drop(conn);
+
+    let topic = produced.topic.clone();
+    let topic_id = produced.topic_id;
+    let stopping = Broker {
+        node_id: owner_id,
+        addr: &coordinator,
+    };
+    while_stopped(
+        ctx,
+        stopping,
+        Box::pin(async {
+            let mut conn = match connect(&survivor_addr).await {
+                Ok(c) => c,
+                Err(e) => return e.context("connecting to a surviving broker").into_verdict(),
+            };
+            // The group needs a coordinator again before it can be asked
+            // anything; that it gets one is the other half of this.
+            let mut relocated = None;
+            for attempt in 0..ctx.config.recovery_attempts() {
+                if attempt > 0 {
+                    tokio::time::sleep(ctx.config.settle_delay).await;
+                }
+                // Asked of a survivor, not of the bootstrap: the
+                // broker that was stopped may well be the bootstrap,
+                // and asking it would fail for the obvious reason
+                // rather than tell us anything about failing over.
+                if let Ok(Some(addr)) = await_coordinator_at(ctx, &survivor_addr, &group).await {
+                    if addr != coordinator {
+                        relocated = Some(addr);
+                        break;
+                    }
+                }
+            }
+            let Some(addr) = relocated else {
+                return Verdict::Fail {
+                    details: format!(
+                        "node {owner_id} coordinated {group} and was stopped; after {:?} the \
+                     cluster still names no other coordinator, so the group cannot commit \
+                     or resume at all",
+                        ctx.config.recovery_budget
+                    ),
+                };
+            };
+            if let Ok(reconnected) = connect(&addr).await {
+                conn = reconnected;
+            }
+            // A coordinator that has just taken the group over has to
+            // load its state before it can answer about it, and until
+            // it has, the group's partitions are not in its reply at
+            // all. That is a wait, not a lost offset — the two are
+            // distinguished by whether it is still true at the end of
+            // the recovery budget.
+            let mut last = None;
+            for attempt in 0..ctx.config.recovery_attempts() {
+                if attempt > 0 {
+                    tokio::time::sleep(ctx.config.settle_delay).await;
+                }
+                match fetch_committed(&mut conn, fetch_version, &group, &topic, topic_id, 1_550)
+                    .await
+                {
+                    Ok(got) if got == committed => return Verdict::Pass,
+                    Ok(got) => last = Some(format!("reports {got}")),
+                    Err(CheckError::Violation(details)) => last = Some(details),
+                    Err(e) => return e.context("OffsetFetch (after failover)").into_verdict(),
+                }
+            }
+            Verdict::Fail {
+                details: format!(
+                    "{group} committed offset {committed}, node {owner_id} (its coordinator) \
+                     was stopped, and the new coordinator at {addr} still {} after {:?}. A \
+                     consumer resuming here reprocesses everything since",
+                    last.unwrap_or_else(|| "says nothing about it".into()),
+                    ctx.config.recovery_budget
+                ),
+            }
+        }),
+    )
+    .await
 }

@@ -37,6 +37,10 @@ fn main() -> Result<()> {
     match task {
         "codegen" => codegen(),
         "conformance" => conformance::conformance(&args[1..]),
+        // Not for humans: this is what `cargo xtask conformance` hands
+        // to `odradek-accept --cluster-control` so the recovery checks
+        // can stop and start a broker. See `conformance::node_control`.
+        "cluster-node" => conformance::node_control(&args[1..]),
         other => bail!("unknown task {other:?}; available tasks: codegen, conformance"),
     }
 }

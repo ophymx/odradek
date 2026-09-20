@@ -15,7 +15,7 @@ use crate::{SubjectRole, Verdict};
 pub mod client;
 pub mod server;
 
-pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// How a catalogued check executes. The variant *is* the check's subject
 /// role: a server check drives a connection to the subject, a client

@@ -32,6 +32,12 @@ fn usage() -> ExitCode {
     eprintln!(
         "usage: odradek-accept (--server <host:port> | --client-listen <host:port> | --list)\n\
          \x20 [--sasl-server <host:port>]  a second listener with SASL configured\n\
+         \x20 [--cluster-control <cmd>]    how to stop and start a broker: run\n\
+         \x20                    as `<cmd> <stop|start> <node-id> <host:port>`.\n\
+         \x20                    Both names are given because not every\n\
+         \x20                    implementation lets you choose node ids.\n\
+         \x20                    Without it, the checks that need a broker to\n\
+         \x20                    fail skip.\n\
          \x20                    [--json]\n\
          \x20 [--fault <name>]   stage one misbehavior for the client to cope\n\
          \x20                    with: leader-move, throttle,\n\
@@ -46,6 +52,7 @@ fn usage() -> ExitCode {
 struct Args {
     server: Option<String>,
     sasl_server: Option<String>,
+    cluster_control: Option<String>,
     client_listen: Option<String>,
     list: bool,
     fault: Option<checks::client::HarnessFault>,
@@ -58,6 +65,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut parsed = Args {
         server: None,
         sasl_server: None,
+        cluster_control: None,
         client_listen: None,
         list: false,
         fault: None,
@@ -70,6 +78,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         match arg.as_str() {
             "--server" => parsed.server = Some(it.next()?.clone()),
             "--sasl-server" => parsed.sasl_server = Some(it.next()?.clone()),
+            "--cluster-control" => parsed.cluster_control = Some(it.next()?.clone()),
             "--client-listen" => parsed.client_listen = Some(it.next()?.clone()),
             "--list" => parsed.list = true,
             "--fault" => {
@@ -95,6 +104,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         let alone = parsed.server.is_none()
             && parsed.client_listen.is_none()
             && parsed.fault.is_none()
+            && parsed.cluster_control.is_none()
             && !parsed.json
             && parsed.baseline.is_none()
             && parsed.write_baseline.is_none();
@@ -130,12 +140,15 @@ async fn main() -> ExitCode {
     }
 
     let report = if let Some(addr) = &args.server {
-        checks::server::run_with_sasl(
-            addr,
-            args.sasl_server.as_deref(),
-            &checks::server::ProbeConfig::default(),
-        )
-        .await
+        let mut config = checks::server::ProbeConfig::default();
+        config.control = args.cluster_control.as_deref().map(
+            |command| -> std::sync::Arc<dyn checks::server::ClusterControl> {
+                std::sync::Arc::new(CommandControl {
+                    command: command.to_owned(),
+                })
+            },
+        );
+        checks::server::run_with_sasl(addr, args.sasl_server.as_deref(), &config).await
     } else {
         let addr = args.client_listen.as_deref().unwrap();
         let listener = match TcpListener::bind(addr).await {
@@ -176,6 +189,70 @@ async fn main() -> ExitCode {
     }
 
     exit_status(&report, args.baseline.as_deref())
+}
+
+/// Stops and starts brokers by running a command the caller supplied.
+///
+/// The suite knows nothing about how the subject is deployed and has no
+/// business guessing: `docker stop`, `kubectl delete pod`, `systemctl
+/// stop`, an ssh hop, a cloud API. So it is handed one command and
+/// invokes it as `<command> stop <node-id>` / `<command> start
+/// <node-id>`, and whoever wrote the command decides what those mean.
+///
+/// Split on whitespace so a command can carry fixed arguments
+/// (`"./control.sh --cluster ci"`). Nothing here goes near a shell, so
+/// quoting and redirection are not available and not needed; a command
+/// that wants them can be a script, which is the expected shape anyway.
+#[derive(Debug)]
+struct CommandControl {
+    command: String,
+}
+
+impl CommandControl {
+    async fn run(&self, verb: &'static str, node_id: i32, addr: String) -> Result<(), String> {
+        // `std::process` on a blocking thread rather than tokio's, which
+        // would mean a `process` feature — and with it a signal-handling
+        // dependency — on a published crate, for something that happens
+        // a handful of times per run and is slow anyway.
+        let command = self.command.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut parts = command.split_whitespace();
+            let program = parts.next().ok_or("--cluster-control is empty")?;
+            let out = std::process::Command::new(program)
+                .args(parts)
+                .arg(verb)
+                .arg(node_id.to_string())
+                .arg(&addr)
+                .output()
+                .map_err(|e| format!("running {command:?}: {e}"))?;
+            if out.status.success() {
+                return Ok(());
+            }
+            Err(format!(
+                "{command:?} {verb} {node_id} exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        })
+        .await
+        .map_err(|e| format!("control task for {verb} {node_id} failed: {e}"))?
+    }
+}
+
+impl checks::server::ClusterControl for CommandControl {
+    fn stop(
+        &self,
+        broker: checks::server::Broker<'_>,
+    ) -> checks::BoxFuture<'_, Result<(), String>> {
+        Box::pin(self.run("stop", broker.node_id, broker.addr.to_owned()))
+    }
+
+    fn start(
+        &self,
+        broker: checks::server::Broker<'_>,
+    ) -> checks::BoxFuture<'_, Result<(), String>> {
+        Box::pin(self.run("start", broker.node_id, broker.addr.to_owned()))
+    }
 }
 
 fn exit_status(report: &Report, baseline_path: Option<&str>) -> ExitCode {
