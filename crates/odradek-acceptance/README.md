@@ -288,6 +288,34 @@ recorded rather than scored:
   passes on Kafka and skips on Redpanda, and the skip reason says which
   of the two situations it is.
 
+## The proxied pass
+
+`cargo xtask conformance` runs every subject twice: once against the
+broker, and once with
+[`odradek-protocol`'s proxy example](../odradek-protocol/examples/proxy.rs)
+between the suite and the broker. Both passes are enforced against the
+same baseline — the proxied one gets no baseline of its own, because the
+claim being tested is precisely that there is nothing to record: a proxy
+built on the protocol crate should be indistinguishable from the broker
+it stands in front of.
+
+That is where the crate's design claims stop being assertions. Unknown
+tagged fields round-trip raw, record batches re-encode byte-identically,
+response header versions are recoverable from the request — each is
+justified in the source with "a proxy needs this", and a proxy that got
+any of them wrong would make some check answer differently than the
+broker behind it. The diff then names which one.
+
+It earned its place immediately. Its first run reported four group
+checks erroring through the proxy that had passed directly, and the
+proxy turned out to be innocent: the suite was reusing fixed group names
+across runs, so a second run against a live cluster parked behind a
+rebalance waiting for the first run's members. Throwaway containers had
+hidden it from CI, and anyone pointing the suite twice at their own
+cluster would have hit it. Group names are stamped per run now.
+
+Use `--no-proxy` to skip the second pass.
+
 Part of the [odradek](https://github.com/ophymx/odradek) constellation.
 
 ## License

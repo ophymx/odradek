@@ -5,6 +5,7 @@
 //! cargo xtask conformance             # all subjects, enforce baselines
 //! cargo xtask conformance --record    # (re)write baselines from this run
 //! cargo xtask conformance redpanda    # only subjects whose name contains
+//! cargo xtask conformance --no-proxy  # skip the second, proxied pass
 //! ```
 //!
 //! Each subject runs in a throwaway container on an ephemeral host port,
@@ -19,12 +20,19 @@
 //! itself. Checks the suite could not run (infrastructure `error`
 //! outcomes) never satisfy a baseline, but odradek-accept reports them
 //! distinctly from protocol failures.
+//!
+//! Every subject is then run a second time through
+//! [the proxy example][proxy], enforced against the *same* baseline. See
+//! [`proxy_pass`] for why that comparison is the interesting one.
+//!
+//! [proxy]: ../../../crates/odradek-protocol/examples/proxy.rs
 
 use std::fmt::Write as _;
-use std::io::{Read, Write};
+use std::io::{BufRead as _, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -150,6 +158,7 @@ const SUBJECTS: &[Subject] = &[
 
 pub fn conformance(args: &[String]) -> Result<()> {
     let record = args.iter().any(|a| a == "--record");
+    let proxied = !args.iter().any(|a| a == "--no-proxy");
     let filters: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let selected: Vec<&'static Subject> = SUBJECTS
         .iter()
@@ -169,6 +178,10 @@ pub fn conformance(args: &[String]) -> Result<()> {
     let root = workspace_root();
     build_accept(&root)?;
     let accept = root.join("target/debug/odradek-accept");
+    let proxy = proxied.then(|| root.join("target/debug/examples/proxy"));
+    if proxied {
+        build_proxy(&root)?;
+    }
     let conf_dir = root.join("conformance");
     std::fs::create_dir_all(&conf_dir)?;
 
@@ -193,10 +206,18 @@ pub fn conformance(args: &[String]) -> Result<()> {
         .iter()
         .map(|&subject| {
             let accept = accept.clone();
+            let proxy = proxy.clone();
             let conf_dir = conf_dir.clone();
             std::thread::spawn(move || {
                 let mut log = String::new();
-                let result = run_subject(subject, &accept, &conf_dir, record, &mut log);
+                let result = run_subject(
+                    subject,
+                    &accept,
+                    proxy.as_deref(),
+                    &conf_dir,
+                    record,
+                    &mut log,
+                );
                 (log, result)
             })
         })
@@ -237,12 +258,25 @@ fn build_accept(root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn build_proxy(root: &Path) -> Result<()> {
+    let status = Command::new("cargo")
+        .args(["build", "-p", "odradek-protocol", "--example", "proxy"])
+        .current_dir(root)
+        .status()
+        .context("running cargo build")?;
+    if !status.success() {
+        bail!("cargo build --example proxy failed");
+    }
+    Ok(())
+}
+
 /// Run one subject end to end, appending everything a human should see
 /// to `log` rather than printing it — concurrent subjects would otherwise
 /// interleave their reports line by line.
 fn run_subject(
     subject: &Subject,
     accept: &Path,
+    proxy: Option<&Path>,
     conf_dir: &Path,
     record: bool,
     log: &mut String,
@@ -251,6 +285,9 @@ fn run_subject(
     let sasl_port = ephemeral_port()?;
     let container = Container::start(subject, port, sasl_port)?;
     let addr = format!("127.0.0.1:{port}");
+    let sasl_addr = subject
+        .sasl_listener
+        .then(|| format!("127.0.0.1:{sasl_port}"));
 
     if let Err(e) = wait_ready(&addr) {
         container.dump_logs(log);
@@ -264,20 +301,8 @@ fn run_subject(
     }
 
     let baseline = conf_dir.join(format!("{}.json", subject.name));
-    let mut cmd = Command::new(accept);
-    cmd.args(["--server", &addr]);
-    if subject.sasl_listener {
-        cmd.args(["--sasl-server", &format!("127.0.0.1:{sasl_port}")]);
-    }
-    if record {
-        cmd.args(["--write-baseline".as_ref(), baseline.as_os_str()]);
-    } else {
-        cmd.args(["--baseline".as_ref(), baseline.as_os_str()]);
-    }
-    let out = cmd.output().context("running odradek-accept")?;
-    log.push_str(&String::from_utf8_lossy(&out.stdout));
-    log.push_str(&String::from_utf8_lossy(&out.stderr));
-    if !out.status.success() {
+    let direct = run_accept(accept, &addr, sasl_addr.as_deref(), &baseline, record, log)?;
+    if !direct {
         // In record mode the accept run may exit non-zero because the
         // subject deviates; the point of recording is to capture exactly
         // that, so only enforcement failures are errors.
@@ -292,7 +317,109 @@ fn run_subject(
             bail!("acceptance run failed against {}", subject.name);
         }
     }
+
+    if let Some(proxy) = proxy {
+        proxy_pass(
+            subject,
+            accept,
+            proxy,
+            &addr,
+            sasl_addr.as_deref(),
+            &baseline,
+            log,
+        )?;
+    }
     Ok(())
+}
+
+/// The same suite again, with the proxy example between it and the
+/// broker, enforced against the *same* baseline.
+///
+/// The protocol crate justifies a good deal of its design — unknown
+/// tagged fields round-tripping raw, record batches re-encoding
+/// byte-identically — with "a proxy needs this". `examples/proxy.rs` is
+/// the witness for that claim, and this is what keeps the witness
+/// honest: not a baseline of its own, but the broker's. A proxy that
+/// dropped a tagged field, re-encoded a batch differently, or mislaid a
+/// correlation id would make some check answer differently than the
+/// broker it is standing in front of, and the diff names which one.
+///
+/// Recording is deliberately not offered here. A proxied baseline could
+/// absorb exactly the regressions this is meant to catch; the assertion
+/// is equality with the direct run, so there is nothing else it could
+/// legitimately be.
+fn proxy_pass(
+    subject: &Subject,
+    accept: &Path,
+    proxy: &Path,
+    addr: &str,
+    sasl_addr: Option<&str>,
+    baseline: &Path,
+    log: &mut String,
+) -> Result<()> {
+    let front = Proxy::start(proxy, addr)?;
+    // A second instance for the SASL listener: the proxy forwards SASL
+    // frames without parsing them, but it only has one upstream, and
+    // the two listeners are different upstreams.
+    let sasl_front = sasl_addr.map(|a| Proxy::start(proxy, a)).transpose()?;
+
+    if let Err(e) = wait_ready(front.addr()) {
+        front.dump_logs(log);
+        return Err(e).context("proxy never became reachable");
+    }
+
+    let _ = writeln!(
+        log,
+        "--- {} through the proxy ({} -> {addr}) ---",
+        subject.name,
+        front.addr()
+    );
+    let matched = run_accept(
+        accept,
+        front.addr(),
+        sasl_front.as_ref().map(Proxy::addr),
+        baseline,
+        false,
+        log,
+    )?;
+    if !matched {
+        front.dump_logs(log);
+        if let Some(sasl_front) = &sasl_front {
+            sasl_front.dump_logs(log);
+        }
+        bail!(
+            "{} answers differently through the proxy than directly — the \
+             proxy is not transparent, or the suite is nondeterministic",
+            subject.name
+        );
+    }
+    Ok(())
+}
+
+/// One `odradek-accept --server` run. `Ok(false)` means it ran and the
+/// subject did not satisfy the baseline; `Err` means it could not run.
+fn run_accept(
+    accept: &Path,
+    addr: &str,
+    sasl_addr: Option<&str>,
+    baseline: &Path,
+    record: bool,
+    log: &mut String,
+) -> Result<bool> {
+    let mut cmd = Command::new(accept);
+    cmd.args(["--server", addr]);
+    if let Some(sasl_addr) = sasl_addr {
+        cmd.args(["--sasl-server", sasl_addr]);
+    }
+    if record {
+        cmd.args(["--write-baseline".as_ref(), baseline.as_os_str()]);
+    } else {
+        cmd.args(["--baseline".as_ref(), baseline.as_os_str()]);
+    }
+    let out = cmd.output().context("running odradek-accept")?;
+    log.push_str(&String::from_utf8_lossy(&out.stdout));
+    log.push_str(&String::from_utf8_lossy(&out.stderr));
+    Ok(out.status.success())
 }
 
 /// Pick a free TCP port. Racy in principle; in practice docker publishes
@@ -300,6 +427,61 @@ fn run_subject(
 fn ephemeral_port() -> Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     Ok(listener.local_addr()?.port())
+}
+
+/// A running `examples/proxy` in front of one upstream listener.
+struct Proxy {
+    addr: String,
+    child: std::process::Child,
+    /// Everything the proxy has said, drained by a thread so a chatty
+    /// proxy cannot block on a pipe nobody is reading.
+    stderr: Arc<Mutex<String>>,
+}
+
+impl Proxy {
+    fn start(binary: &Path, upstream: &str) -> Result<Proxy> {
+        let addr = format!("127.0.0.1:{}", ephemeral_port()?);
+        // --advertise defaults to --listen, which is what we want: the
+        // proxy is reachable at the address it binds, so metadata
+        // pointing there sends followers back through it.
+        let mut child = Command::new(binary)
+            .args(["--listen", &addr, "--upstream", upstream])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("spawning {}", binary.display()))?;
+        let stderr = Arc::new(Mutex::new(String::new()));
+        if let Some(pipe) = child.stderr.take() {
+            let sink = Arc::clone(&stderr);
+            std::thread::spawn(move || {
+                for line in std::io::BufReader::new(pipe).lines().map_while(Result::ok) {
+                    let _ = writeln!(sink.lock().unwrap(), "{line}");
+                }
+            });
+        }
+        Ok(Proxy {
+            addr,
+            child,
+            stderr,
+        })
+    }
+
+    fn addr(&self) -> &str {
+        &self.addr
+    }
+
+    fn dump_logs(&self, log: &mut String) {
+        let _ = writeln!(log, "--- proxy {} stderr ---", self.addr);
+        log.push_str(&self.stderr.lock().unwrap());
+    }
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 struct Container {

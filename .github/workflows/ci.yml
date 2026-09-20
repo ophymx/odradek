@@ -109,7 +109,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: enforce committed baselines against Kafka and Redpanda
+      - name: enforce committed baselines against Kafka and Redpanda, direct and proxied
+        # Each subject twice: once against the broker, once through
+        # examples/proxy.rs, both enforced against the same baseline. The
+        # second pass is what keeps the protocol crate's proxy guarantee
+        # honest — a dropped tagged field or a re-encoded batch makes some
+        # check answer differently than the broker behind it.
+        #
         # ~850MB of images, otherwise pulled implicitly by the first
         # `docker run` — that is, only once the build is over. Start both
         # pulls first so they overlap the compile. Nothing here depends on

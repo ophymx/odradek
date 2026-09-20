@@ -669,10 +669,39 @@ const OFFSET_FETCH_BATCHED: i16 = 8;
 /// From v10 both offset APIs address topics by id instead of by name —
 /// the same migration Produce and Fetch made at v13.
 const OFFSETS_BY_TOPIC_ID: i16 = 10;
-/// The group this suite commits under. Named per run so a rerun against a
-/// live cluster never reads a previous run's commits.
-fn check_group(topic: &str) -> String {
-    format!("{topic}-odradek-acceptance")
+/// The group this suite commits under, stamped with [`run_id`] so a
+/// rerun against a live cluster never meets its own leavings.
+///
+/// It is not only stale *commits* that matter. A group whose members did
+/// not leave — because the check that made them was about fencing, or
+/// failed halfway — keeps them until the session times out, and the next
+/// run's JoinGroup then parks behind a rebalance waiting for members
+/// that will never rejoin. That parks for the rebalance timeout, which
+/// is far longer than any check's read deadline, so the whole thing
+/// surfaces as an infrastructure error rather than as anything about the
+/// broker. Fresh names per run cost nothing and make the failure
+/// impossible; per-check cleanup could not, since the checks that most
+/// need it are the ones that end badly.
+fn check_group(tag: &str) -> String {
+    format!("{tag}-odradek-acceptance-{}", run_id())
+}
+
+/// A string distinguishing this process from every other run of the
+/// suite, for naming things a broker keeps.
+///
+/// Process id alone is not enough — they are reused, and a container
+/// that starts the suite twice can plausibly see the same one — so it is
+/// paired with the clock at first use. Computed once, because names
+/// derived from it have to agree across the calls within a single check.
+fn run_id() -> &'static str {
+    static RUN_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RUN_ID.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("{}-{nanos}", std::process::id())
+    })
 }
 
 /// Ask for one partition's offset at `timestamp`.
@@ -3208,6 +3237,10 @@ fn retriable(code: ErrorCode) -> bool {
 }
 
 /// A topic name unique enough to never collide across runs or checks.
+///
+/// Stamped per call rather than per [`run_id`]: two checks can share a
+/// tag, and a topic one of them deleted is not one the other should be
+/// handed.
 fn unique_topic(tag: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
