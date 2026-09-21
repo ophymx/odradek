@@ -14,6 +14,8 @@ leadership moves).
 odradek-accept --list
 # validate a server
 odradek-accept --server localhost:9092 [--json]
+# ... one that will not answer an anonymous caller
+odradek-accept --server localhost:9092 --authenticate user:password
 # validate a client: listen, point its bootstrap here
 odradek-accept --client-listen 127.0.0.1:19092
 # record / enforce expected results per implementation
@@ -282,8 +284,9 @@ must not end up outside the transaction, by either route.
 
 ## What the baselines record
 
-Four subjects: Apache Kafka 4.1 and Redpanda 25.2, each as a single
-broker and again as a three-node cluster.
+Five subjects: Apache Kafka 4.1 and Redpanda 25.2, each as a single
+broker and again as a three-node cluster, plus Redpanda with SASL
+required on every connection.
 
 The matrix overlaps by *brokers* rather than by subjects. Eight at once
 on a two-core runner is enough load to make a broker take seconds over
@@ -310,14 +313,17 @@ topology ones, recorded rather than scored:
   company rather than agreeing.
 - Mechanism negotiation cannot be observed from a listener with no SASL
   configured: every SASL request there is `ILLEGAL_SASL_STATE`, which is
-  correct rather than nonconformant. The harness therefore gives Kafka a
-  second, SASL-configured listener and passes it with `--sasl-server`.
-  Redpanda deliberately gets none: its SASL is switched on cluster-wide,
-  and once it is, the listener configured for no authentication starts
-  refusing anonymous callers, taking 13 unrelated checks down with it.
-  Kafka scopes SASL per listener and has no such coupling. So that check
-  passes on Kafka and skips on Redpanda, and the skip reason says which
-  of the two situations it is.
+  correct rather than nonconformant. Kafka scopes SASL to a listener, so
+  that subject gets a second one and `--sasl-server` points at it while
+  everything else uses the plaintext one. Redpanda switches SASL on for
+  the whole cluster, so there is no plaintext listener to fall back to —
+  which is why it gets a subject of its own where the suite
+  authenticates *every* connection, and where the `sasl/*` checks point
+  at the same listener as everything else.
+
+  That subject is the only one that exercises the suite against a broker
+  which will not answer an anonymous caller at all — which is how
+  brokers are actually run, and which the suite could not do before.
 
 ## The `cluster/*` checks
 

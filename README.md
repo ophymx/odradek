@@ -107,7 +107,8 @@ Early but functional end to end:
   `cargo xtask conformance` runs them against Apache Kafka and Redpanda
   in Docker — each as a single broker and as a three-node cluster, where
   leadership, coordination and failing over are things a suite can
-  actually ask about — and enforces the baselines committed in
+  actually ask about, plus one that refuses anonymous callers entirely —
+  and enforces the baselines committed in
   [`conformance/`](conformance/). See the
   [crate README](crates/odradek-acceptance) for what is covered, how
   calibration works, and what the baselines currently record.

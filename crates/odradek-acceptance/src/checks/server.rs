@@ -527,6 +527,43 @@ pub struct Broker<'a> {
     pub addr: &'a str,
 }
 
+/// Credentials the suite authenticates every connection with.
+///
+/// Only SCRAM, and only because that is what a conformance run needs:
+/// PLAIN would put a password on a plaintext socket, and the mechanisms
+/// that involve a token service are not something a suite can stand up
+/// for itself.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ScramLogin {
+    /// The mechanism name as it goes on the wire, e.g.
+    /// `SCRAM-SHA-256`.
+    pub mechanism: String,
+    pub user: String,
+    pub password: String,
+}
+
+impl ScramLogin {
+    /// `SCRAM-SHA-256` with the given credentials.
+    pub fn scram_sha_256(user: &str, password: &str) -> ScramLogin {
+        ScramLogin {
+            mechanism: SCRAM_MECHANISM.to_owned(),
+            user: user.to_owned(),
+            password: password.to_owned(),
+        }
+    }
+
+    fn mechanism_kind(&self) -> Result<odradek_sasl::Mechanism, CheckError> {
+        match self.mechanism.as_str() {
+            "SCRAM-SHA-256" => Ok(odradek_sasl::Mechanism::ScramSha256),
+            "SCRAM-SHA-512" => Ok(odradek_sasl::Mechanism::ScramSha512),
+            other => Err(CheckError::Infra(format!(
+                "the suite authenticates with SCRAM only, not {other}"
+            ))),
+        }
+    }
+}
+
 /// Limits for one server-side run.
 ///
 /// The settle budget is the only knob that costs wall-clock time: a
@@ -558,6 +595,9 @@ pub struct ProbeConfig {
     /// How to stop and start the subject's brokers. Without one, the
     /// checks that need a broker to fail skip.
     pub control: Option<std::sync::Arc<dyn ClusterControl>>,
+    /// Credentials to authenticate every connection with, for a subject
+    /// that will not answer otherwise.
+    pub credentials: Option<ScramLogin>,
     /// How long to let a cluster notice a broker has gone and finish
     /// electing around it.
     ///
@@ -576,6 +616,7 @@ impl Default for ProbeConfig {
             settle_budget: Duration::from_secs(20),
             settle_delay: Duration::from_millis(100),
             control: None,
+            credentials: None,
             recovery_budget: Duration::from_secs(60),
         }
     }
@@ -697,6 +738,156 @@ async fn connect(addr: &str) -> Result<RawConnection, CheckError> {
     RawConnection::connect(addr)
         .await
         .map_err(|e| CheckError::Infra(format!("connect {addr}: {e}")))
+}
+
+/// A connection ready to carry ordinary requests: connected, and
+/// authenticated first when the run was given credentials.
+///
+/// Every check but the `sasl/*` ones opens its connections this way.
+/// Those few use [`connect`] directly, because the exchange this
+/// performs is the thing they are there to examine.
+///
+/// A listener that demands SASL refuses everything else until it has
+/// had it, so without this the suite could only ever validate
+/// unauthenticated brokers — which is not how anybody runs one. It also
+/// makes the difference between a *listener* that requires
+/// authentication and a *cluster* that does: Kafka scopes SASL to the
+/// listener, so the suite can use a plaintext one for everything and a
+/// second for the `sasl/*` checks. Redpanda switches it on cluster-wide,
+/// and there is no plaintext listener left to fall back to.
+async fn open(ctx: &ServerCtx, addr: &str) -> Result<RawConnection, CheckError> {
+    let mut conn = connect(addr).await?;
+    if let Some(login) = &ctx.config.credentials {
+        authenticate(ctx, &mut conn, login).await?;
+    }
+    Ok(conn)
+}
+
+/// Drive a SCRAM exchange to completion on a fresh connection.
+///
+/// Uses `odradek-sasl`, which is the same code the client crate uses and
+/// is checked against the RFC 7677 vectors; a suite that reimplemented
+/// the arithmetic here would be testing it against itself.
+async fn authenticate(
+    ctx: &ServerCtx,
+    conn: &mut RawConnection,
+    login: &ScramLogin,
+) -> Result<(), CheckError> {
+    let handshake_version = negotiate_versionless(
+        ctx,
+        SaslHandshakeRequest::API_KEY,
+        SaslHandshakeRequest::MIN_VERSION,
+        SaslHandshakeRequest::MAX_VERSION,
+    )?;
+    let auth_version = negotiate_versionless(
+        ctx,
+        SaslAuthenticateRequest::API_KEY,
+        SaslAuthenticateRequest::MIN_VERSION,
+        SaslAuthenticateRequest::MAX_VERSION,
+    )?;
+
+    let mut handshake = SaslHandshakeRequest::default();
+    handshake.mechanism = login.mechanism.to_owned();
+    let mut body = BytesMut::new();
+    handshake
+        .encode(&mut body, handshake_version)
+        .map_err(|e| CheckError::Infra(format!("encoding SaslHandshake: {e}")))?;
+    let resp: SaslHandshakeResponse = api_call(
+        conn,
+        SaslHandshakeRequest::API_KEY,
+        handshake_version,
+        1_900,
+        &body,
+    )
+    .await?;
+    let code = ErrorCode(resp.error_code);
+    if !code.is_ok() {
+        return Err(CheckError::Infra(format!(
+            "the subject refused mechanism {} ({code}); it offers {:?}",
+            login.mechanism, resp.mechanisms
+        )));
+    }
+
+    let mut client = odradek_sasl::ScramClient::new(
+        login.mechanism_kind()?,
+        &login.user,
+        &login.password,
+        odradek_sasl::Limits::default(),
+    )
+    .map_err(|e| CheckError::Infra(format!("building a SCRAM client: {e}")))?;
+
+    let server_first =
+        scram_exchange(conn, auth_version, client.client_first().as_bytes(), 1_901).await?;
+    let client_final = client
+        .client_final(&server_first)
+        .map_err(|e| CheckError::Infra(format!("server-first is not usable: {e}")))?;
+    let server_final = scram_exchange(conn, auth_version, client_final.as_bytes(), 1_902).await?;
+    client
+        .verify_server_final(&server_final)
+        .map_err(|e| CheckError::Infra(format!("server signature does not verify: {e}")))
+}
+
+/// One SaslAuthenticate round trip, as a `CheckError` rather than a
+/// verdict — authenticating is plumbing for most checks, not the thing
+/// under test.
+async fn scram_exchange(
+    conn: &mut RawConnection,
+    version: i16,
+    token: &[u8],
+    correlation_id: i32,
+) -> Result<String, CheckError> {
+    let mut request = SaslAuthenticateRequest::default();
+    request.auth_bytes = Bytes::copy_from_slice(token);
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding SaslAuthenticate: {e}")))?;
+    let resp: SaslAuthenticateResponse = api_call(
+        conn,
+        SaslAuthenticateRequest::API_KEY,
+        version,
+        correlation_id,
+        &body,
+    )
+    .await?;
+    let code = ErrorCode(resp.error_code);
+    if !code.is_ok() {
+        return Err(CheckError::Infra(format!(
+            "SCRAM exchange answered {code}{}",
+            resp.error_message
+                .as_deref()
+                .map(|m| format!(": {m}"))
+                .unwrap_or_default()
+        )));
+    }
+    String::from_utf8(resp.auth_bytes.to_vec())
+        .map_err(|e| CheckError::Infra(format!("SCRAM token is not utf-8: {e}")))
+}
+
+/// [`negotiate`] without the verdict: authentication happening at all is
+/// infrastructure, so a subject that cannot be authenticated has not
+/// failed a requirement, it has failed to be reachable.
+fn negotiate_versionless(
+    ctx: &ServerCtx,
+    api_key: i16,
+    min: i16,
+    max: i16,
+) -> Result<i16, CheckError> {
+    // A discovery failure and an unadvertised api come to the same
+    // thing here: no version to authenticate at.
+    let Some((advertised_min, advertised_max)) = ctx.range(api_key).unwrap_or_default() else {
+        return Err(CheckError::Infra(format!(
+            "credentials were given but the subject does not advertise api {api_key}"
+        )));
+    };
+    let version = advertised_max.min(max);
+    if version < advertised_min || version < min {
+        return Err(CheckError::Infra(format!(
+            "no usable version of api {api_key}: subject speaks \
+             {advertised_min}-{advertised_max}, authentication needs {min}-{max}"
+        )));
+    }
+    Ok(version)
 }
 
 /// Discovery and shared state for one server run: the subject's address
@@ -1027,7 +1218,7 @@ async fn find_coordinator_at(
     group: &str,
     correlation_base: i32,
 ) -> Verdict {
-    let mut conn = match connect(&ctx.addr).await {
+    let mut conn = match open(ctx, &ctx.addr).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
@@ -1169,7 +1360,7 @@ fn coordinator_endpoint(resp: &FindCoordinatorResponse, version: i16) -> Option<
 /// cluster says, rather than this helper inventing a verdict about it.
 async fn coordinator_conn(ctx: &ServerCtx, group: &str) -> Result<RawConnection, CheckError> {
     let addr = await_coordinator(ctx, group).await?;
-    connect(addr.as_deref().unwrap_or(&ctx.addr)).await
+    open(ctx, addr.as_deref().unwrap_or(&ctx.addr)).await
 }
 
 /// Wait for the group coordinator to exist, and say where it is.
@@ -1221,7 +1412,7 @@ async fn await_coordinator_at(
         .encode(&mut body, version)
         .map_err(|e| CheckError::Infra(format!("encoding FindCoordinator: {e}")))?;
 
-    let mut conn = connect(addr).await?;
+    let mut conn = open(ctx, addr).await?;
     for attempt in 0..ctx.config.settle_attempts() {
         if attempt > 0 {
             tokio::time::sleep(ctx.config.settle_delay).await;
@@ -2049,7 +2240,7 @@ async fn sasl_authenticate_requires_handshake(ctx: &ServerCtx) -> Verdict {
         Err(skip) => return skip,
     };
     // A fresh connection: nothing negotiated on it, by construction.
-    let mut conn = match connect(&ctx.addr).await {
+    let mut conn = match open(ctx, &ctx.addr).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
@@ -2963,7 +3154,7 @@ async fn metadata_unknown_topic(ctx: &ServerCtx) -> Verdict {
         Err(skip) => return skip,
     };
     let topic = unique_topic("nosuch");
-    let mut conn = match connect(&ctx.addr).await {
+    let mut conn = match open(ctx, &ctx.addr).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
@@ -3070,7 +3261,7 @@ async fn create_topics_duplicate(ctx: &ServerCtx) -> Verdict {
         Ok(v) => v,
         Err(skip) => return skip,
     };
-    let mut conn = match connect(&ctx.addr).await {
+    let mut conn = match open(ctx, &ctx.addr).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
@@ -3117,7 +3308,7 @@ async fn create_topics_validate_only(ctx: &ServerCtx) -> Verdict {
         Ok(v) => v,
         Err(skip) => return skip,
     };
-    let mut conn = match connect(&ctx.addr).await {
+    let mut conn = match open(ctx, &ctx.addr).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
@@ -3369,11 +3560,12 @@ fn negotiate(
 /// One Metadata exchange naming no topics, on a fresh connection, with
 /// the version-appropriate headers.
 async fn metadata_exchange(
+    ctx: &ServerCtx,
     addr: &str,
     version: i16,
     correlation_id: i32,
 ) -> Result<MetadataResponse, CheckError> {
-    let mut conn = connect(addr).await?;
+    let mut conn = open(ctx, addr).await?;
     let mut req = MetadataRequest::default();
     // An empty (non-null) topics array means "no topics" from v1 on;
     // the checks only negotiate v1+.
@@ -3406,7 +3598,7 @@ async fn metadata_basic(ctx: &ServerCtx) -> Verdict {
     };
     for (i, version) in versions.iter().copied().enumerate() {
         let correlation = 4 + i32::try_from(i).unwrap_or(0);
-        let resp = match metadata_exchange(&ctx.addr, version, correlation).await {
+        let resp = match metadata_exchange(ctx, &ctx.addr, version, correlation).await {
             Ok(resp) => resp,
             Err(e) => return e.into_verdict().at_version(version),
         };
@@ -3467,7 +3659,7 @@ async fn metadata_flexible_header(ctx: &ServerCtx) -> Verdict {
     // metadata_exchange decodes the response header at v1 for flexible
     // versions and demands the body consume every remaining byte, so a
     // v0-header response cannot pass undetected.
-    match metadata_exchange(&ctx.addr, version, 5).await {
+    match metadata_exchange(ctx, &ctx.addr, version, 5).await {
         Ok(_) => Verdict::Pass,
         Err(e) => e.into_verdict(),
     }
@@ -3613,7 +3805,9 @@ async fn produce_flow(
     // Failing to encode our own request means the check never ran.
     let infra = |details: String| Verdict::Error { details };
 
-    let mut bootstrap = connect(&ctx.addr).await.map_err(CheckError::into_verdict)?;
+    let mut bootstrap = open(ctx, &ctx.addr)
+        .await
+        .map_err(CheckError::into_verdict)?;
     let topic = unique_topic(tag);
 
     // Create the topic.
@@ -4178,10 +4372,10 @@ async fn init_producer_id(
     transactional_id: &str,
     correlation: i32,
 ) -> Result<(RawConnection, InitProducerIdResponse), CheckError> {
-    let mut bootstrap = connect(&ctx.addr).await?;
+    let mut bootstrap = open(ctx, &ctx.addr).await?;
     let located =
         await_txn_coordinator(ctx, &mut bootstrap, transactional_id, correlation - 1).await?;
-    let mut conn = connect(located.as_deref().unwrap_or(&ctx.addr)).await?;
+    let mut conn = open(ctx, located.as_deref().unwrap_or(&ctx.addr)).await?;
     let mut request = InitProducerIdRequest::default();
     request.transactional_id = Some(transactional_id.to_owned());
     request.transaction_timeout_ms = 60_000;
@@ -4206,7 +4400,7 @@ async fn init_producer_id(
                 await_txn_coordinator(ctx, &mut bootstrap, transactional_id, correlation - 1)
                     .await?
             {
-                conn = connect(&addr).await?;
+                conn = open(ctx, &addr).await?;
             }
         }
         let resp: InitProducerIdResponse = api_call(
@@ -5654,7 +5848,7 @@ async fn connect_to_controller(
     correlation: i32,
 ) -> Result<RawConnection, CheckError> {
     let located = controller_endpoint(bootstrap, version, correlation).await?;
-    connect(located.as_deref().unwrap_or(&ctx.addr)).await
+    open(ctx, located.as_deref().unwrap_or(&ctx.addr)).await
 }
 
 /// The same, negotiating Metadata for itself — for the callers that
@@ -5670,10 +5864,10 @@ async fn admin_conn(
     correlation: i32,
 ) -> Result<RawConnection, CheckError> {
     let Ok(range) = ctx.range(MetadataRequest::API_KEY) else {
-        return connect(&ctx.addr).await;
+        return open(ctx, &ctx.addr).await;
     };
     let Ok(version) = negotiate("Metadata", range, 1, MetadataRequest::MAX_VERSION) else {
-        return connect(&ctx.addr).await;
+        return open(ctx, &ctx.addr).await;
     };
     connect_to_controller(ctx, bootstrap, version, correlation).await
 }
@@ -5703,10 +5897,10 @@ async fn connect_to_leader(
         }
         let correlation = correlation_base + i32::try_from(attempt).unwrap_or(0);
         if let Some(addr) = leader_endpoint(bootstrap, version, topic, correlation).await? {
-            return connect(&addr).await;
+            return open(ctx, &addr).await;
         }
     }
-    connect(&ctx.addr).await
+    open(ctx, &ctx.addr).await
 }
 
 /// Commit metadata must come back exactly as it was given.
@@ -5889,7 +6083,7 @@ async fn create_topics_impossible_replication(ctx: &ServerCtx) -> Verdict {
         Ok(v) => v,
         Err(skip) => return skip,
     };
-    let mut conn = match connect(&ctx.addr).await {
+    let mut conn = match open(ctx, &ctx.addr).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
@@ -6524,7 +6718,7 @@ async fn produce_compressed_passthrough(ctx: &ServerCtx, codec: Codec) -> Verdic
         Err(skip) => return skip,
     };
 
-    let mut bootstrap = match connect(&ctx.addr).await {
+    let mut bootstrap = match open(ctx, &ctx.addr).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
@@ -7468,7 +7662,9 @@ async fn cluster_nodes(ctx: &ServerCtx) -> Result<Vec<ClusterNode>, Verdict> {
         1,
         MetadataRequest::MAX_VERSION,
     )?;
-    let mut conn = connect(&ctx.addr).await.map_err(CheckError::into_verdict)?;
+    let mut conn = open(ctx, &ctx.addr)
+        .await
+        .map_err(CheckError::into_verdict)?;
     let mut request = MetadataRequest::default();
     request.topics = Some(Vec::new());
     request.allow_auto_topic_creation = false;
@@ -7646,7 +7842,7 @@ async fn cluster_brokers_agree_on_the_leader(ctx: &ServerCtx) -> Verdict {
 
     let mut answers: Vec<(i32, i32)> = Vec::new();
     for (i, node) in nodes.iter().enumerate() {
-        let mut conn = match connect(&node.addr).await {
+        let mut conn = match open(ctx, &node.addr).await {
             Ok(c) => c,
             Err(e) => {
                 return e
@@ -7741,7 +7937,7 @@ async fn cluster_brokers_agree_on_the_coordinator(ctx: &ServerCtx) -> Verdict {
 
     let mut answers: Vec<(i32, String)> = Vec::new();
     for (i, node) in nodes.iter().enumerate() {
-        let mut conn = match connect(&node.addr).await {
+        let mut conn = match open(ctx, &node.addr).await {
             Ok(c) => c,
             Err(e) => {
                 return e
@@ -7836,7 +8032,7 @@ async fn cluster_replicas_span_brokers(ctx: &ServerCtx) -> Verdict {
     // replicas than brokers, a subject could satisfy this by accident.
     let wanted = i16::try_from(nodes.len()).unwrap_or(i16::MAX);
 
-    let mut conn = match connect(&ctx.addr).await {
+    let mut conn = match open(ctx, &ctx.addr).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
@@ -7995,7 +8191,7 @@ async fn cluster_writes_go_to_the_leader(ctx: &ServerCtx) -> Verdict {
         Err(verdict) => return verdict,
     };
 
-    let mut conn = match connect(&ctx.addr).await {
+    let mut conn = match open(ctx, &ctx.addr).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
@@ -8017,7 +8213,7 @@ async fn cluster_writes_go_to_the_leader(ctx: &ServerCtx) -> Verdict {
         };
     };
 
-    let mut conn = match connect(&other.addr).await {
+    let mut conn = match open(ctx, &other.addr).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
@@ -8099,7 +8295,7 @@ async fn cluster_group_offsets_need_the_coordinator(ctx: &ServerCtx) -> Verdict 
         };
     };
 
-    let mut conn = match connect(&other.addr).await {
+    let mut conn = match open(ctx, &other.addr).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
@@ -8261,7 +8457,7 @@ async fn cluster_leadership_moves_when_a_broker_stops(ctx: &ServerCtx) -> Verdic
     // no story here and the check would be about nothing.
     let topic = unique_topic("failover");
     let wanted = i16::try_from(nodes.len()).unwrap_or(1);
-    let mut bootstrap = match connect(&ctx.addr).await {
+    let mut bootstrap = match open(ctx, &ctx.addr).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
@@ -8303,7 +8499,7 @@ async fn cluster_leadership_moves_when_a_broker_stops(ctx: &ServerCtx) -> Verdic
         ctx,
         stopping,
         Box::pin(async {
-            let mut conn = match connect(&survivor_addr).await {
+            let mut conn = match open(ctx, &survivor_addr).await {
                 Ok(c) => c,
                 Err(e) => return e.context("connecting to a surviving broker").into_verdict(),
             };
@@ -8351,7 +8547,7 @@ async fn cluster_leadership_moves_when_a_broker_stops(ctx: &ServerCtx) -> Verdic
                     ),
                 };
             };
-            let mut leader_conn = match connect(&node.addr).await {
+            let mut leader_conn = match open(ctx, &node.addr).await {
                 Ok(c) => c,
                 Err(e) => return e.context("connecting to the new leader").into_verdict(),
             };
@@ -8454,7 +8650,7 @@ async fn cluster_committed_offsets_outlive_the_coordinator(ctx: &ServerCtx) -> V
 
     // A number nothing else would produce by accident.
     let committed = 23;
-    let mut conn = match connect(&coordinator).await {
+    let mut conn = match open(ctx, &coordinator).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
@@ -8486,7 +8682,7 @@ async fn cluster_committed_offsets_outlive_the_coordinator(ctx: &ServerCtx) -> V
         ctx,
         stopping,
         Box::pin(async {
-            let mut conn = match connect(&survivor_addr).await {
+            let mut conn = match open(ctx, &survivor_addr).await {
                 Ok(c) => c,
                 Err(e) => return e.context("connecting to a surviving broker").into_verdict(),
             };
@@ -8518,7 +8714,7 @@ async fn cluster_committed_offsets_outlive_the_coordinator(ctx: &ServerCtx) -> V
                     ),
                 };
             };
-            if let Ok(reconnected) = connect(&addr).await {
+            if let Ok(reconnected) = open(ctx, &addr).await {
                 conn = reconnected;
             }
             // A coordinator that has just taken the group over has to
@@ -8630,7 +8826,7 @@ async fn versions_advertised_are_speakable(ctx: &ServerCtx) -> Verdict {
             // version by closing the connection would otherwise condemn
             // every version after it, and the report would say thirteen
             // versions are unspeakable when one is.
-            let mut conn = match connect(&produced.addr).await {
+            let mut conn = match open(ctx, &produced.addr).await {
                 Ok(c) => c,
                 Err(e) => return e.into_verdict(),
             };
@@ -8664,7 +8860,7 @@ async fn versions_advertised_are_speakable(ctx: &ServerCtx) -> Verdict {
         ) {
             for version in &versions {
                 let correlation = 1_640 + i32::from(*version);
-                let mut conn = match connect(&produced.addr).await {
+                let mut conn = match open(ctx, &produced.addr).await {
                     Ok(c) => c,
                     Err(e) => return e.into_verdict(),
                 };
@@ -8718,7 +8914,7 @@ async fn versions_advertised_are_speakable(ctx: &ServerCtx) -> Verdict {
         CreateTopicsRequest::MAX_VERSION,
     ) {
         for version in &versions {
-            let mut conn = match connect(&ctx.addr).await {
+            let mut conn = match open(ctx, &ctx.addr).await {
                 Ok(c) => c,
                 Err(e) => return e.into_verdict(),
             };

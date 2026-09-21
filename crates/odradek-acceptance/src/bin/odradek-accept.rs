@@ -32,6 +32,9 @@ fn usage() -> ExitCode {
     eprintln!(
         "usage: odradek-accept (--server <host:port> | --client-listen <host:port> | --list)\n\
          \x20 [--sasl-server <host:port>]  a second listener with SASL configured\n\
+         \x20 [--authenticate <user>:<password>]  authenticate every\n\
+         \x20                    connection with SCRAM-SHA-256, for a subject\n\
+         \x20                    that will not answer otherwise\n\
          \x20 [--cluster-control <cmd>]    how to stop and start a broker: run\n\
          \x20                    as `<cmd> <stop|start> <node-id> <host:port>`.\n\
          \x20                    Both names are given because not every\n\
@@ -53,6 +56,7 @@ struct Args {
     server: Option<String>,
     sasl_server: Option<String>,
     cluster_control: Option<String>,
+    authenticate: Option<String>,
     client_listen: Option<String>,
     list: bool,
     fault: Option<checks::client::HarnessFault>,
@@ -66,6 +70,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         server: None,
         sasl_server: None,
         cluster_control: None,
+        authenticate: None,
         client_listen: None,
         list: false,
         fault: None,
@@ -79,6 +84,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
             "--server" => parsed.server = Some(it.next()?.clone()),
             "--sasl-server" => parsed.sasl_server = Some(it.next()?.clone()),
             "--cluster-control" => parsed.cluster_control = Some(it.next()?.clone()),
+            "--authenticate" => parsed.authenticate = Some(it.next()?.clone()),
             "--client-listen" => parsed.client_listen = Some(it.next()?.clone()),
             "--list" => parsed.list = true,
             "--fault" => {
@@ -105,6 +111,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
             && parsed.client_listen.is_none()
             && parsed.fault.is_none()
             && parsed.cluster_control.is_none()
+            && parsed.authenticate.is_none()
             && !parsed.json
             && parsed.baseline.is_none()
             && parsed.write_baseline.is_none();
@@ -148,6 +155,15 @@ async fn main() -> ExitCode {
                 })
             },
         );
+        if let Some(login) = &args.authenticate {
+            // Split on the first colon: a password may contain one, a
+            // username may not.
+            let Some((user, password)) = login.split_once(':') else {
+                eprintln!("--authenticate wants <user>:<password>");
+                return ExitCode::from(2);
+            };
+            config.credentials = Some(checks::server::ScramLogin::scram_sha_256(user, password));
+        }
         checks::server::run_with_sasl(addr, args.sasl_server.as_deref(), &config).await
     } else {
         let addr = args.client_listen.as_deref().unwrap();

@@ -109,6 +109,10 @@ struct Subject {
     /// Whether this subject serves a second, SASL-configured listener on
     /// 9094. Without one the `sasl/*` checks that need it skip.
     sasl_listener: bool,
+    /// Whether the subject's *own* listener demands authentication, so
+    /// the suite must authenticate every connection rather than only
+    /// the ones the `sasl/*` checks make.
+    authenticated: bool,
     /// Commands to run inside the container once it is ready, before the
     /// suite starts — for state that cannot be configured at boot.
     provision: &'static [&'static [&'static str]],
@@ -169,6 +173,7 @@ const SUBJECTS: &[Subject] = &[
             "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1",
         ],
         sasl_listener: true,
+        authenticated: false,
         nodes: 1,
         // SCRAM credentials live in the metadata log, so they are added
         // after the broker is up rather than configured into it.
@@ -216,6 +221,7 @@ const SUBJECTS: &[Subject] = &[
             // this configuration can be asked.
         ],
         sasl_listener: false,
+        authenticated: false,
         nodes: 1,
         provision: &[],
     },
@@ -277,6 +283,7 @@ const SUBJECTS: &[Subject] = &[
             "KAFKA_HEAP_OPTS=-Xmx512m -Xms256m",
         ],
         sasl_listener: false,
+        authenticated: false,
         nodes: 3,
         provision: &[],
     },
@@ -324,8 +331,64 @@ const SUBJECTS: &[Subject] = &[
             "redpanda.internal_topic_replication_factor=3",
         ],
         sasl_listener: false,
+        authenticated: false,
         nodes: 3,
         provision: &[],
+    },
+    Subject {
+        // Redpanda with SASL on, which for Redpanda means on for the
+        // whole cluster rather than for one listener. That is the
+        // difference this subject exists to cover: Kafka scopes SASL to
+        // a listener, so the suite can keep a plaintext one for the
+        // other checks and point `--sasl-server` at a second; Redpanda
+        // has no plaintext listener left to fall back to, and every
+        // connection the suite makes has to authenticate.
+        //
+        // Which is how anybody actually runs a broker. Until this, the
+        // suite could only validate one that lets anyone in.
+        name: "redpanda-25.2.1-sasl",
+        image: "redpandadata/redpanda:v25.2.1",
+        run_args: &[
+            "--",
+            "redpanda",
+            "start",
+            "--mode",
+            "dev-container",
+            "--smp",
+            "1",
+            "--kafka-addr",
+            "SASL://0.0.0.0:9092",
+            "--advertise-kafka-addr",
+            "SASL://127.0.0.1:{port}",
+            "--set",
+            "redpanda.enable_sasl=true",
+            // The listener has to say it authenticates, or SASL is on
+            // cluster-wide and this listener still lets anyone in.
+            "--set",
+            "redpanda.kafka_api[0].authentication_method=sasl",
+            // Without a superuser the credentials authenticate and then
+            // are allowed to do nothing, and every check fails on
+            // authorization rather than on anything it meant to ask.
+            "--set",
+            "redpanda.superusers=[conformance]",
+        ],
+        sasl_listener: false,
+        authenticated: true,
+        nodes: 1,
+        // The user is created through the admin api once the broker is
+        // up: it lives in the cluster's own state, not in its config.
+        provision: &[&[
+            "curl",
+            "-sS",
+            "--fail",
+            "-X",
+            "POST",
+            "http://localhost:9644/v1/security/users",
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            "{\"username\":\"conformance\",\"password\":\"conformance\",\"algorithm\":\"SCRAM-SHA-256\"}",
+        ]],
     },
 ];
 
@@ -549,9 +612,17 @@ fn run_subject(
     // The suite is pointed at one node and finds the rest through
     // Metadata, which is the only way a client could find them either.
     let addr = cluster.bootstrap().to_owned();
-    let sasl_addr = subject
-        .sasl_listener
-        .then(|| format!("127.0.0.1:{sasl_port}"));
+    // Where the `sasl/*` checks go to ask about mechanisms. Kafka gets
+    // a second listener for it; a subject whose own listener demands
+    // SASL *is* that listener, and pointing them at it is what turns
+    // four skips into four answers.
+    let sasl_addr = if subject.sasl_listener {
+        Some(format!("127.0.0.1:{sasl_port}"))
+    } else if subject.authenticated {
+        Some(addr.clone())
+    } else {
+        None
+    };
 
     // Every node, not just the bootstrap: a partition led by a broker
     // that is not up yet is a check failing on the harness's impatience.
@@ -575,15 +646,17 @@ fn run_subject(
     let control = (subject.nodes > 1)
         .then(|| cluster.control_command())
         .transpose()?;
-    let direct = run_accept(
-        accept,
-        &addr,
-        sasl_addr.as_deref(),
-        control.as_deref(),
-        &baseline,
-        record,
-        log,
-    )?;
+    // The credentials the suite authenticates with are the ones the
+    // subject was provisioned with; a conformance run brings its own
+    // account rather than borrowing somebody's.
+    let authenticate = subject.authenticated.then_some("conformance:conformance");
+    let target = Target {
+        addr: &addr,
+        sasl_addr: sasl_addr.as_deref(),
+        control: control.as_deref(),
+        authenticate,
+    };
+    let direct = run_accept(accept, &target, &baseline, record, log)?;
     if !direct {
         // In record mode the accept run may exit non-zero because the
         // subject deviates; the point of recording is to capture exactly
@@ -609,15 +682,7 @@ fn run_subject(
     // cluster properly needs a listener per broker, which is a different
     // example than the one this is a witness for.
     match (proxy, subject.nodes) {
-        (Some(proxy), 1) => proxy_pass(
-            subject,
-            accept,
-            proxy,
-            &addr,
-            sasl_addr.as_deref(),
-            &baseline,
-            log,
-        )?,
+        (Some(proxy), 1) => proxy_pass(subject, accept, proxy, &target, &baseline, log)?,
         (Some(_), _) => {
             let _ = writeln!(
                 log,
@@ -650,16 +715,18 @@ fn proxy_pass(
     subject: &Subject,
     accept: &Path,
     proxy: &Path,
-    addr: &str,
-    sasl_addr: Option<&str>,
+    target: &Target<'_>,
     baseline: &Path,
     log: &mut String,
 ) -> Result<()> {
-    let front = Proxy::start(proxy, addr)?;
+    let front = Proxy::start(proxy, target.addr)?;
     // A second instance for the SASL listener: the proxy forwards SASL
     // frames without parsing them, but it only has one upstream, and
     // the two listeners are different upstreams.
-    let sasl_front = sasl_addr.map(|a| Proxy::start(proxy, a)).transpose()?;
+    let sasl_front = target
+        .sasl_addr
+        .map(|a| Proxy::start(proxy, a))
+        .transpose()?;
 
     if let Err(e) = wait_ready(front.addr()) {
         front.dump_logs(log);
@@ -668,21 +735,20 @@ fn proxy_pass(
 
     let _ = writeln!(
         log,
-        "--- {} through the proxy ({} -> {addr}) ---",
+        "--- {} through the proxy ({} -> {}) ---",
         subject.name,
-        front.addr()
-    );
-    let matched = run_accept(
-        accept,
         front.addr(),
-        sasl_front.as_ref().map(Proxy::addr),
+        target.addr
+    );
+    let proxied = Target {
+        addr: front.addr(),
+        sasl_addr: sasl_front.as_ref().map(Proxy::addr),
         // No control through the proxy: the proxied pass only runs for
         // single-node subjects, which have no failover to watch.
-        None,
-        baseline,
-        false,
-        log,
-    )?;
+        control: None,
+        authenticate: target.authenticate,
+    };
+    let matched = run_accept(accept, &proxied, baseline, false, log)?;
     if !matched {
         front.dump_logs(log);
         if let Some(sasl_front) = &sasl_front {
@@ -699,22 +765,36 @@ fn proxy_pass(
 
 /// One `odradek-accept --server` run. `Ok(false)` means it ran and the
 /// subject did not satisfy the baseline; `Err` means it could not run.
+/// Everything the accept binary needs in order to reach one subject.
+struct Target<'a> {
+    addr: &'a str,
+    /// A second listener with SASL configured, for the `sasl/*` checks
+    /// that need somewhere to ask about mechanisms.
+    sasl_addr: Option<&'a str>,
+    /// How to stop and start a broker, for the recovery checks.
+    control: Option<&'a str>,
+    /// Credentials, when the subject's own listener will not answer
+    /// without them.
+    authenticate: Option<&'a str>,
+}
+
 fn run_accept(
     accept: &Path,
-    addr: &str,
-    sasl_addr: Option<&str>,
-    control: Option<&str>,
+    target: &Target<'_>,
     baseline: &Path,
     record: bool,
     log: &mut String,
 ) -> Result<bool> {
     let mut cmd = Command::new(accept);
-    cmd.args(["--server", addr]);
-    if let Some(sasl_addr) = sasl_addr {
+    cmd.args(["--server", target.addr]);
+    if let Some(sasl_addr) = target.sasl_addr {
         cmd.args(["--sasl-server", sasl_addr]);
     }
-    if let Some(control) = control {
+    if let Some(control) = target.control {
         cmd.args(["--cluster-control", control]);
+    }
+    if let Some(login) = target.authenticate {
+        cmd.args(["--authenticate", login]);
     }
     if record {
         cmd.args(["--write-baseline".as_ref(), baseline.as_os_str()]);
