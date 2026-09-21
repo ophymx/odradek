@@ -2571,6 +2571,20 @@ fn produce_exchange(
     )
 }
 
+/// The topic a fetch names, however it names it: v13+ addresses by id
+/// and leaves the name empty, earlier versions do the reverse.
+///
+/// One place, because the satisfiability question and the response have
+/// to agree about which log is being asked for — disagree and the poll
+/// waits out records it is about to serve.
+fn resolve_topic(state: &ClusterState, name: String, topic_id: &[u8; 16]) -> Option<String> {
+    if name.is_empty() {
+        state.topic_names.get(topic_id).cloned()
+    } else {
+        Some(name)
+    }
+}
+
 async fn fetch_exchange(
     mut frame: Bytes,
     api_version: i16,
@@ -2594,14 +2608,23 @@ async fn fetch_exchange(
     // deadlock — and dropping it is also what makes the wait mean
     // something: the response is built from the log as it stands
     // *after* the poll, so a record that arrives during it is served.
+    //
+    // Addressed by id or by name, and resolved the same way here as in
+    // the response below: a v13+ request carries an empty name, so
+    // asking the log by name alone answers "nothing there" for every
+    // id-addressed fetch and waits out a poll over records already
+    // written.
     let satisfiable = {
         let state = cluster.lock().unwrap();
         request.min_bytes <= 0
             || request.topics.iter().any(|topic| {
+                let Some(name) = resolve_topic(&state, topic.topic.clone(), &topic.topic_id) else {
+                    return false;
+                };
                 topic.partitions.iter().any(|p| {
                     state
                         .logs
-                        .get(&(topic.topic.clone(), p.partition))
+                        .get(&(name.clone(), p.partition))
                         .is_some_and(|log| p.fetch_offset < log.next_offset)
                 })
             })
@@ -2616,12 +2639,7 @@ async fn fetch_exchange(
         .topics
         .iter()
         .map(|topic| {
-            // v13+ addresses by id; earlier versions by name.
-            let resolved = if topic.topic.is_empty() {
-                state.topic_names.get(&topic.topic_id).cloned()
-            } else {
-                Some(topic.topic.clone())
-            };
+            let resolved = resolve_topic(state, topic.topic.clone(), &topic.topic_id);
             let mut echoed_id = topic.topic_id;
             if faults.contains(&Fault::FetchWrongTopicId) {
                 echoed_id[0] ^= 0x80;

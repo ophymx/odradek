@@ -12,6 +12,27 @@ use odradek_acceptance::report::{BaselineDiff, BaselineStatus, FORMAT, Report};
 use odradek_acceptance::subject::{Fault, SubjectServer};
 use odradek_acceptance::{SubjectRole, Verdict};
 
+/// The whole catalog against a subject.
+async fn run(subject: &SubjectServer) -> Report {
+    run_at(subject.addr(), Some(subject.control())).await
+}
+
+/// The same, narrowed to a single catalogued check.
+async fn run_only(subject: &SubjectServer, id: &str) -> Report {
+    let addr = subject.addr();
+    server::run_ids(addr, Some(addr), &probe(Some(subject.control())), &[id]).await
+}
+
+/// The same, by address — for the test that has no subject to speak of.
+///
+/// The reference subject speaks SASL on its only listener, so it is its
+/// own SASL address — here and in [`run_only`]. A real broker needs two,
+/// because a listener without SASL cannot answer a question about
+/// mechanisms.
+async fn run_at(addr: &str, control: Option<std::sync::Arc<dyn server::ClusterControl>>) -> Report {
+    server::run_with_sasl(addr, Some(addr), &probe(control)).await
+}
+
 /// Every subject here is in-process and answers instantly, so the default
 /// settle budget — five seconds, right for a real broker electing a
 /// leader for a fresh topic — is pure latency. Worse, a fault that answers
@@ -19,12 +40,7 @@ use odradek_acceptance::{SubjectRole, Verdict};
 /// burns the whole budget before reaching the correct verdict. Three
 /// tenths of a second is still an order of magnitude more than these
 /// subjects ever need.
-async fn run(subject: &SubjectServer) -> Report {
-    run_at(subject.addr(), Some(subject.control())).await
-}
-
-/// The same, by address — for the test that has no subject to speak of.
-async fn run_at(addr: &str, control: Option<std::sync::Arc<dyn server::ClusterControl>>) -> Report {
+fn probe(control: Option<std::sync::Arc<dyn server::ClusterControl>>) -> ProbeConfig {
     let mut config = ProbeConfig::default();
     config.settle_budget = Duration::from_millis(300);
     // Failing over costs a real cluster seconds of failure detection and
@@ -36,10 +52,7 @@ async fn run_at(addr: &str, control: Option<std::sync::Arc<dyn server::ClusterCo
     // in-process — but the checks cannot tell, which is the point of
     // taking one rather than assuming how to stop a broker.
     config.control = control;
-    // The reference subject speaks SASL on its only listener, so it is
-    // its own SASL address. A real broker needs two, because a listener
-    // without SASL cannot answer a question about mechanisms.
-    server::run_with_sasl(addr, Some(addr), &config).await
+    config
 }
 
 fn server_check_ids() -> Vec<&'static str> {
@@ -303,11 +316,20 @@ fn every_check_has_a_fault_and_every_fault_a_check() {
     }
 }
 
+/// One subject per fault, and only the check that claims to detect it.
+///
+/// Running the whole catalog here would say nothing this does not: every
+/// check opens its own connection and makes its own topics, so a check's
+/// verdict does not depend on what ran before it, and the assertion below
+/// reads one verdict out of seventy either way. Whether a fault disturbs
+/// the other sixty-nine is a separate question, asked by
+/// [`isolated_faults_cause_no_collateral_failures`] of the faults for
+/// which it has an answer.
 #[tokio::test]
 async fn each_fault_trips_its_targeted_check() {
     for &(fault, target) in SENSITIVITY {
         let subject = SubjectServer::spawn(vec![fault]).await.unwrap();
-        let report = run(&subject).await;
+        let report = run_only(&subject, target).await;
         assert!(
             matches!(report.verdict(target), Some(Verdict::Fail { .. })),
             "fault {fault:?} was not detected by {target}:\n{report}"

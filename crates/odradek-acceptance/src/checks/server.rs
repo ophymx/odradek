@@ -657,20 +657,77 @@ pub async fn run(addr: &str) -> Report {
 /// SASL address, the checks that need one use it; without, they skip and
 /// say why.
 pub async fn run_with_sasl(addr: &str, sasl_addr: Option<&str>, config: &ProbeConfig) -> Report {
-    let mut ctx = ServerCtx::discover(addr, config.clone()).await;
-    ctx.sasl_addr = sasl_addr.map(str::to_owned);
-    run_ctx(ctx).await
+    run_ctx(
+        discover_with_sasl(addr, sasl_addr, config).await,
+        &Selection::All,
+    )
+    .await
 }
 
 /// Run the catalogued Server-role checks against `addr` under `config`.
 pub async fn run_with(addr: &str, config: &ProbeConfig) -> Report {
-    run_ctx(ServerCtx::discover(addr, config.clone()).await).await
+    run_ctx(
+        ServerCtx::discover(addr, config.clone()).await,
+        &Selection::All,
+    )
+    .await
 }
 
-async fn run_ctx(ctx: ServerCtx) -> Report {
+/// Run only the catalogued Server-role checks named in `ids`, in catalog
+/// order, and report on exactly those.
+///
+/// Same engine, same context, same report as [`run_with_sasl`] — only the
+/// selection differs, because every check opens its own connection and
+/// creates whatever topics, groups and transactions it needs, so running
+/// one says the same thing about the subject as running it among seventy.
+/// That is what makes this safe to use for the fault-injection
+/// calibration, where a run exists to observe a single check and paying
+/// for the other seventy is the whole cost of the suite.
+///
+/// An id no catalogued check answers to contributes no outcome; the
+/// report names what actually ran.
+pub async fn run_ids(
+    addr: &str,
+    sasl_addr: Option<&str>,
+    config: &ProbeConfig,
+    ids: &[&str],
+) -> Report {
+    run_ctx(
+        discover_with_sasl(addr, sasl_addr, config).await,
+        &Selection::Ids(ids),
+    )
+    .await
+}
+
+async fn discover_with_sasl(
+    addr: &str,
+    sasl_addr: Option<&str>,
+    config: &ProbeConfig,
+) -> ServerCtx {
+    let mut ctx = ServerCtx::discover(addr, config.clone()).await;
+    ctx.sasl_addr = sasl_addr.map(str::to_owned);
+    ctx
+}
+
+/// Which catalogued checks a run executes.
+enum Selection<'a> {
+    All,
+    Ids(&'a [&'a str]),
+}
+
+impl Selection<'_> {
+    fn includes(&self, check: &Check) -> bool {
+        match self {
+            Selection::All => true,
+            Selection::Ids(ids) => ids.contains(&check.id),
+        }
+    }
+}
+
+async fn run_ctx(ctx: ServerCtx, selection: &Selection<'_>) -> Report {
     let mut outcomes = Vec::new();
     for check in crate::checks::catalog() {
-        if check.role() != SubjectRole::Server {
+        if check.role() != SubjectRole::Server || !selection.includes(check) {
             continue;
         }
         let Runner::Server(runner) = check.runner else {
@@ -6630,8 +6687,9 @@ async fn fetch_long_poll_contract(ctx: &ServerCtx) -> Verdict {
     // to wait for one.
     // Long enough that a broker which does not wait at all is
     // unmistakable — those answer in microseconds — and short enough
-    // that the fault matrix, which runs the whole catalogue once per
-    // fault, does not pay a second for it every time.
+    // that this wait, which every run of the catalogue pays in full
+    // because there is nothing else to do with the time, stays the
+    // largest single cost of a run rather than the whole of it.
     let wait_ms = 500;
     let started = std::time::Instant::now();
     if let Err(e) = fetch_with_wait(&mut conn, version, &topic, end, 1, wait_ms, 890).await {
