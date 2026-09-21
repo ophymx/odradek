@@ -284,9 +284,10 @@ must not end up outside the transaction, by either route.
 
 ## What the baselines record
 
-Five subjects: Apache Kafka 4.1 and Redpanda 25.2, each as a single
+Six subjects: Apache Kafka 4.1 and Redpanda 25.2, each as a single
 broker and again as a three-node cluster, plus Redpanda with SASL
-required on every connection.
+required on every connection, plus Apache Kafka 3.7 for the versions
+the others never reach.
 
 The matrix overlaps by *brokers* rather than by subjects. Eight at once
 on a two-core runner is enough load to make a broker take seconds over
@@ -311,6 +312,29 @@ topology ones, recorded rather than scored:
 - Redpanda 25.2 does not implement KIP-848 at all: those four checks
   skip, which is the one place the two implementations genuinely part
   company rather than agreeing.
+- Apache Kafka 3.7 is in the matrix for the *lower* half of every
+  version range. Kafka 4.0 raised the minimum api version it accepts
+  on most apis, so against a 4.x subject the suite can only ever
+  negotiate the modern half; 3.7 still offers the old half. It differs
+  from the 4.1 subject by exactly five checks, and each difference is
+  a fact about 3.7 rather than a defect:
+
+  - `produce/topic-id` skips, because addressing a produce by topic id
+    arrives above 3.7's ceiling of Produce v10.
+  - The four KIP-848 checks skip. 3.7 shipped that protocol as early
+    access, off by default, and *advertises* ConsumerGroupHeartbeat
+    while the coordinator answers `UNSUPPORTED_VERSION` to every call.
+    Whether advertising an api one refuses is itself a defect is a
+    genuine argument — the Java client probes and falls back on
+    exactly that code, so the behaviour is at least intended — and
+    this is a regression suite, not a certification body. What is not
+    arguable is that there is no member to observe, and that four
+    checks each failing would report one fact four times.
+
+  Its proxied pass matters more than its direct one: every other
+  subject exercises the proxy at 4.x versions only, so the
+  byte-identical round-trip had never been witnessed on the older
+  encodings until this subject existed.
 - Mechanism negotiation cannot be observed from a listener with no SASL
   configured: every SASL request there is `ILLEGAL_SASL_STATE`, which is
   correct rather than nonconformant. Kafka scopes SASL to a listener, so

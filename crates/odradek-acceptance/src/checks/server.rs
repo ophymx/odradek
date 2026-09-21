@@ -2415,6 +2415,32 @@ async fn consumer_group_heartbeat(
     .await
 }
 
+/// A subject that advertises KIP-848 and then will not serve it.
+///
+/// Kafka 3.7 registers ConsumerGroupHeartbeat, so ApiVersions offers it,
+/// while the group coordinator rejects every call unless the new
+/// rebalance protocol is switched on — which in that release it is not
+/// by default. Whether advertising an api one refuses is itself a defect
+/// is a real argument (the Java client probes and falls back on exactly
+/// this code, so the behaviour is at least intended), and this suite is
+/// a regression suite rather than a certification body: it is not the
+/// place to settle it.
+///
+/// What is not arguable is that there is no member to observe. The four
+/// checks here are each about a *behaviour* of the protocol, not about
+/// whether it is offered honestly; failing all four would report one
+/// fact four times and leave none of them evidence of anything in
+/// particular. They skip, and the reason carries the finding.
+fn unserved_consumer_group(code: ErrorCode, version: i16) -> Option<Verdict> {
+    (code == ErrorCode::UNSUPPORTED_VERSION).then(|| Verdict::Skipped {
+        reason: format!(
+            "the subject advertises ConsumerGroupHeartbeat v{version} and then answers \
+             UNSUPPORTED_VERSION to it, so the protocol is offered but not served and \
+             there is no member to observe"
+        ),
+    })
+}
+
 /// The KIP-848 version this subject and these checks share.
 fn consumer_group_version(ctx: &ServerCtx) -> Result<i16, Verdict> {
     negotiate(
@@ -2460,6 +2486,9 @@ async fn consumer_group_epoch_advances(ctx: &ServerCtx) -> Verdict {
     };
     let code = ErrorCode(resp.error_code);
     if !code.is_ok() {
+        if let Some(skip) = unserved_consumer_group(code, version) {
+            return skip;
+        }
         return Verdict::Fail {
             details: format!("a member introducing itself at epoch 0 was answered {code}"),
         };
@@ -2592,6 +2621,9 @@ async fn settle_assignment(
         };
         let code = ErrorCode(resp.error_code);
         if !code.is_ok() {
+            if let Some(skip) = unserved_consumer_group(code, version) {
+                return Err(skip);
+            }
             return Err(Verdict::Fail {
                 details: format!("heartbeat at epoch {epoch} answered {code}"),
             });
@@ -2729,6 +2761,9 @@ async fn consumer_group_fenced_epoch(ctx: &ServerCtx) -> Verdict {
     };
     let code = ErrorCode(joined.error_code);
     if !code.is_ok() {
+        if let Some(skip) = unserved_consumer_group(code, version) {
+            return skip;
+        }
         return Verdict::Fail {
             details: format!("joining answered {code}"),
         };

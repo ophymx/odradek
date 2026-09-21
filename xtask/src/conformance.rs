@@ -194,6 +194,67 @@ const SUBJECTS: &[Subject] = &[
             "conformance",
         ]],
     },
+    // The same broker, four minor releases back, for the versions the
+    // 4.x subjects never reach. Kafka 4.0 raised the *minimum* api
+    // version it accepts on most apis (KIP-896), so against 4.1 the
+    // suite can only ever negotiate the modern half of each range;
+    // 3.7 still offers the old half, and offering it is what makes it
+    // testable. Produce is the clearest case: 3.7 advertises v0 to v10
+    // where 4.1 starts at v3, and v0-v2 carry a pre-KIP-98 message set
+    // rather than a record batch — which this workspace does not model
+    // and says so, a claim that had no broker to make it against until
+    // now.
+    //
+    // 3.7 rather than 3.9 because the point is distance. The config is
+    // byte-for-byte the 4.1 subject's, which is itself a small result:
+    // nothing about the harness needed a version switch.
+    Subject {
+        name: "apache-kafka-3.7.0",
+        image: "apache/kafka:3.7.0",
+        run_args: &[
+            "-e",
+            "KAFKA_NODE_ID=1",
+            "-e",
+            "KAFKA_PROCESS_ROLES=broker,controller",
+            "-e",
+            "KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,SASL://0.0.0.0:9094,INTERNAL://0.0.0.0:9099",
+            "-e",
+            "KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:{port},SASL://127.0.0.1:{sasl_port},INTERNAL://localhost:9099",
+            "-e",
+            "KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER",
+            "-e",
+            "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,SASL:SASL_PLAINTEXT,INTERNAL:PLAINTEXT",
+            "-e",
+            "KAFKA_INTER_BROKER_LISTENER_NAME=INTERNAL",
+            "-e",
+            "KAFKA_SASL_ENABLED_MECHANISMS=SCRAM-SHA-256",
+            "-e",
+            "KAFKA_LISTENER_NAME_SASL_SCRAM-SHA-256_SASL_JAAS_CONFIG=org.apache.kafka.common.security.scram.ScramLoginModule required;",
+            "-e",
+            "KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093",
+            "-e",
+            "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1",
+            "-e",
+            "KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1",
+            "-e",
+            "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1",
+        ],
+        sasl_listener: true,
+        authenticated: false,
+        nodes: 1,
+        provision: &[&[
+            "/opt/kafka/bin/kafka-configs.sh",
+            "--bootstrap-server",
+            "localhost:9099",
+            "--alter",
+            "--add-config",
+            "SCRAM-SHA-256=[password=conformance]",
+            "--entity-type",
+            "users",
+            "--entity-name",
+            "conformance",
+        ]],
+    },
     Subject {
         name: "redpanda-25.2.1",
         image: "redpandadata/redpanda:v25.2.1",
