@@ -28,6 +28,7 @@ use odradek_protocol::messages::api_versions_response::{ApiVersion, ApiVersionsR
 use odradek_protocol::messages::fetch_request::FetchRequest;
 use odradek_protocol::messages::fetch_response::FetchResponse;
 use odradek_protocol::messages::init_producer_id_request::InitProducerIdRequest;
+use odradek_protocol::messages::list_offsets_request::ListOffsetsRequest;
 use odradek_protocol::messages::metadata_request::MetadataRequest;
 use odradek_protocol::messages::metadata_response::{
     MetadataResponse, MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
@@ -93,6 +94,16 @@ const ADVERTISED: &[(i16, i16, i16)] = &[
         MetadataRequest::API_KEY,
         MetadataRequest::MIN_VERSION,
         MetadataRequest::MAX_VERSION,
+    ),
+    // A consumer asks where to start before it fetches anything, so a
+    // harness that does not offer this is one no consumer can reach
+    // the fetch path of — which left half of
+    // `client/routes-to-partition-leader` ("produce *and* fetch") with
+    // no third-party client able to exercise it.
+    (
+        ListOffsetsRequest::API_KEY,
+        ListOffsetsRequest::MIN_VERSION,
+        ListOffsetsRequest::MAX_VERSION,
     ),
 ];
 
@@ -276,6 +287,8 @@ struct Observation {
     body_exempt: bool,
     /// (topic, partition) pairs this produce/fetch addressed.
     routes: Vec<(String, i32)>,
+    /// The mechanism a SaslHandshake asked for, if this is one.
+    sasl_mechanism: Option<String>,
 }
 
 /// The SASL apis the harness offers, so a client configured for
@@ -291,6 +304,11 @@ const METADATA_THROTTLE_MIN: i16 = 3;
 
 /// Metadata gained a tagged-field section at v9.
 const METADATA_FLEXIBLE_MIN: i16 = 9;
+
+/// The first ApiVersions response whose *body* is flexible. Its header
+/// stays v0 at every version — the quirk the protocol crate documents —
+/// so the tagged-field section lives in the body alone.
+const API_VERSIONS_FLEXIBLE_MIN: i16 = 3;
 
 /// A tag far above anything the schemas define, so it can only be
 /// something the client has never heard of.
@@ -375,7 +393,22 @@ struct ClusterView {
     /// `(connection, request index)` for every response that carried an
     /// unknown tagged field.
     tagged: std::sync::Mutex<Vec<(usize, usize)>>,
+    /// Connections whose SaslHandshake named a mechanism this harness
+    /// offers, and which may therefore be spoken to in that mechanism's
+    /// terms. See [`OFFERED_MECHANISM`].
+    negotiated: std::sync::Mutex<HashSet<usize>>,
 }
+
+/// The one mechanism the harness knows how to be wrong in.
+///
+/// Only OAUTHBEARER, because the refusal
+/// [`RejectSaslToken`](HarnessFault::RejectSaslToken) injects is an
+/// OAUTHBEARER construct — RFC 7628 §3.1's success-shaped failure
+/// challenge — and no other mechanism has one. Under PLAIN a failure is
+/// the response's error code and nothing else, so the same bytes mean
+/// "authenticated" rather than "refused", and a client that carries on
+/// is right to.
+const OFFERED_MECHANISM: &str = "OAUTHBEARER";
 
 impl ClusterView {
     /// The produce verdict for `partition` arriving at `node_id`: the
@@ -458,6 +491,7 @@ pub async fn run(listener: &TcpListener, config: &ObserveConfig) -> io::Result<R
         leaders: std::sync::Mutex::new((0..BROKER_COUNT).collect()),
         events: std::sync::Mutex::new(Vec::new()),
         sasl_rejections: std::sync::Mutex::new(Vec::new()),
+        negotiated: std::sync::Mutex::new(HashSet::new()),
         throttles: std::sync::Mutex::new(Vec::new()),
         tagged: std::sync::Mutex::new(Vec::new()),
         started: std::time::Instant::now(),
@@ -603,12 +637,15 @@ async fn serve_conn(
         if let Some(header) = &obs.header {
             respond(
                 &mut stream,
-                header,
+                Answering {
+                    header,
+                    routes: &obs.routes,
+                    conn_id,
+                    index: obs.index,
+                    sasl_mechanism: obs.sasl_mechanism.as_deref(),
+                },
                 &view,
                 node_id,
-                &obs.routes,
-                conn_id,
-                obs.index,
             )
             .await;
         }
@@ -645,6 +682,7 @@ fn parse_request(
         header_error: None,
         body_error: None,
         body_exempt: true,
+        sasl_mechanism: None,
         routes: Vec::new(),
     };
     if frame.len() < 8 {
@@ -726,6 +764,30 @@ fn parse_request(
             obs.body_exempt = false;
             obs.body_error = decode_fully::<MetadataRequest>(buf, api_version).err();
         }
+        (ListOffsetsRequest::API_KEY, Some(buf)) => {
+            obs.body_exempt = false;
+            match decode_fully::<ListOffsetsRequest>(buf, api_version) {
+                Err(e) => obs.body_error = Some(e),
+                Ok(req) => {
+                    for topic in &req.topics {
+                        for p in &topic.partitions {
+                            obs.routes.push((topic.name.clone(), p.partition_index));
+                        }
+                    }
+                }
+            }
+        }
+        (SASL_HANDSHAKE_API, Some(buf)) => {
+            obs.body_exempt = false;
+            // The mechanism is carried out of here because `respond` is
+            // handed the header and not the body, and answering a
+            // handshake correctly means answering the mechanism that
+            // was actually asked for.
+            match decode_fully::<SaslHandshakeRequest>(buf, api_version) {
+                Err(e) => obs.body_error = Some(e),
+                Ok(req) => obs.sasl_mechanism = Some(req.mechanism),
+            }
+        }
         _ => {}
     }
     obs
@@ -764,23 +826,46 @@ fn salvage_header(frame: &Bytes) -> Option<RequestHeader> {
     None
 }
 
-async fn respond(
-    stream: &mut TcpStream,
-    header: &RequestHeader,
-    view: &ClusterView,
-    node_id: i32,
-    routes: &[(String, i32)],
+/// Everything the harness knows about the request it is answering.
+///
+/// A struct rather than six parameters: they all come from the same
+/// [`Observation`] and are only ever passed together, and the list had
+/// grown past the point where the call site said anything.
+#[derive(Clone, Copy)]
+struct Answering<'a> {
+    header: &'a RequestHeader,
+    /// `(topic, partition)` pairs this request addresses.
+    routes: &'a [(String, i32)],
     conn_id: usize,
     index: usize,
-) {
+    /// The mechanism a SaslHandshake asked for, if this is one.
+    sasl_mechanism: Option<&'a str>,
+}
+
+async fn respond(stream: &mut TcpStream, req: Answering<'_>, view: &ClusterView, node_id: i32) {
+    let Answering {
+        header,
+        routes,
+        conn_id,
+        index,
+        sasl_mechanism,
+    } = req;
     let api_key = header.request_api_key;
     let api_version = header.request_api_version;
 
     let (body, header_version) = match api_key {
         ApiVersionsRequest::API_KEY if api_version > MAX_API_VERSIONS => {
-            (encode_api_versions(ErrorCode::UNSUPPORTED_VERSION.0, 0), 0)
+            // A version the harness cannot speak is refused at v0, and
+            // a v0 body has nowhere to put a tagged field anyway.
+            (
+                encode_api_versions(ErrorCode::UNSUPPORTED_VERSION.0, 0, None),
+                0,
+            )
         }
-        ApiVersionsRequest::API_KEY => (encode_api_versions(ErrorCode::NONE.0, api_version), 0),
+        ApiVersionsRequest::API_KEY => (
+            encode_api_versions(ErrorCode::NONE.0, api_version, Some((view, conn_id, index))),
+            0,
+        ),
         MetadataRequest::API_KEY => {
             let v = api_version.clamp(MetadataRequest::MIN_VERSION, MetadataRequest::MAX_VERSION);
             let leaders = view.leaders.lock().unwrap().clone();
@@ -848,8 +933,21 @@ async fn respond(
                 SaslHandshakeRequest::MAX_VERSION,
             );
             let mut resp = SaslHandshakeResponse::default();
-            resp.error_code = ErrorCode::NONE.0;
-            resp.mechanisms = vec!["OAUTHBEARER".to_owned()];
+            resp.mechanisms = vec![OFFERED_MECHANISM.to_owned()];
+            // Answer the mechanism the client actually asked for. This
+            // used to say NONE to everything while advertising one
+            // mechanism, which told a client asking for PLAIN that
+            // PLAIN was agreed and then spoke OAUTHBEARER to it — and
+            // failed two checks against a client that had done nothing
+            // wrong. A broker answers UNSUPPORTED_SASL_MECHANISM here
+            // and the client stops; so does this.
+            match sasl_mechanism {
+                Some(OFFERED_MECHANISM) => {
+                    resp.error_code = ErrorCode::NONE.0;
+                    view.negotiated.lock().unwrap().insert(conn_id);
+                }
+                _ => resp.error_code = ErrorCode::UNSUPPORTED_SASL_MECHANISM.0,
+            }
             let mut body = BytesMut::new();
             if resp.encode(&mut body, v).is_err() {
                 return;
@@ -866,7 +964,11 @@ async fn respond(
             );
             let mut resp = SaslAuthenticateResponse::default();
             resp.error_code = ErrorCode::NONE.0;
-            if view.fault == Some(HarnessFault::RejectSaslToken) {
+            // Only where the mechanism was agreed. A client that was
+            // refused at the handshake and kept going anyway is not
+            // being asked an OAUTHBEARER question.
+            let negotiated = view.negotiated.lock().unwrap().contains(&conn_id);
+            if negotiated && view.fault == Some(HarnessFault::RejectSaslToken) {
                 let already = view
                     .sasl_rejections
                     .lock()
@@ -958,6 +1060,54 @@ async fn respond(
                 response_header_version(ProduceRequest::API_KEY, v).unwrap_or(0),
             )
         }
+        ListOffsetsRequest::API_KEY => {
+            use odradek_protocol::messages::list_offsets_response::{
+                ListOffsetsPartitionResponse, ListOffsetsTopicResponse,
+            };
+            let v = api_version.clamp(
+                ListOffsetsRequest::MIN_VERSION,
+                ListOffsetsRequest::MAX_VERSION,
+            );
+            // Every log here is empty, so every question about where it
+            // starts or ends has the same answer. Judged against
+            // current leadership like produce and fetch are, so a
+            // consumer asking the wrong broker is told so and the
+            // routing check sees it.
+            let mut topics: Vec<ListOffsetsTopicResponse> = Vec::new();
+            for (topic, partition) in routes {
+                let error_code = if topic == ROUTING_TOPIC {
+                    view.fetch_error(*partition, node_id)
+                } else {
+                    ErrorCode::UNKNOWN_TOPIC_OR_PARTITION.0
+                };
+                let mut entry = ListOffsetsPartitionResponse::default();
+                entry.partition_index = *partition;
+                entry.error_code = error_code;
+                entry.timestamp = -1;
+                entry.offset = 0;
+                entry.leader_epoch = -1;
+                match topics.iter_mut().find(|t| &t.name == topic) {
+                    Some(t) => t.partitions.push(entry),
+                    None => {
+                        let mut topic_resp = ListOffsetsTopicResponse::default();
+                        topic_resp.name = topic.clone();
+                        topic_resp.partitions = vec![entry];
+                        topics.push(topic_resp);
+                    }
+                }
+            }
+            let mut resp =
+                odradek_protocol::messages::list_offsets_response::ListOffsetsResponse::default();
+            resp.topics = topics;
+            let mut body = BytesMut::new();
+            if resp.encode(&mut body, v).is_err() {
+                return;
+            }
+            (
+                body.freeze(),
+                response_header_version(ListOffsetsRequest::API_KEY, v).unwrap_or(0),
+            )
+        }
         FetchRequest::API_KEY => {
             use odradek_protocol::messages::fetch_response::{
                 FetchableTopicResponse, PartitionData,
@@ -1022,9 +1172,32 @@ async fn respond(
     let _ = stream.write_all(&out).await;
 }
 
-fn encode_api_versions(error_code: i16, version: i16) -> Bytes {
+fn encode_api_versions(
+    error_code: i16,
+    version: i16,
+    tag: Option<(&ClusterView, usize, usize)>,
+) -> Bytes {
     let mut resp = ApiVersionsResponse::default();
     resp.error_code = error_code;
+    // ApiVersions is the *other* place a tagged field can reach a
+    // client, and by some distance the better one: its body is
+    // flexible from v3, every client sends it, and every client parses
+    // the answer before it can do anything else. Metadata alone was
+    // not enough — librdkafka asks for Metadata v4 and nothing higher,
+    // so the flexible section this fault needs does not exist in its
+    // Metadata responses and the check could only ever skip against
+    // the most widely deployed client there is.
+    if let Some((view, conn_id, index)) = tag {
+        if view.fault == Some(HarnessFault::UnknownTaggedField)
+            && version >= API_VERSIONS_FLEXIBLE_MIN
+        {
+            resp.unknown_tagged_fields.push(RawTaggedField {
+                tag: UNKNOWN_TAG,
+                data: Bytes::from_static(b"from a newer broker"),
+            });
+            view.tagged.lock().unwrap().push((conn_id, index));
+        }
+    }
     resp.api_keys = ADVERTISED
         .iter()
         .map(|&(api_key, min_version, max_version)| {

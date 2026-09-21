@@ -102,6 +102,30 @@ jobs:
         with:
           command: check
 
+  client-matrix:
+    name: third-party client matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: enforce committed baselines against a real third-party client
+        # The other direction from the conformance job: there real
+        # brokers answer our checks, here a real client is answered by
+        # our harness and judged on what it says. Six scenarios — a
+        # producer, a consumer, and one per injected fault — because
+        # five of the eleven client checks have nothing to judge until
+        # a fault is armed, and a matrix that ran the happy path alone
+        # would leave half the catalogue skipping and call it a pass.
+        #
+        # Its own job rather than a step of the conformance one: it
+        # needs no broker, finishes in well under a minute, and a
+        # failure here means something different.
+        run: |
+          docker pull -q edenhill/kcat:1.7.1 &
+          cargo xtask client-matrix
+          wait || true
+
   conformance:
     name: real-broker conformance
     runs-on: ubuntu-latest

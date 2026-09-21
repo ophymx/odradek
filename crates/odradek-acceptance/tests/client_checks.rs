@@ -9,6 +9,7 @@ use odradek_acceptance::checks::catalog;
 use odradek_acceptance::checks::client::{HarnessFault, ObserveConfig, ROUTING_TOPIC, run};
 use odradek_acceptance::{SubjectRole, Verdict};
 use odradek_client::{ClientConfig, Cluster, Connection, Consumer, Producer};
+use odradek_protocol::header::request_header_version;
 use odradek_protocol::messages::produce_request::{
     PartitionProduceData, ProduceRequest, TopicProduceData,
 };
@@ -307,8 +308,15 @@ fn request_frame(api_key: i16, api_version: i16, correlation_id: i32, body: &[u8
     header.correlation_id = correlation_id;
     header.client_id = Some("misbehaving".into());
     let mut payload = BytesMut::new();
-    // Metadata v9+ is flexible → header v2 for both frames.
-    header.encode(&mut payload, 2).unwrap();
+    // The header version is a function of the api and its version, not
+    // a constant. This said 2 unconditionally, from when every frame
+    // here was a flexible Metadata; a SaslHandshake v1 takes a v1
+    // header, and a v2 one puts an extra tagged-field byte in front of
+    // the body. Nothing read these bodies, so nothing minded — until
+    // the harness started answering the mechanism it was asked for.
+    let header_version = request_header_version(api_key, api_version)
+        .expect("the tests only send apis the protocol crate knows");
+    header.encode(&mut payload, header_version).unwrap();
     payload.extend_from_slice(body);
     payload.to_vec()
 }

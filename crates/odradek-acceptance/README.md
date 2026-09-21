@@ -282,6 +282,45 @@ was written expecting a refusal, the broker said otherwise, and the
 requirement it now states is the one that actually holds — the records
 must not end up outside the transaction, by either route.
 
+## The client matrix
+
+`cargo xtask client-matrix` is the mirror of the broker matrix, pointing
+the other way: the harness answers, a real client is judged on what it
+says, and each scenario is enforced against a committed baseline.
+
+Six scenarios for one client (kcat 1.7.1, so librdkafka): a producer, a
+consumer, and one per injected fault. The faults are the point — five of
+the eleven client checks have nothing to judge until one is armed, so a
+matrix that ran only the happy path would leave nearly half the
+catalogue skipping and report it as a pass. Between the six, every check
+is exercised.
+
+librdkafka passes all eleven. Everything the matrix found on its first
+run was in the harness:
+
+- **A mechanism was agreed that had never been offered.** The
+  SaslHandshake answer was `NONE` to everything while advertising only
+  OAUTHBEARER, so a client asking for PLAIN was told PLAIN was fine and
+  then sent RFC 7628's success-shaped failure challenge — an OAUTHBEARER
+  construct that has no meaning under PLAIN, where failure is the error
+  code and nothing else. Two checks failed a client that had done
+  nothing wrong. The handshake answers `UNSUPPORTED_SASL_MECHANISM` now,
+  and the two SASL checks skip unless the mechanism they are about was
+  the one negotiated.
+- **The unknown-tagged-field fault could not reach librdkafka.** It was
+  injected only into Metadata at v9 and above, and librdkafka asks for
+  Metadata v4 and nothing higher, so the flexible section the fault
+  needs did not exist in any response it received. ApiVersions carries
+  it too now: flexible from v3, sent by every client, and parsed before
+  anything else can happen.
+- **No consumer could reach the fetch path at all.** The harness
+  advertised Fetch but not ListOffsets, and a consumer asks where the
+  log starts before it fetches anything — so half of
+  `client/routes-to-partition-leader` ("produce *and* fetch") had no
+  third-party client able to exercise it. The harness answers
+  ListOffsets now, judged against current leadership like produce and
+  fetch are.
+
 ## What the baselines record
 
 Six subjects: Apache Kafka 4.1 and Redpanda 25.2, each as a single

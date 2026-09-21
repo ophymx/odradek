@@ -29,6 +29,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
+mod clients;
 mod conformance;
 
 fn main() -> Result<()> {
@@ -37,15 +38,18 @@ fn main() -> Result<()> {
     match task {
         "codegen" => codegen(),
         "conformance" => conformance::conformance(&args[1..]),
+        "client-matrix" => clients::client_matrix(&args[1..]),
         // Not for humans: this is what `cargo xtask conformance` hands
         // to `odradek-accept --cluster-control` so the recovery checks
         // can stop and start a broker. See `conformance::node_control`.
         "cluster-node" => conformance::node_control(&args[1..]),
-        other => bail!("unknown task {other:?}; available tasks: codegen, conformance"),
+        other => {
+            bail!("unknown task {other:?}; available tasks: codegen, conformance, client-matrix")
+        }
     }
 }
 
-fn workspace_root() -> PathBuf {
+pub fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
