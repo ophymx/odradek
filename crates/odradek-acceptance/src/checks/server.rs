@@ -3218,8 +3218,6 @@ async fn create_topic_call(
     // does. That only shows up on a cluster, and only once something
     // has moved the controller off whichever broker the suite
     // bootstrapped from, which is exactly what the recovery checks do.
-    let mut controller = admin_conn(ctx, conn, correlation_id.wrapping_sub(1)).await?;
-    let conn = &mut controller;
     let mut creatable = CreatableTopic::default();
     creatable.name = topic.to_owned();
     creatable.num_partitions = 1;
@@ -3232,14 +3230,7 @@ async fn create_topic_call(
     request
         .encode(&mut body, version)
         .map_err(|e| CheckError::Infra(format!("encoding CreateTopics: {e}")))?;
-    let resp: CreateTopicsResponse = api_call(
-        conn,
-        CreateTopicsRequest::API_KEY,
-        version,
-        correlation_id,
-        &body,
-    )
-    .await?;
+    let resp = create_topics_at_controller(ctx, conn, version, &body, correlation_id).await?;
     let result = resp
         .topics
         .first()
@@ -3823,19 +3814,11 @@ async fn produce_flow(
     create
         .encode(&mut body, create_version)
         .map_err(|e| infra(e.to_string()))?;
-    // To the controller, not to whichever broker we bootstrapped from.
-    let mut controller = admin_conn(ctx, &mut bootstrap, 9)
+    // To the controller, not to whichever broker we bootstrapped from —
+    // and to whichever broker that is *now*, since it moves.
+    let resp = create_topics_at_controller(ctx, &mut bootstrap, create_version, &body, 10)
         .await
-        .map_err(|e| e.context("locating the controller").into_verdict())?;
-    let resp: CreateTopicsResponse = api_call(
-        &mut controller,
-        CreateTopicsRequest::API_KEY,
-        create_version,
-        10,
-        &body,
-    )
-    .await
-    .map_err(|e| e.context("CreateTopics").into_verdict())?;
+        .map_err(|e| e.context("CreateTopics").into_verdict())?;
     let result = resp
         .topics
         .first()
@@ -5151,11 +5134,24 @@ async fn await_abort_marker(
     })?;
 
     if data.last_stable_offset <= first_offset {
+        // The watermarks go in the message because they are what
+        // distinguishes the two ways this fails. A high watermark above
+        // the stable offset means the records are on disk and only the
+        // marker is missing — the coordinator acknowledged an end it
+        // never wrote, or wrote it for partitions not including this
+        // one. A high watermark that is also stuck means the write
+        // itself never became visible, which is a different fault in a
+        // different component, and guessing between them from one
+        // number is how an hour goes missing.
         return Err(Verdict::Fail {
             details: format!(
-                "{context} the stable offset never moved past {first_offset} (still {}), so the \
-                 partition stays blocked on a transaction that has already finished",
-                data.last_stable_offset
+                "{context} the stable offset never moved past {first_offset} within {:?} \
+                 (stable {}, high watermark {}, log start {}), so the partition stays \
+                 blocked on a transaction that has already finished",
+                ctx.config.recovery_budget,
+                data.last_stable_offset,
+                data.high_watermark,
+                data.log_start_offset
             ),
         });
     }
@@ -5678,22 +5674,37 @@ async fn delete_topics_removes_the_topic(ctx: &ServerCtx) -> Verdict {
             details: format!("encoding DeleteTopics: {e}"),
         };
     }
-    let resp: DeleteTopicsResponse = match api_call(
-        &mut admin,
-        DeleteTopicsRequest::API_KEY,
-        delete_version,
-        800,
-        &body,
-    )
-    .await
-    {
-        Ok(resp) => resp,
-        Err(e) => return e.context("DeleteTopics").into_verdict(),
-    };
-    let code = resp
-        .responses
-        .first()
-        .map_or(ErrorCode::NONE, |r| ErrorCode(r.error_code));
+    // Following the controller as it moves, for the same reason
+    // creating a topic does.
+    let mut code = ErrorCode::NOT_CONTROLLER;
+    for attempt in 0..ctx.config.settle_attempts() {
+        if attempt > 0 {
+            tokio::time::sleep(ctx.config.settle_delay).await;
+            admin = match connect_to_controller(ctx, &mut conn, metadata_version, 862).await {
+                Ok(c) => c,
+                Err(e) => return e.context("relocating the controller").into_verdict(),
+            };
+        }
+        let answer: DeleteTopicsResponse = match api_call(
+            &mut admin,
+            DeleteTopicsRequest::API_KEY,
+            delete_version,
+            800,
+            &body,
+        )
+        .await
+        {
+            Ok(answer) => answer,
+            Err(e) => return e.context("DeleteTopics").into_verdict(),
+        };
+        code = answer
+            .responses
+            .first()
+            .map_or(ErrorCode::NONE, |r| ErrorCode(r.error_code));
+        if code != ErrorCode::NOT_CONTROLLER {
+            break;
+        }
+    }
     if code == ErrorCode::TOPIC_DELETION_DISABLED {
         return Verdict::Skipped {
             reason: "the subject has topic deletion disabled".into(),
@@ -5849,6 +5860,55 @@ async fn connect_to_controller(
 ) -> Result<RawConnection, CheckError> {
     let located = controller_endpoint(bootstrap, version, correlation).await?;
     open(ctx, located.as_deref().unwrap_or(&ctx.addr)).await
+}
+
+/// Send an already-encoded CreateTopics body to the controller,
+/// following the cluster when it says the controller has moved.
+///
+/// `NOT_CONTROLLER` is a redirect, not a refusal, and the same mistake
+/// as every other snapshot the suite has believed: routing to the
+/// controller is not enough, because which broker *is* the controller
+/// has a lifetime. It is shortest exactly when the suite is busiest —
+/// a cluster still electing, or one a recovery check has just taken a
+/// broker out of — so the answer can be stale by the time the next
+/// request arrives. A client re-reads Metadata and asks whoever it now
+/// names.
+async fn create_topics_at_controller(
+    ctx: &ServerCtx,
+    bootstrap: &mut RawConnection,
+    version: i16,
+    body: &[u8],
+    correlation: i32,
+) -> Result<CreateTopicsResponse, CheckError> {
+    let mut last = None;
+    for attempt in 0..ctx.config.settle_attempts() {
+        if attempt > 0 {
+            tokio::time::sleep(ctx.config.settle_delay).await;
+        }
+        let mut controller = admin_conn(ctx, bootstrap, correlation.wrapping_sub(1)).await?;
+        let resp: CreateTopicsResponse = api_call(
+            &mut controller,
+            CreateTopicsRequest::API_KEY,
+            version,
+            correlation,
+            body,
+        )
+        .await?;
+        let code = resp
+            .topics
+            .first()
+            .map_or(ErrorCode::NONE, |t| ErrorCode(t.error_code));
+        if code != ErrorCode::NOT_CONTROLLER {
+            return Ok(resp);
+        }
+        last = Some(code);
+    }
+    Err(CheckError::Violation(format!(
+        "CreateTopics still answers {} after {:?} of following the controller \
+         Metadata names",
+        last.unwrap_or(ErrorCode::NOT_CONTROLLER),
+        ctx.config.settle_budget
+    )))
 }
 
 /// The same, negotiating Metadata for itself — for the callers that
@@ -7040,9 +7100,12 @@ async fn txn_commit_is_visible_to_readers(ctx: &ServerCtx) -> Verdict {
         return Verdict::Fail {
             details: format!(
                 "the commit was acknowledged but the stable offset never moved past \
-                 {first_offset} (still {}); a read_committed consumer stays blocked on a \
-                 transaction that finished",
-                data.last_stable_offset
+                 {first_offset} within {:?} (stable {}, high watermark {}, log start {}); a \
+                 read_committed consumer stays blocked on a transaction that finished",
+                ctx.config.recovery_budget,
+                data.last_stable_offset,
+                data.high_watermark,
+                data.log_start_offset
             ),
         };
     }
@@ -7755,18 +7818,9 @@ async fn create_replicated_topic(
         .map_err(|e| Verdict::Error {
             details: format!("encoding CreateTopics: {e}"),
         })?;
-    let mut controller = admin_conn(ctx, conn, correlation.wrapping_sub(1))
+    let resp = create_topics_at_controller(ctx, conn, version, &body, correlation)
         .await
-        .map_err(|e| e.context("locating the controller").into_verdict())?;
-    let resp: CreateTopicsResponse = api_call(
-        &mut controller,
-        CreateTopicsRequest::API_KEY,
-        version,
-        correlation,
-        &body,
-    )
-    .await
-    .map_err(|e| e.context("CreateTopics").into_verdict())?;
+        .map_err(|e| e.context("CreateTopics").into_verdict())?;
     let code = resp
         .topics
         .first()
