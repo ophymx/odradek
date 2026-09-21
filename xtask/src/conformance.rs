@@ -834,10 +834,10 @@ fn run_subject(
     // cluster properly needs a listener per broker, which is a different
     // example than the one this is a witness for.
     match (proxy, subject.nodes) {
-        // A TLS subject has no proxied pass either: `examples/proxy.rs`
-        // is the protocol crate plus a socket, and putting a TLS stack
-        // in it would make it a different example than the one this is
-        // a witness for.
+        // A TLS subject has no proxied pass: `examples/proxy.rs` is the
+        // protocol crate plus a socket, and putting a TLS stack in it
+        // would make it a different example than the one this is a
+        // witness for.
         (Some(_), _) if subject.tls => {
             let _ = writeln!(
                 log,
@@ -845,14 +845,7 @@ fn run_subject(
                 subject.name
             );
         }
-        (Some(proxy), 1) => proxy_pass(subject, accept, proxy, &target, &baseline, log)?,
-        (Some(_), _) => {
-            let _ = writeln!(
-                log,
-                "note: no proxied pass for {} — the proxy example fronts a single broker",
-                subject.name
-            );
-        }
+        (Some(proxy), _) => proxy_pass(subject, accept, proxy, &target, &cluster, &baseline, log)?,
         (None, _) => {}
     }
     Ok(())
@@ -879,10 +872,12 @@ fn proxy_pass(
     accept: &Path,
     proxy: &Path,
     target: &Target<'_>,
+    cluster: &Cluster,
     baseline: &Path,
     log: &mut String,
 ) -> Result<()> {
-    let front = Proxy::start(proxy, target.addr)?;
+    let upstreams: Vec<String> = cluster.addrs().map(str::to_owned).collect();
+    let front = Proxy::fronting(proxy, &upstreams)?;
     // A second instance for the SASL listener: the proxy forwards SASL
     // frames without parsing them, but it only has one upstream, and
     // the two listeners are different upstreams.
@@ -905,12 +900,15 @@ fn proxy_pass(
         front.addr(),
         target.addr
     );
+    // Named by the proxy's ports, because that is what the suite will
+    // ask to have stopped.
+    let control = (subject.nodes > 1)
+        .then(|| cluster.control_command_via(front.addrs()))
+        .transpose()?;
     let proxied = Target {
         addr: front.addr(),
         sasl_addr: sasl_front.as_ref().map(Proxy::addr),
-        // No control through the proxy: the proxied pass only runs for
-        // single-node subjects, which have no failover to watch.
-        control: None,
+        control: control.as_deref(),
         authenticate: target.authenticate,
         // The proxy example terminates TCP, not TLS; a subject behind
         // it is reached in plaintext or not at all.
@@ -1246,13 +1244,12 @@ fn ephemeral_ports(n: usize) -> Result<Vec<u16>> {
         .collect()
 }
 
-fn ephemeral_port() -> Result<u16> {
-    Ok(ephemeral_ports(1)?[0])
-}
-
 /// A running `examples/proxy` in front of one upstream listener.
 struct Proxy {
     addr: String,
+    /// Every listener, in upstream order, so a cluster's control can be
+    /// rewritten to name the ports the suite actually connects to.
+    addrs: Vec<String>,
     child: std::process::Child,
     /// Everything the proxy has said, drained by a thread so a chatty
     /// proxy cannot block on a pipe nobody is reading.
@@ -1261,12 +1258,36 @@ struct Proxy {
 
 impl Proxy {
     fn start(binary: &Path, upstream: &str) -> Result<Proxy> {
-        let addr = format!("127.0.0.1:{}", ephemeral_port()?);
-        // --advertise defaults to --listen, which is what we want: the
-        // proxy is reachable at the address it binds, so metadata
-        // pointing there sends followers back through it.
+        Proxy::fronting(binary, std::slice::from_ref(&upstream.to_owned()))
+    }
+
+    /// A proxy with one listener per upstream broker.
+    ///
+    /// Every broker gets its own, and the first is what the suite is
+    /// pointed at. One listener in front of a cluster would not be a
+    /// proxy of it: metadata would name that one address for every
+    /// broker, and the client would send each partition's writes to
+    /// whichever broker happened to be behind it.
+    fn fronting(binary: &Path, upstreams: &[String]) -> Result<Proxy> {
+        let ports = ephemeral_ports(upstreams.len())?;
+        let addrs: Vec<String> = ports
+            .iter()
+            .map(|port| format!("127.0.0.1:{port}"))
+            .collect();
+        let addr = addrs
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("a proxy needs at least one upstream"))?
+            .clone();
+        // The listen address is also the advertised one: the proxy is
+        // reachable where it binds, so metadata pointing there sends
+        // clients back through it.
+        let mut args = Vec::new();
+        for (listen, upstream) in addrs.iter().zip(upstreams) {
+            args.push("--map".to_owned());
+            args.push(format!("{listen}={upstream}"));
+        }
         let mut child = Command::new(binary)
-            .args(["--listen", &addr, "--upstream", upstream])
+            .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -1283,6 +1304,7 @@ impl Proxy {
         }
         Ok(Proxy {
             addr,
+            addrs,
             child,
             stderr,
         })
@@ -1290,6 +1312,10 @@ impl Proxy {
 
     fn addr(&self) -> &str {
         &self.addr
+    }
+
+    fn addrs(&self) -> &[String] {
+        &self.addrs
     }
 
     fn dump_logs(&self, log: &mut String) {
@@ -1401,6 +1427,41 @@ impl Cluster {
             .map(|n| {
                 let port = n.addr.rsplit_once(':').map_or("", |(_, p)| p);
                 format!("{}:{port}", n.name)
+            })
+            .collect();
+        Ok(format!(
+            "{} cluster-node {}",
+            exe.display(),
+            names.join(",")
+        ))
+    }
+
+    /// The same command, for a suite reaching these nodes through
+    /// something else.
+    ///
+    /// `node_control` finds a container by the port the suite connected
+    /// to, which is the whole point — the suite knows addresses, not
+    /// container names. Through a proxy those are the proxy's ports, so
+    /// stopping "the broker at 127.0.0.1:41000" has to mean the
+    /// container behind that listener. Without this the two recovery
+    /// checks would find no container, skip, and diverge from a
+    /// baseline that records them passing.
+    fn control_command_via(&self, fronts: &[String]) -> Result<String> {
+        let exe = std::env::current_exe().context("locating the xtask binary")?;
+        if fronts.len() != self.nodes.len() {
+            bail!(
+                "{} listeners in front of {} nodes",
+                fronts.len(),
+                self.nodes.len()
+            );
+        }
+        let names: Vec<String> = self
+            .nodes
+            .iter()
+            .zip(fronts)
+            .map(|(node, front)| {
+                let port = front.rsplit_once(':').map_or("", |(_, p)| p);
+                format!("{}:{port}", node.name)
             })
             .collect();
         Ok(format!(

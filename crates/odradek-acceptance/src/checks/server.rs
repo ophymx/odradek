@@ -4643,6 +4643,62 @@ async fn end_txn(
     Ok(ErrorCode(resp.error_code))
 }
 
+/// End a transaction, following the coordinator if it has moved.
+///
+/// NOT_COORDINATOR to an EndTxn means "ask the broker that holds this
+/// transaction now", exactly as it does for a group offset commit --
+/// the coordinator for a transactional id is a fact with a lifetime,
+/// and `init_producer_id` resolved it some exchanges ago. Read as a
+/// refusal it reports a broker for failing to end a transaction it was
+/// never asked about, which on a Redpanda cluster happens about one
+/// run in several.
+///
+/// On success the connection is left pointing wherever the answer came
+/// from, so a caller that goes on talking to the coordinator is talking
+/// to the right one.
+async fn end_txn_settled(
+    ctx: &ServerCtx,
+    conn: &mut RawConnection,
+    version: i16,
+    actor: TxnActor<'_>,
+    committed: bool,
+    correlation: i32,
+) -> Result<ErrorCode, CheckError> {
+    let mut last = ErrorCode::NOT_COORDINATOR;
+    for attempt in 0..ctx.config.settle_attempts() {
+        if attempt > 0 {
+            tokio::time::sleep(ctx.config.settle_delay).await;
+        }
+        let code = end_txn(
+            conn,
+            version,
+            actor,
+            committed,
+            correlation + i32::try_from(attempt).unwrap_or(0),
+        )
+        .await?;
+        if code != ErrorCode::NOT_COORDINATOR {
+            return Ok(code);
+        }
+        last = code;
+        // Ask the bootstrap where the transaction lives now, and move
+        // there. A coordinator that has just taken it over may not be
+        // ready to say so yet, which is what the attempts are for.
+        let mut bootstrap = open(ctx, &ctx.addr).await?;
+        if let Some(addr) = await_txn_coordinator(
+            ctx,
+            &mut bootstrap,
+            actor.transactional_id,
+            correlation.wrapping_sub(1),
+        )
+        .await?
+        {
+            *conn = open(ctx, &addr).await?;
+        }
+    }
+    Ok(last)
+}
+
 /// Produce one transactional batch, returning the partition's error code
 /// and base offset.
 /// What a produce stamps its batch with, and whether it belongs to a
@@ -5052,7 +5108,7 @@ async fn txn_unannounced_write_stays_in_the_transaction(ctx: &ServerCtx) -> Verd
     // It was accepted. Then the transaction had better own it — which
     // an abort is the sharpest way to ask: if these records survive
     // being thrown away, they were never in the transaction.
-    match end_txn(&mut txn, versions.end, actor, false, 530).await {
+    match end_txn_settled(ctx, &mut txn, versions.end, actor, false, 530).await {
         Ok(code) if code.is_ok() => {}
         Ok(code) => {
             return Verdict::Fail {
@@ -5181,7 +5237,7 @@ async fn txn_abort_is_reported_to_readers(ctx: &ServerCtx) -> Verdict {
         Ok(offset) => offset,
         Err(verdict) => return verdict,
     };
-    match end_txn(&mut txn, versions.end, actor, false, 640).await {
+    match end_txn_settled(ctx, &mut txn, versions.end, actor, false, 640).await {
         Ok(code) if code.is_ok() => {}
         Ok(code) => {
             return Verdict::Fail {
@@ -7334,7 +7390,7 @@ async fn txn_commit_is_visible_to_readers(ctx: &ServerCtx) -> Verdict {
         Ok(offset) => offset,
         Err(verdict) => return verdict,
     };
-    match end_txn(&mut txn, versions.end, actor, true, 1_020).await {
+    match end_txn_settled(ctx, &mut txn, versions.end, actor, true, 1_020).await {
         Ok(code) if code.is_ok() => {}
         Ok(code) => {
             return Verdict::Fail {
@@ -7581,7 +7637,7 @@ async fn txn_offsets_wait_for_the_commit(ctx: &ServerCtx) -> Verdict {
         Err(e) => return e.context("OffsetFetch (mid-transaction)").into_verdict(),
     }
 
-    match end_txn(&mut conn, versions.end, actor, true, 1_140).await {
+    match end_txn_settled(ctx, &mut conn, versions.end, actor, true, 1_140).await {
         Ok(code) if code.is_ok() => {}
         Ok(code) => {
             return Verdict::Fail {
@@ -8426,14 +8482,14 @@ async fn cluster_replicas_span_brokers(ctx: &ServerCtx) -> Verdict {
             details: format!("encoding CreateTopics: {e}"),
         };
     }
-    let resp: CreateTopicsResponse = match api_call(
-        &mut conn,
-        CreateTopicsRequest::API_KEY,
-        create_version,
-        1_450,
-        &body,
-    )
-    .await
+    // Through the controller, following it if it moves. This check
+    // used to send its CreateTopics to whatever broker it had open and
+    // read NOT_CONTROLLER as "would not create a 3-replica topic",
+    // which is the sixth time in this suite that a redirect has been
+    // taken for a refusal -- and here it did not even report it as a
+    // failure, it *skipped*, so the check quietly stopped asking its
+    // question about one run in three.
+    let resp = match create_topics_at_controller(ctx, &mut conn, create_version, &body, 1_450).await
     {
         Ok(resp) => resp,
         Err(e) => return e.context("CreateTopics").into_verdict(),

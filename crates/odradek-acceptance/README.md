@@ -296,7 +296,7 @@ must not end up outside the transaction, by either route.
   repository expires on a date nobody is watching, in a run that
   changed nothing.
 
-  It gets no proxied pass. `examples/proxy.rs` is the protocol crate
+  It gets no proxied pass — the only subject that does not. `examples/proxy.rs` is the protocol crate
   plus a socket, and putting a TLS stack in it would make it a
   different example than the one the proxy guarantee is a witness for.
 
@@ -505,13 +505,37 @@ justified in the source with "a proxy needs this", and a proxy that got
 any of them wrong would make some check answer differently than the
 broker behind it. The diff then names which one.
 
-It earned its place immediately. Its first run reported four group
-checks erroring through the proxy that had passed directly, and the
-proxy turned out to be innocent: the suite was reusing fixed group names
+Clusters are proxied too, which took a listener per broker. Rewriting
+Metadata to point every broker at one address is not proxying a
+cluster, it is reassigning it: the client is told that whichever broker
+the proxy happens to hold leads every partition, and the first write to
+one it does not lead is refused for as long as the client retries. So
+the rewrite is a *lookup* — broker 2 is advertised as the listener in
+front of broker 2 — and an endpoint the map does not know is left alone
+and reported on stderr, because a client that connects around the proxy
+makes everything measured afterwards measure the broker instead.
+
+Only the TLS subject is unproxied now, and for a reason rather than an
+omission: the proxy example is the protocol crate plus a socket, and a
+TLS stack in it would make it a different example than the one the
+guarantee is a witness for.
+
+It earned its place immediately, and again when the clusters arrived.
+Its first run reported four group checks erroring through the proxy
+that had passed directly, and the proxy turned out to be innocent: the suite was reusing fixed group names
 across runs, so a second run against a live cluster parked behind a
 rebalance waiting for the first run's members. Throwaway containers had
 hidden it from CI, and anyone pointing the suite twice at their own
 cluster would have hit it. Group names are stamped per run now.
+
+The cluster pass then found something in the proxy itself, which a
+single broker could not have: it rewrote Metadata and not
+FindCoordinator. With one upstream those are the same address, so the
+client went to the right place and every answer was correct — the proxy
+simply was not in the path for anything a consumer group does, and
+nothing said so. Three brokers turned it into a wrong answer instead of
+an invisible one, and the suite named it: a coordinator "not one of the
+brokers Metadata reports".
 
 Use `--no-proxy` to skip the second pass.
 
