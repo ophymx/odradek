@@ -111,14 +111,31 @@ the ones where the *wrong* answer is plausible:
 - A topic reported deleted stops existing — the mirror of
   `validate_only`, checked by asking again rather than by trusting the
   acknowledgement.
-- A gzip-compressed batch comes back exactly as it was produced. The
-  record set is the producer's bytes and a broker storing a topic at
-  the default `compression.type=producer` has no business in them —
-  recompressing, even to the same codec, rewrites the batch and breaks
-  every consumer that verified the crc it was given, which includes
-  anything proxying or mirroring the log. The give-away is not an
-  error: the records decode fine, they are simply not the bytes anybody
-  wrote.
+- A compressed batch comes back exactly as it was produced, for each of
+  gzip, snappy, lz4 and zstd. The record set is the producer's bytes and
+  a broker storing a topic at the default `compression.type=producer`
+  has no business in them — recompressing, even to the same codec,
+  rewrites the batch and breaks every consumer that verified the crc it
+  was given, which includes anything proxying or mirroring the log. The
+  give-away is not an error: the records decode fine, they are simply
+  not the bytes anybody wrote.
+
+  One codec per check, rather than one check sweeping all four, because
+  which codecs an implementation accepts is exactly the sort of
+  difference the baselines exist to record — an aggregate would hide a
+  missing one behind three working ones.
+
+  These also pin the *framing*, which is where the interoperability
+  traps live. Kafka's snappy is not the snappy project's framing format
+  but the one Java's `SnappyOutputStream` happened to use, and lz4 is
+  the frame format rather than a raw block. A producer that reaches for
+  its snappy library's stream encoder writes something no Kafka consumer
+  can read: same codec name, different bytes. That the check tests this
+  and not merely passthrough was worth establishing rather than
+  assuming — framed the wrong way, a batch is refused outright (Apache
+  Kafka 4.1 answers `UNKNOWN_SERVER_ERROR`), so the brokers really do
+  look inside, and a suite that framed it wrongly would find out rather
+  than quietly pass its own bytes back and forth.
 - A replication factor the cluster cannot satisfy is *refused*. The
   plausible wrong answer here is not an error but a success: creating
   the topic with however many replicas are available, so a caller who

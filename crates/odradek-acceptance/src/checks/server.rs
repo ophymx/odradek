@@ -292,11 +292,29 @@ pub static SERVER_CHECKS: &[Check] = &[
         runner: Runner::Server(|ctx| Box::pin(metadata_topic_id_is_stable(ctx))),
     },
     Check {
-        id: "produce/compressed-batch-passthrough",
+        id: "produce/gzip-passthrough",
         requirement: "returns a gzip-compressed batch exactly as it was \
                       produced, rather than recompressing it and rewriting \
                       bytes the producer's crc covered",
-        runner: Runner::Server(|ctx| Box::pin(produce_compressed_passthrough(ctx))),
+        runner: Runner::Server(|ctx| Box::pin(produce_compressed_passthrough(ctx, GZIP))),
+    },
+    Check {
+        id: "produce/snappy-passthrough",
+        requirement: "returns a snappy-compressed batch exactly as it was \
+                      produced — in the xerial framing the protocol inherited \
+                      from Java, which is not the snappy project's own",
+        runner: Runner::Server(|ctx| Box::pin(produce_compressed_passthrough(ctx, SNAPPY))),
+    },
+    Check {
+        id: "produce/lz4-passthrough",
+        requirement: "returns an lz4-compressed batch exactly as it was \
+                      produced, in the lz4 frame format rather than a raw block",
+        runner: Runner::Server(|ctx| Box::pin(produce_compressed_passthrough(ctx, LZ4))),
+    },
+    Check {
+        id: "produce/zstd-passthrough",
+        requirement: "returns a zstd-compressed batch exactly as it was produced",
+        runner: Runner::Server(|ctx| Box::pin(produce_compressed_passthrough(ctx, ZSTD))),
     },
     Check {
         id: "fetch/long-poll-contract",
@@ -6395,7 +6413,52 @@ async fn describe_groups_reports_members(ctx: &ServerCtx) -> Verdict {
 }
 
 /// The compression codec bits of a record batch's attributes.
-const GZIP_ATTR: i16 = 1;
+/// A record-set compression codec, as a batch's attributes name it.
+///
+/// The low three bits of `attributes` carry the codec; everything above
+/// them is transactional and timestamp-type flags.
+#[derive(Clone, Copy)]
+struct Codec {
+    name: &'static str,
+    attr: i16,
+}
+
+const GZIP: Codec = Codec {
+    name: "gzip",
+    attr: 1,
+};
+const SNAPPY: Codec = Codec {
+    name: "snappy",
+    attr: 2,
+};
+const LZ4: Codec = Codec {
+    name: "lz4",
+    attr: 3,
+};
+const ZSTD: Codec = Codec {
+    name: "zstd",
+    attr: 4,
+};
+
+/// Header of the xerial snappy stream format: magic, then version and
+/// minimum-compatible version as big-endian 1s, then a sequence of
+/// big-endian-length-prefixed raw snappy blocks.
+///
+/// Kafka's snappy is *not* the snappy framing format the reference
+/// implementation ships (`0xff 0x06 0x00 0x00 sNaPpY`). It is the
+/// framing Java's `SnappyOutputStream` happened to use, which the
+/// protocol then inherited and cannot now change. A producer that
+/// reaches for its snappy library's stream encoder writes something no
+/// Kafka consumer can read — the codec is named the same and the bytes
+/// are not — and it is the sort of mistake that shows up as a
+/// deserialization error on somebody else's machine.
+const XERIAL_HEADER: [u8; 16] = [
+    0x82, b'S', b'N', b'A', b'P', b'P', b'Y', 0x00, 0, 0, 0, 1, 0, 0, 0, 1,
+];
+
+/// Uncompressed bytes per xerial block, matching the Java
+/// `SnappyOutputStream` default.
+const XERIAL_BLOCK: usize = 32 << 10;
 
 /// A compressed batch must come back exactly as it was sent.
 ///
@@ -6408,7 +6471,7 @@ const GZIP_ATTR: i16 = 1;
 /// the path where a broker is most tempted to intervene, and the
 /// give-away is not an error: the records decode fine, they are simply
 /// not the bytes anybody wrote.
-async fn produce_compressed_passthrough(ctx: &ServerCtx) -> Verdict {
+async fn produce_compressed_passthrough(ctx: &ServerCtx, codec: Codec) -> Verdict {
     let create_version = match negotiate(
         "CreateTopics",
         match ctx.range(CreateTopicsRequest::API_KEY) {
@@ -6465,7 +6528,7 @@ async fn produce_compressed_passthrough(ctx: &ServerCtx) -> Verdict {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
-    let topic = unique_topic("gzip");
+    let topic = unique_topic(codec.name);
     match create_topic_call(ctx, &mut bootstrap, create_version, &topic, false, 950).await {
         Ok((code, _)) if code.is_ok() => {}
         Ok((code, _)) => {
@@ -6481,7 +6544,7 @@ async fn produce_compressed_passthrough(ctx: &ServerCtx) -> Verdict {
         Err(e) => return e.context("locating the partition leader").into_verdict(),
     };
 
-    let sent = match gzip_batch() {
+    let sent = match compressed_batch(codec) {
         Ok(bytes) => bytes,
         Err(details) => return Verdict::Error { details },
     };
@@ -6533,12 +6596,15 @@ async fn produce_compressed_passthrough(ctx: &ServerCtx) -> Verdict {
         }
         if last == ErrorCode::UNSUPPORTED_COMPRESSION_TYPE {
             return Verdict::Skipped {
-                reason: "the subject does not accept gzip-compressed batches".into(),
+                reason: format!(
+                    "the subject does not accept {}-compressed batches",
+                    codec.name
+                ),
             };
         }
         if !retriable(last) {
             return Verdict::Fail {
-                details: format!("producing a gzip batch answered {last}"),
+                details: format!("producing a {} batch answered {last}", codec.name),
             };
         }
         // As in `produce_flow`: a retriable code here means this broker
@@ -6551,7 +6617,10 @@ async fn produce_compressed_passthrough(ctx: &ServerCtx) -> Verdict {
     }
     if !produced {
         return Verdict::Fail {
-            details: format!("a gzip batch never became producible: still {last}"),
+            details: format!(
+                "a {} batch never became producible: still {last}",
+                codec.name
+            ),
         };
     }
 
@@ -6573,8 +6642,9 @@ async fn produce_compressed_passthrough(ctx: &ServerCtx) -> Verdict {
     if got.len() < OUTSIDE_CRC || sent.len() < OUTSIDE_CRC {
         return Verdict::Fail {
             details: format!(
-                "produced {} byte(s) of gzip batch and got {} back",
+                "produced {} byte(s) of {} batch and got {} back",
                 sent.len(),
+                codec.name,
                 got.len()
             ),
         };
@@ -6582,9 +6652,10 @@ async fn produce_compressed_passthrough(ctx: &ServerCtx) -> Verdict {
     if got[OUTSIDE_CRC..] != sent[OUTSIDE_CRC..] {
         return Verdict::Fail {
             details: format!(
-                "a gzip batch came back rewritten: {} byte(s) produced, {} returned, and the \
+                "a {} batch came back rewritten: {} byte(s) produced, {} returned, and the \
                  crc-covered bytes differ — the records still decode, they are simply not \
                  the ones anybody wrote",
+                codec.name,
                 sent.len(),
                 got.len()
             ),
@@ -6593,14 +6664,12 @@ async fn produce_compressed_passthrough(ctx: &ServerCtx) -> Verdict {
     Verdict::Pass
 }
 
-/// [`probe_batch`]'s records, gzipped, as a batch declaring the codec.
+/// [`probe_batch`]'s records compressed with `codec`, as a batch
+/// declaring it.
 ///
 /// Built rather than pasted so it stays honest if the probe batch
-/// changes; gzip because it is the one codec every Kafka-protocol
-/// implementation has had since the beginning.
-fn gzip_batch() -> Result<Bytes, String> {
-    use std::io::Write as _;
-
+/// changes.
+fn compressed_batch(codec: Codec) -> Result<Bytes, String> {
     let batch = probe_batch();
     let Records::Plain(records) = &batch.records else {
         return Err("the probe batch is not plain records".into());
@@ -6611,16 +6680,10 @@ fn gzip_batch() -> Result<Bytes, String> {
             .encode(&mut plain)
             .map_err(|e| format!("encoding a record: {e}"))?;
     }
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder
-        .write_all(&plain)
-        .map_err(|e| format!("gzipping the record set: {e}"))?;
-    let payload = encoder
-        .finish()
-        .map_err(|e| format!("finishing the gzip stream: {e}"))?;
+    let payload = compress(codec, &plain)?;
 
     let mut compressed = batch.clone();
-    compressed.attributes |= GZIP_ATTR;
+    compressed.attributes |= codec.attr;
     compressed.records = Records::Compressed {
         count: i32::try_from(records.len()).unwrap_or(0),
         payload: Bytes::from(payload),
@@ -6630,6 +6693,61 @@ fn gzip_batch() -> Result<Bytes, String> {
         .encode(&mut out)
         .map_err(|e| format!("encoding the compressed batch: {e}"))?;
     Ok(out.freeze())
+}
+
+/// A record set compressed the way the protocol says each codec is
+/// framed.
+///
+/// Written out here rather than taken from `odradek-client`, which has
+/// its own copy: a suite that compressed with the implementation under
+/// test would agree with it about the framing by construction, and the
+/// framing is the part worth disagreeing about.
+fn compress(codec: Codec, plain: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Write as _;
+
+    match codec.attr {
+        // Plain gzip, as every implementation has done since the start.
+        1 => {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder
+                .write_all(plain)
+                .map_err(|e| format!("gzipping the record set: {e}"))?;
+            encoder
+                .finish()
+                .map_err(|e| format!("finishing the gzip stream: {e}"))
+        }
+        // Xerial framing, not the snappy project's own. See
+        // [`XERIAL_HEADER`].
+        2 => {
+            let mut out = Vec::from(XERIAL_HEADER);
+            let mut encoder = snap::raw::Encoder::new();
+            for chunk in plain.chunks(XERIAL_BLOCK) {
+                let block = encoder
+                    .compress_vec(chunk)
+                    .map_err(|e| format!("snappy-compressing a block: {e}"))?;
+                let len = u32::try_from(block.len())
+                    .map_err(|_| "a snappy block exceeded u32".to_owned())?;
+                out.extend_from_slice(&len.to_be_bytes());
+                out.extend_from_slice(&block);
+            }
+            Ok(out)
+        }
+        // The lz4 *frame* format, not a raw block.
+        3 => {
+            let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
+            encoder
+                .write_all(plain)
+                .map_err(|e| format!("lz4-compressing the record set: {e}"))?;
+            encoder
+                .finish()
+                .map_err(|e| format!("finishing the lz4 frame: {e}"))
+        }
+        4 => {
+            zstd::encode_all(plain, 0).map_err(|e| format!("zstd-compressing the record set: {e}"))
+        }
+        other => Err(format!("no compressor for codec attribute {other}")),
+    }
 }
 
 /// A committed transaction must become readable, and not read as

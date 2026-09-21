@@ -287,10 +287,21 @@ pub enum Fault {
     /// so the input reads as processed while the output can still be
     /// thrown away.
     TxnOffsetsPublishImmediately,
-    /// Re-stamp a compressed batch before storing it, rewriting bytes
-    /// the producer's crc covered. The records still decode, which is
-    /// what makes it quiet.
-    ProduceRewritesCompressedBatches,
+    /// Re-stamp a gzip batch before storing it, rewriting bytes the
+    /// producer's crc covered. The records still decode, which is what
+    /// makes it quiet.
+    ///
+    /// One per codec, rather than one for all of them, because each
+    /// codec has a check of its own: a single fault that rewrote every
+    /// compressed batch would trip four checks at once, and a fault
+    /// that trips four checks is evidence about none of them.
+    ProduceRewritesGzipBatches,
+    /// The same, for snappy.
+    ProduceRewritesSnappyBatches,
+    /// The same, for lz4.
+    ProduceRewritesLz4Batches,
+    /// The same, for zstd.
+    ProduceRewritesZstdBatches,
     /// Answer a fetch that cannot be satisfied immediately instead of
     /// waiting out `max_wait_ms`, turning every caught-up consumer into
     /// a busy loop.
@@ -370,7 +381,10 @@ impl Fault {
         Fault::ProduceAcceptsFencedEpoch,
         Fault::TxnCommitMarksAborted,
         Fault::TxnOffsetsPublishImmediately,
-        Fault::ProduceRewritesCompressedBatches,
+        Fault::ProduceRewritesGzipBatches,
+        Fault::ProduceRewritesSnappyBatches,
+        Fault::ProduceRewritesLz4Batches,
+        Fault::ProduceRewritesZstdBatches,
         Fault::FetchIgnoresMaxWait,
         Fault::MetadataLeaderIsUnknown,
         Fault::DescribeGroupsHidesMembers,
@@ -3188,19 +3202,29 @@ fn describe_groups_exchange(
 /// The client id this subject reports for its members.
 const CLIENT_ID_LABEL: &str = "odradek-acceptance";
 
-/// Under `ProduceRewritesCompressedBatches`, re-encode a compressed
+/// Under the `ProduceRewrites…Batches` faults, re-encode a compressed
 /// batch with a different max timestamp — a crc-covered field, so the
 /// stored bytes stop being the produced ones while still decoding.
+///
+/// Which codec is rewritten is read from the batch's own attributes, so
+/// each fault reaches exactly the check that produces that codec.
 fn rewrite_compressed(
     set: &Bytes,
     batches: &[records::RecordBatch],
     faults: &[Fault],
 ) -> Option<Bytes> {
-    if !faults.contains(&Fault::ProduceRewritesCompressedBatches) {
-        return None;
-    }
     let batch = batches.first()?;
     if !matches!(batch.records, records::Records::Compressed { .. }) {
+        return None;
+    }
+    let wanted = match batch.attributes & 0b111 {
+        1 => Fault::ProduceRewritesGzipBatches,
+        2 => Fault::ProduceRewritesSnappyBatches,
+        3 => Fault::ProduceRewritesLz4Batches,
+        4 => Fault::ProduceRewritesZstdBatches,
+        _ => return None,
+    };
+    if !faults.contains(&wanted) {
         return None;
     }
     let _ = set;

@@ -110,8 +110,17 @@ const SENSITIVITY: &[(Fault, &str)] = &[
         "txn/offsets-wait-for-the-commit",
     ),
     (
-        Fault::ProduceRewritesCompressedBatches,
-        "produce/compressed-batch-passthrough",
+        Fault::ProduceRewritesGzipBatches,
+        "produce/gzip-passthrough",
+    ),
+    (
+        Fault::ProduceRewritesSnappyBatches,
+        "produce/snappy-passthrough",
+    ),
+    (Fault::ProduceRewritesLz4Batches, "produce/lz4-passthrough"),
+    (
+        Fault::ProduceRewritesZstdBatches,
+        "produce/zstd-passthrough",
     ),
     (Fault::FetchIgnoresMaxWait, "fetch/long-poll-contract"),
     (

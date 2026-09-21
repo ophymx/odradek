@@ -651,13 +651,16 @@ dependencies = [
  "base64",
  "bytes",
  "flate2",
+ "lz4_flex",
  "odradek-client",
  "odradek-protocol",
  "odradek-sasl",
  "serde",
  "serde_json",
+ "snap",
  "thiserror",
  "tokio",
+ "zstd",
 ]
 
 [[package]]
