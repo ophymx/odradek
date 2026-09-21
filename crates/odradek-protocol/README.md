@@ -25,6 +25,21 @@ the exact same codec.
   byte-identically — verified against a golden segment from a real
   Kafka 4.1 broker.
 - **Malformed input never panics.** Decoders return typed errors.
+  Fuzzed every build: bit flips, truncations, splices and synthesized
+  bytes against every generated type at every version it speaks, plus
+  the record-set and header decoders. `src/fuzz.rs` holds that, the
+  proxy guarantee above, and the round-trip below.
+- **One pass through the codec settles.** A message is not guaranteed to
+  re-encode to the bytes it arrived as, but re-encoding what was decoded
+  always produces bytes that decode to the same value and re-encode
+  unchanged. Three values have more than one spelling on the wire and
+  the decoder accepts all of them, as the reference implementation does:
+  a `BOOLEAN` is any non-zero byte and is written back as `0x01`, a
+  nullable struct's marker is any negative byte and is written back as
+  `0xff`, and an overlong varint decodes to the value it spells and is
+  written back minimally. A proxy built on this crate normalizes those
+  three, which for the last one means forwarding a message shorter than
+  the one it received. Each has a test naming it.
 - **Decoding is bounded.** A wire count is an instruction to allocate
   and the peer chooses it, so every decoder spends against a budget
   sized from its input: at most `clamp(16 × n, 64 KiB, 256 MiB)` bytes

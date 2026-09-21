@@ -79,6 +79,8 @@ pub mod consumer_protocol;
 pub mod error;
 pub mod error_code;
 pub mod frame;
+#[cfg(test)]
+mod fuzz;
 pub mod header;
 pub mod message;
 pub mod messages;

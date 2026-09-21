@@ -147,6 +147,230 @@ pub fn request_is_flexible(api_key: i16, api_version: i16) -> Option<bool> {
     }
 }
 
+/// Invoke `$each!` once per keyed message type, request and
+/// response alike, as `$each!(Type, "Type")`.
+///
+/// Generated, so it cannot fall behind the schemas: a test that
+/// iterates this covers a new message the day it is generated.
+///
+/// Keyed only — the headers and the embedded consumer-protocol
+/// types have no api key, so they implement no [`crate::Message`]
+/// and there is nothing generic to call on them. A caller that
+/// wants those has to name them.
+///
+/// Behind `cfg(test)` because that is the whole of its use
+/// today, and an unused macro is a warning this workspace
+/// treats as an error. Non-test callers exist in principle —
+/// a proxy's dispatch loop is the obvious one — and the day
+/// one arrives, this attribute is what it edits.
+#[cfg(test)]
+macro_rules! for_each_message {
+    ($each:ident) => {
+        $each!(
+            $crate::messages::add_offsets_to_txn_request::AddOffsetsToTxnRequest,
+            "AddOffsetsToTxnRequest"
+        );
+        $each!(
+            $crate::messages::add_offsets_to_txn_response::AddOffsetsToTxnResponse,
+            "AddOffsetsToTxnResponse"
+        );
+        $each!(
+            $crate::messages::add_partitions_to_txn_request::AddPartitionsToTxnRequest,
+            "AddPartitionsToTxnRequest"
+        );
+        $each!(
+            $crate::messages::add_partitions_to_txn_response::AddPartitionsToTxnResponse,
+            "AddPartitionsToTxnResponse"
+        );
+        $each!(
+            $crate::messages::api_versions_request::ApiVersionsRequest,
+            "ApiVersionsRequest"
+        );
+        $each!(
+            $crate::messages::api_versions_response::ApiVersionsResponse,
+            "ApiVersionsResponse"
+        );
+        $each!(
+            $crate::messages::consumer_group_heartbeat_request::ConsumerGroupHeartbeatRequest,
+            "ConsumerGroupHeartbeatRequest"
+        );
+        $each!(
+            $crate::messages::consumer_group_heartbeat_response::ConsumerGroupHeartbeatResponse,
+            "ConsumerGroupHeartbeatResponse"
+        );
+        $each!(
+            $crate::messages::create_topics_request::CreateTopicsRequest,
+            "CreateTopicsRequest"
+        );
+        $each!(
+            $crate::messages::create_topics_response::CreateTopicsResponse,
+            "CreateTopicsResponse"
+        );
+        $each!(
+            $crate::messages::delete_topics_request::DeleteTopicsRequest,
+            "DeleteTopicsRequest"
+        );
+        $each!(
+            $crate::messages::delete_topics_response::DeleteTopicsResponse,
+            "DeleteTopicsResponse"
+        );
+        $each!(
+            $crate::messages::describe_configs_request::DescribeConfigsRequest,
+            "DescribeConfigsRequest"
+        );
+        $each!(
+            $crate::messages::describe_configs_response::DescribeConfigsResponse,
+            "DescribeConfigsResponse"
+        );
+        $each!(
+            $crate::messages::describe_groups_request::DescribeGroupsRequest,
+            "DescribeGroupsRequest"
+        );
+        $each!(
+            $crate::messages::describe_groups_response::DescribeGroupsResponse,
+            "DescribeGroupsResponse"
+        );
+        $each!(
+            $crate::messages::end_txn_request::EndTxnRequest,
+            "EndTxnRequest"
+        );
+        $each!(
+            $crate::messages::end_txn_response::EndTxnResponse,
+            "EndTxnResponse"
+        );
+        $each!(
+            $crate::messages::fetch_request::FetchRequest,
+            "FetchRequest"
+        );
+        $each!(
+            $crate::messages::fetch_response::FetchResponse,
+            "FetchResponse"
+        );
+        $each!(
+            $crate::messages::find_coordinator_request::FindCoordinatorRequest,
+            "FindCoordinatorRequest"
+        );
+        $each!(
+            $crate::messages::find_coordinator_response::FindCoordinatorResponse,
+            "FindCoordinatorResponse"
+        );
+        $each!(
+            $crate::messages::heartbeat_request::HeartbeatRequest,
+            "HeartbeatRequest"
+        );
+        $each!(
+            $crate::messages::heartbeat_response::HeartbeatResponse,
+            "HeartbeatResponse"
+        );
+        $each!(
+            $crate::messages::init_producer_id_request::InitProducerIdRequest,
+            "InitProducerIdRequest"
+        );
+        $each!(
+            $crate::messages::init_producer_id_response::InitProducerIdResponse,
+            "InitProducerIdResponse"
+        );
+        $each!(
+            $crate::messages::join_group_request::JoinGroupRequest,
+            "JoinGroupRequest"
+        );
+        $each!(
+            $crate::messages::join_group_response::JoinGroupResponse,
+            "JoinGroupResponse"
+        );
+        $each!(
+            $crate::messages::leave_group_request::LeaveGroupRequest,
+            "LeaveGroupRequest"
+        );
+        $each!(
+            $crate::messages::leave_group_response::LeaveGroupResponse,
+            "LeaveGroupResponse"
+        );
+        $each!(
+            $crate::messages::list_groups_request::ListGroupsRequest,
+            "ListGroupsRequest"
+        );
+        $each!(
+            $crate::messages::list_groups_response::ListGroupsResponse,
+            "ListGroupsResponse"
+        );
+        $each!(
+            $crate::messages::list_offsets_request::ListOffsetsRequest,
+            "ListOffsetsRequest"
+        );
+        $each!(
+            $crate::messages::list_offsets_response::ListOffsetsResponse,
+            "ListOffsetsResponse"
+        );
+        $each!(
+            $crate::messages::metadata_request::MetadataRequest,
+            "MetadataRequest"
+        );
+        $each!(
+            $crate::messages::metadata_response::MetadataResponse,
+            "MetadataResponse"
+        );
+        $each!(
+            $crate::messages::offset_commit_request::OffsetCommitRequest,
+            "OffsetCommitRequest"
+        );
+        $each!(
+            $crate::messages::offset_commit_response::OffsetCommitResponse,
+            "OffsetCommitResponse"
+        );
+        $each!(
+            $crate::messages::offset_fetch_request::OffsetFetchRequest,
+            "OffsetFetchRequest"
+        );
+        $each!(
+            $crate::messages::offset_fetch_response::OffsetFetchResponse,
+            "OffsetFetchResponse"
+        );
+        $each!(
+            $crate::messages::produce_request::ProduceRequest,
+            "ProduceRequest"
+        );
+        $each!(
+            $crate::messages::produce_response::ProduceResponse,
+            "ProduceResponse"
+        );
+        $each!(
+            $crate::messages::sasl_authenticate_request::SaslAuthenticateRequest,
+            "SaslAuthenticateRequest"
+        );
+        $each!(
+            $crate::messages::sasl_authenticate_response::SaslAuthenticateResponse,
+            "SaslAuthenticateResponse"
+        );
+        $each!(
+            $crate::messages::sasl_handshake_request::SaslHandshakeRequest,
+            "SaslHandshakeRequest"
+        );
+        $each!(
+            $crate::messages::sasl_handshake_response::SaslHandshakeResponse,
+            "SaslHandshakeResponse"
+        );
+        $each!(
+            $crate::messages::sync_group_request::SyncGroupRequest,
+            "SyncGroupRequest"
+        );
+        $each!(
+            $crate::messages::sync_group_response::SyncGroupResponse,
+            "SyncGroupResponse"
+        );
+        $each!(
+            $crate::messages::txn_offset_commit_request::TxnOffsetCommitRequest,
+            "TxnOffsetCommitRequest"
+        );
+        $each!(
+            $crate::messages::txn_offset_commit_response::TxnOffsetCommitResponse,
+            "TxnOffsetCommitResponse"
+        );
+    };
+}
+#[cfg(test)]
+pub(crate) use for_each_message;
+
 /// The version range this schema snapshot speaks for `api_key`'s
 /// request type, or `None` for keys with no generated support.
 pub fn supported_versions(api_key: i16) -> Option<(i16, i16)> {

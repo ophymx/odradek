@@ -137,6 +137,52 @@ fn codegen() -> Result<()> {
     }
     let _ = writeln!(mod_rs, "        _ => None,\n    }}\n}}");
 
+    // Every generated type, as a list something can be written *over*.
+    // A test that enumerates message types by hand is a list that goes
+    // stale the first time a schema is added, and goes stale silently —
+    // the missing type simply stops being covered. Emitting it here
+    // means codegen-sync in CI keeps it exhaustive for free.
+    //
+    // Crate-internal on purpose. It would make a reasonable public
+    // macro, and a proxy with its own dispatch loop is the obvious
+    // caller, but a `#[macro_export]` is permanent in a way this has
+    // not earned yet.
+    let _ = writeln!(
+        mod_rs,
+        "\n/// Invoke `$each!` once per keyed message type, request and\n\
+         /// response alike, as `$each!(Type, \"Type\")`.\n\
+         ///\n\
+         /// Generated, so it cannot fall behind the schemas: a test that\n\
+         /// iterates this covers a new message the day it is generated.\n\
+         ///\n\
+         /// Keyed only — the headers and the embedded consumer-protocol\n\
+         /// types have no api key, so they implement no [`crate::Message`]\n\
+         /// and there is nothing generic to call on them. A caller that\n\
+         /// wants those has to name them.\n\
+         ///\n\
+         /// Behind `cfg(test)` because that is the whole of its use\n\
+         /// today, and an unused macro is a warning this workspace\n\
+         /// treats as an error. Non-test callers exist in principle —\n\
+         /// a proxy's dispatch loop is the obvious one — and the day\n\
+         /// one arrives, this attribute is what it edits.\n\
+         #[cfg(test)]\n\
+         macro_rules! for_each_message {{\n    ($each:ident) => {{"
+    );
+    for (module, msg) in &module_names {
+        if msg.api_key.is_none() {
+            continue;
+        }
+        let _ = writeln!(
+            mod_rs,
+            "        $each!($crate::messages::{module}::{}, \"{}\");",
+            msg.name, msg.name
+        );
+    }
+    let _ = writeln!(
+        mod_rs,
+        "    }};\n}}\n#[cfg(test)]\npub(crate) use for_each_message;"
+    );
+
     let _ = writeln!(
         mod_rs,
         "\n/// The version range this schema snapshot speaks for `api_key`'s\n\
