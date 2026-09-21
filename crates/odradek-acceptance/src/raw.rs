@@ -38,13 +38,26 @@ pub enum WireError {
 #[derive(Debug)]
 pub struct RawConnection {
     stream: TcpStream,
+    peer: String,
 }
 
 impl RawConnection {
+    /// The address this connection was opened to.
+    ///
+    /// Kept as it was given rather than read back from the socket: a
+    /// caller that wants a second connection to the same broker wants
+    /// the address it would dial, not the resolved one.
+    pub fn peer(&self) -> &str {
+        &self.peer
+    }
+
     pub async fn connect(addr: &str) -> Result<RawConnection, WireError> {
         let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
-        Ok(RawConnection { stream })
+        Ok(RawConnection {
+            stream,
+            peer: addr.to_owned(),
+        })
     }
 
     /// Write one length-prefixed frame.

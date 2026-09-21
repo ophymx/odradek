@@ -457,6 +457,13 @@ pub static SERVER_CHECKS: &[Check] = &[
             Box::pin(cluster_committed_offsets_outlive_the_coordinator(ctx))
         }),
     },
+    Check {
+        id: "versions/advertised-versions-are-speakable",
+        requirement: "answers every version of every api it advertises, in the \
+                      shape that version specifies — an advertised range the \
+                      server cannot serve sends clients to a version that fails",
+        runner: Runner::Server(|ctx| Box::pin(versions_advertised_are_speakable(ctx))),
+    },
 ];
 
 /// How to take one of the subject's brokers away, and give it back.
@@ -636,6 +643,13 @@ impl CheckError {
         match self {
             CheckError::Infra(d) => CheckError::Infra(format!("{what}: {d}")),
             CheckError::Violation(d) => CheckError::Violation(format!("{what}: {d}")),
+        }
+    }
+
+    /// What went wrong, without saying whose fault it was.
+    fn details(&self) -> &str {
+        match self {
+            CheckError::Infra(d) | CheckError::Violation(d) => d,
         }
     }
 
@@ -3447,6 +3461,17 @@ async fn metadata_flexible_header(ctx: &ServerCtx) -> Verdict {
 
 /// Newest name-addressed Produce/Fetch versions: v13+ switches to topic
 /// ids, which the `*/topic-id` checks exercise separately.
+/// The first Produce version that carries a v2 record batch.
+///
+/// Below it the request body is a *message set* — the pre-KIP-98
+/// format, with its own framing and no producer id — which this
+/// workspace does not model and does not intend to: the record batch
+/// and its crc are the thing the protocol crate exists to get right.
+/// So v0-v2 are unspeakable here whatever the server does, and a sweep
+/// that sent a modern batch at them would be reporting its own
+/// limitation as the subject's fault. Apache Kafka 4.1 still advertises
+/// Produce from v0.
+const PRODUCE_RECORD_BATCH_MIN: i16 = 3;
 const PRODUCE_NAME_MAX: i16 = 12;
 const FETCH_NAME_MAX: i16 = 12;
 /// First topic-id-addressed versions.
@@ -3513,6 +3538,9 @@ fn probe_batch() -> RecordBatch {
 /// record set bytes that were sent.
 struct ProducedTopic {
     conn: RawConnection,
+    /// Where `conn` points: the partition leader, for callers that need
+    /// a second connection to the same broker.
+    addr: String,
     topic: String,
     /// From CreateTopics (v7+ returns it); zero-uuid means unknown.
     topic_id: [u8; 16],
@@ -3674,6 +3702,7 @@ async fn produce_flow(
         let code = ErrorCode(partition.error_code);
         if code.is_ok() {
             return Ok(ProducedTopic {
+                addr: conn.peer().to_owned(),
                 conn,
                 topic,
                 topic_id,
@@ -8406,4 +8435,303 @@ async fn cluster_committed_offsets_outlive_the_coordinator(ctx: &ServerCtx) -> V
         }),
     )
     .await
+}
+
+// ---------------------------------------------------------------------
+// Version sweep
+// ---------------------------------------------------------------------
+
+/// Every version a server advertises must be one it can actually speak.
+///
+/// ApiVersions is a promise: a client reads the advertised range and
+/// picks from it, usually the highest it also understands. A server that
+/// advertises a version it cannot serve has told every client to go
+/// somewhere that does not work, and the failure lands at whatever
+/// moment that client happens to negotiate — which is to say, on
+/// upgrade, in production, for the newest clients first.
+///
+/// The suite mostly negotiates the *highest* version on offer, which is
+/// the interesting one for behaviour and the least interesting one for
+/// coverage: it leaves everything below it unspoken. Five apis are
+/// already swept across their whole range by the checks that own them
+/// (Metadata, Fetch by name, ListOffsets, FindCoordinator,
+/// OffsetFetch). This sweeps ones that were pinned to a single version,
+/// plus the id-addressed half of Fetch, where only the topmost version
+/// was ever sent.
+///
+/// **It judges shape, and nothing else.** An error code is a fine
+/// answer here; what is not fine is a version that cannot be spoken at
+/// all — a connection closed, a body that will not decode at the
+/// version it was requested at, bytes left over afterwards. That
+/// restraint is not modesty, it is what keeps the suite calibrated: a
+/// check that sweeps many apis overlaps every check that owns one of
+/// them, and if it asserted their semantics too, every fault would trip
+/// two checks and neither would be evidence of anything in particular.
+/// For the same reason ApiVersions itself is not swept here — it has
+/// four checks of its own, including both header quirks.
+///
+/// What it exercises is as much this crate as the subject. Each
+/// exchange is encoded at version *n* by the generated codec and the
+/// response decoded at version *n* and required to consume the frame
+/// exactly, so a schema this crate models wrongly at some version fails
+/// here and reads as the server's fault. The matrix is what tells them
+/// apart: a version that fails against every implementation is ours,
+/// one that fails against a single implementation is theirs. That is
+/// why the failure lists every (api, version) pair rather than stopping
+/// at the first.
+///
+/// Not swept, and honestly: the group lifecycle (JoinGroup, SyncGroup,
+/// Heartbeat, LeaveGroup, ConsumerGroupHeartbeat), the transaction
+/// apis, and the SASL exchange. Each is a *sequence* whose steps must
+/// agree on a version and which leaves state behind, so sweeping them
+/// means standing up a fresh member or producer per version rather than
+/// re-sending one request. Worth doing; not done here.
+async fn versions_advertised_are_speakable(ctx: &ServerCtx) -> Verdict {
+    let produced = match produce_flow(ctx, "sweep", Addressing::Name).await {
+        Ok(p) => p,
+        Err(verdict) => return verdict,
+    };
+    let topic = produced.topic.clone();
+    let topic_id = produced.topic_id;
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut swept: Vec<String> = Vec::new();
+
+    // Produce, by name. The id-addressed version is the newest one and
+    // `produce/topic-id` already sends it.
+    if let Ok(versions) = versions_of(
+        ctx,
+        ProduceRequest::API_KEY,
+        "Produce",
+        PRODUCE_RECORD_BATCH_MIN,
+        PRODUCE_NAME_MAX,
+    ) {
+        for version in &versions {
+            let correlation = 1_600 + i32::from(*version);
+            // A fresh connection per version. A server that refuses a
+            // version by closing the connection would otherwise condemn
+            // every version after it, and the report would say thirteen
+            // versions are unspeakable when one is.
+            let mut conn = match connect(&produced.addr).await {
+                Ok(c) => c,
+                Err(e) => return e.into_verdict(),
+            };
+            // The code is not this check's business; that it answered in
+            // the shape v{version} specifies is.
+            if let Err(e) = produce_stamped(
+                &mut conn,
+                *version,
+                ProduceStamp::plain(),
+                &topic,
+                0,
+                correlation,
+            )
+            .await
+            {
+                failures.push(format!("Produce v{version}: {}", e.details()));
+            }
+        }
+        swept.push(format!("Produce {}", span(&versions)));
+    }
+
+    // Fetch, by topic id — the half `fetch/batch-integrity` does not
+    // reach, since it sweeps only the name-addressed versions.
+    if topic_id != [0u8; 16] {
+        if let Ok(versions) = versions_of(
+            ctx,
+            FetchRequest::API_KEY,
+            "Fetch",
+            FETCH_ID_MIN,
+            FetchRequest::MAX_VERSION,
+        ) {
+            for version in &versions {
+                let correlation = 1_640 + i32::from(*version);
+                let mut conn = match connect(&produced.addr).await {
+                    Ok(c) => c,
+                    Err(e) => return e.into_verdict(),
+                };
+                if let Err(e) = sweep_fetch_by_id(&mut conn, *version, topic_id, correlation).await
+                {
+                    failures.push(format!("Fetch v{version} (by id): {}", e.details()));
+                }
+            }
+            swept.push(format!("Fetch-by-id {}", span(&versions)));
+        }
+    }
+
+    // OffsetCommit, to the group's coordinator.
+    let group = check_group("sweep");
+    let commit_max = if topic_id == [0u8; 16] {
+        OFFSETS_BY_TOPIC_ID - 1
+    } else {
+        OffsetCommitRequest::MAX_VERSION
+    };
+    if let Ok(versions) = versions_of(
+        ctx,
+        OffsetCommitRequest::API_KEY,
+        "OffsetCommit",
+        OffsetCommitRequest::MIN_VERSION,
+        commit_max,
+    ) {
+        for version in &versions {
+            let correlation = 1_680 + i32::from(*version);
+            let mut conn = match coordinator_conn(ctx, &group).await {
+                Ok(c) => c,
+                Err(e) => return e.context("locating the group coordinator").into_verdict(),
+            };
+            if let Err(e) =
+                sweep_offset_commit(&mut conn, *version, &group, &topic, topic_id, correlation)
+                    .await
+            {
+                failures.push(format!("OffsetCommit v{version}: {}", e.details()));
+            }
+        }
+        swept.push(format!("OffsetCommit {}", span(&versions)));
+    }
+
+    // CreateTopics, asked not to create. v0 has no `validate_only`
+    // field, so there it really does create — hence a fresh name per
+    // version rather than one shared throughout.
+    if let Ok(versions) = versions_of(
+        ctx,
+        CreateTopicsRequest::API_KEY,
+        "CreateTopics",
+        CreateTopicsRequest::MIN_VERSION,
+        CreateTopicsRequest::MAX_VERSION,
+    ) {
+        for version in &versions {
+            let mut conn = match connect(&ctx.addr).await {
+                Ok(c) => c,
+                Err(e) => return e.into_verdict(),
+            };
+            let name = unique_topic(&format!("sweepct{version}"));
+            let correlation = 1_720 + i32::from(*version) * 4;
+            if let Err(e) =
+                create_topic_call(ctx, &mut conn, *version, &name, true, correlation).await
+            {
+                failures.push(format!("CreateTopics v{version}: {}", e.details()));
+            }
+        }
+        swept.push(format!("CreateTopics {}", span(&versions)));
+    }
+
+    if swept.is_empty() {
+        return Verdict::Skipped {
+            reason: "the subject advertises none of the apis this sweeps".into(),
+        };
+    }
+    if failures.is_empty() {
+        return Verdict::Pass;
+    }
+    Verdict::Fail {
+        details: format!(
+            "{} advertised version(s) could not be spoken. Swept {}. {}",
+            failures.len(),
+            swept.join(", "),
+            failures.join("; ")
+        ),
+    }
+}
+
+/// A topic-id-addressed fetch, decoded and thrown away.
+///
+/// Deliberately not [`run_fetch`], which also demands the response echo
+/// the requested topic id — that is `fetch/topic-id`'s requirement, and
+/// borrowing it here would make its fault trip two checks.
+async fn sweep_fetch_by_id(
+    conn: &mut RawConnection,
+    version: i16,
+    topic_id: [u8; 16],
+    correlation: i32,
+) -> Result<(), CheckError> {
+    let mut partition = FetchPartition::default();
+    partition.partition = 0;
+    partition.current_leader_epoch = -1;
+    partition.fetch_offset = 0;
+    partition.last_fetched_epoch = -1;
+    partition.log_start_offset = -1;
+    partition.partition_max_bytes = 1 << 20;
+    let mut fetch_topic = FetchTopic::default();
+    fetch_topic.topic_id = topic_id;
+    fetch_topic.partitions = vec![partition];
+    let mut request = FetchRequest::default();
+    request.max_wait_ms = 500;
+    request.min_bytes = 0;
+    request.max_bytes = 1 << 22;
+    request.session_id = 0;
+    request.session_epoch = -1;
+    request.topics = vec![fetch_topic];
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding Fetch: {e}")))?;
+    let _: FetchResponse =
+        api_call(conn, FetchRequest::API_KEY, version, correlation, &body).await?;
+    Ok(())
+}
+
+/// An offset commit, decoded and thrown away.
+///
+/// Not [`commit_offset`], which reports a non-zero code as a violation.
+/// Here the code is the coordinator's business: only the shape is this
+/// check's.
+async fn sweep_offset_commit(
+    conn: &mut RawConnection,
+    version: i16,
+    group: &str,
+    topic: &str,
+    topic_id: [u8; 16],
+    correlation: i32,
+) -> Result<(), CheckError> {
+    let mut partition = OffsetCommitRequestPartition::default();
+    partition.partition_index = 0;
+    partition.committed_offset = 1;
+    partition.committed_leader_epoch = -1;
+    let mut req_topic = OffsetCommitRequestTopic::default();
+    if version >= OFFSETS_BY_TOPIC_ID {
+        req_topic.topic_id = topic_id;
+    } else {
+        req_topic.name = topic.to_owned();
+    }
+    req_topic.partitions = vec![partition];
+    let mut request = OffsetCommitRequest::default();
+    request.group_id = group.to_owned();
+    request.generation_id_or_member_epoch = -1;
+    request.member_id = String::new();
+    request.retention_time_ms = -1;
+    request.topics = vec![req_topic];
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding OffsetCommit: {e}")))?;
+    let _: OffsetCommitResponse = api_call(
+        conn,
+        OffsetCommitRequest::API_KEY,
+        version,
+        correlation,
+        &body,
+    )
+    .await?;
+    Ok(())
+}
+
+/// The versions of `api_key` that both the subject advertises and this
+/// sweep can send, or `Err` when there are none.
+fn versions_of(
+    ctx: &ServerCtx,
+    api_key: i16,
+    api: &'static str,
+    min: i16,
+    max: i16,
+) -> Result<Vec<i16>, Verdict> {
+    negotiate_all(api, ctx.range(api_key)?, min, max)
+}
+
+/// `v0-12`, or `v7` when there is only one.
+fn span(versions: &[i16]) -> String {
+    match (versions.first(), versions.last()) {
+        (Some(first), Some(last)) if first != last => format!("v{first}-{last}"),
+        (Some(only), _) => format!("v{only}"),
+        _ => "none".into(),
+    }
 }

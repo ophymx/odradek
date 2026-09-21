@@ -261,6 +261,10 @@ const SENSITIVITY: &[(Fault, &str)] = &[
         Fault::OffsetsDieWithTheirCoordinator,
         "cluster/committed-offsets-outlive-the-coordinator",
     ),
+    (
+        Fault::MisshapesOneProduceVersion,
+        "versions/advertised-versions-are-speakable",
+    ),
 ];
 
 /// The calibration registry is exhaustive in both directions against the

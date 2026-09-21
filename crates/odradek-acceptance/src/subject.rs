@@ -208,6 +208,18 @@ pub enum Fault {
     /// coordinated them, so a consumer that resumes after a failure
     /// reprocesses everything since.
     OffsetsDieWithTheirCoordinator,
+    /// Answer one Produce version in the shape of another, while
+    /// continuing to advertise it. The range stays well-formed and
+    /// every other version works, which is what makes this the
+    /// plausible bug rather than an obvious one — a schema bumped
+    /// without its handler, found only by a client that happens to
+    /// negotiate that version.
+    ///
+    /// v5 because nothing else in the suite sends it: the produce
+    /// checks negotiate the highest version on offer, so a fault on
+    /// one of those would trip them too, and a fault that trips two
+    /// checks is evidence about neither.
+    MisshapesOneProduceVersion,
     /// Refuse an unsupported mechanism without naming any supported
     /// one, leaving the client nothing to fall back to.
     SaslHandshakeHidesMechanisms,
@@ -402,6 +414,7 @@ impl Fault {
         Fault::AnyBrokerServesGroups,
         Fault::LeadershipStaysWithTheStoppedBroker,
         Fault::OffsetsDieWithTheirCoordinator,
+        Fault::MisshapesOneProduceVersion,
     ];
 }
 
@@ -2527,10 +2540,19 @@ fn produce_exchange(
     }
     let mut resp = ProduceResponse::default();
     resp.responses = responses;
+    // The advertised range still claims this version; only the answer
+    // is in the wrong shape. A v0 produce response carries neither
+    // throttle time nor log-start offset, so read as v5 it runs out of
+    // body — which is exactly how a version nobody tests fails.
+    let encode_at = if faults.contains(&Fault::MisshapesOneProduceVersion) && api_version == 5 {
+        0
+    } else {
+        api_version
+    };
     frame_response(
         req_header.correlation_id,
         response_header_version(ProduceRequest::API_KEY, api_version),
-        |out| resp.encode(out, api_version).unwrap(),
+        |out| resp.encode(out, encode_at).unwrap(),
         false,
     )
 }

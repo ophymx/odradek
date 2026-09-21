@@ -59,6 +59,7 @@
     "txn/offsets-wait-for-the-commit": "pass",
     "txn/open-transaction-holds-the-stable-offset": "pass",
     "txn/stale-epoch-is-fenced": "pass",
-    "txn/unannounced-write-stays-in-the-transaction": "pass"
+    "txn/unannounced-write-stays-in-the-transaction": "pass",
+    "versions/advertised-versions-are-speakable": "pass"
   }
 }

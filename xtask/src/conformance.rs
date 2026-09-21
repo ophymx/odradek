@@ -41,6 +41,64 @@ use crate::workspace_root;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Docker label naming the xtask process that owns a container or
+/// network.
+const OWNER_LABEL: &str = "odradek-accept-owner";
+
+/// Remove containers and networks left behind by an xtask that is no
+/// longer running.
+///
+/// `Drop for Container` handles every ordinary ending, including the
+/// error and panic paths. It cannot handle the process being killed
+/// outright — and since the recovery checks need containers that
+/// survive being stopped, `--rm` is not available to catch that either.
+/// A killed run therefore leaves brokers running: on a developer's
+/// machine, several of them, for hours, quietly competing with the next
+/// run for the cores its timing assumptions depend on.
+///
+/// Keyed on the owning pid rather than on age or on the name, so a run
+/// happening right now on the same machine is never disturbed: only a
+/// container whose owner is gone is swept. A pid we cannot ask about is
+/// left alone, which is the safe direction to be wrong in.
+fn sweep_strays() {
+    let label = format!("label={OWNER_LABEL}");
+    for (kind, list) in [
+        ("container", vec!["ps", "-aq"]),
+        ("network", vec!["network", "ls", "-q"]),
+    ] {
+        let mut args = list;
+        args.extend(["--filter", label.as_str()]);
+        let Ok(out) = Command::new("docker").args(&args).output() else {
+            return;
+        };
+        for id in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+            let Ok(inspect) = Command::new("docker")
+                .args([
+                    "inspect",
+                    "-f",
+                    &format!("{{{{index .Config.Labels \"{OWNER_LABEL}\"}}}}"),
+                    id,
+                ])
+                .output()
+            else {
+                continue;
+            };
+            let owner = String::from_utf8_lossy(&inspect.stdout).trim().to_owned();
+            // A label we cannot read, or a pid still alive: leave it.
+            if owner.is_empty() || Path::new(&format!("/proc/{owner}")).exists() {
+                continue;
+            }
+            let removed = match kind {
+                "container" => Command::new("docker").args(["rm", "-f", "-v", id]).status(),
+                _ => Command::new("docker").args(["network", "rm", id]).status(),
+            };
+            if matches!(removed, Ok(status) if status.success()) {
+                eprintln!("removed stray {kind} {id} from pid {owner}");
+            }
+        }
+    }
+}
+
 struct Subject {
     /// Baseline file stem, e.g. `apache-kafka-4.1.0`.
     name: &'static str,
@@ -272,6 +330,12 @@ const SUBJECTS: &[Subject] = &[
 ];
 
 pub fn conformance(args: &[String]) -> Result<()> {
+    // Before anything else, including argument validation: a machine
+    // carrying brokers from a run that died is a machine this run's
+    // timing assumptions are wrong about, and that is true however this
+    // one was invoked.
+    sweep_strays();
+
     let record = args.iter().any(|a| a == "--record");
     let proxied = !args.iter().any(|a| a == "--no-proxy");
     let filters: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
@@ -968,6 +1032,11 @@ impl Container {
             "-d".into(),
             "--name".into(),
             spec.name.into(),
+            // Stamped with the pid that owns it, so a later run can tell
+            // a container this one is still using from one whose owner
+            // died before `Drop` could run. See `sweep_strays`.
+            "--label".into(),
+            format!("{OWNER_LABEL}={}", std::process::id()),
             "-p".into(),
             format!("127.0.0.1:{}:9092", spec.port),
         ];
@@ -1031,10 +1100,11 @@ impl Drop for Container {
         // away — including on the error and panic paths this guard
         // exists for.
         //
-        // This is now the only thing that removes a container, since
-        // dropping `--rm` was what made the recovery checks possible.
-        // An xtask killed outright therefore leaves containers behind;
-        // they are named `odradek-accept-*` and cost a `docker rm -f`.
+        // The ordinary path, and the only one `--rm` used to cover:
+        // dropping it is what made the recovery checks possible, since
+        // a container that removes itself on stop cannot be started
+        // again. An xtask killed outright runs no destructor at all, so
+        // `sweep_strays` collects what this misses on the next run.
         let child = Command::new("docker")
             .args(["rm", "-f", &self.name])
             .stdin(Stdio::null())
@@ -1058,8 +1128,9 @@ struct Network {
 
 impl Network {
     fn create(name: &str) -> Result<Network> {
+        let owner = format!("{OWNER_LABEL}={}", std::process::id());
         let out = Command::new("docker")
-            .args(["network", "create", name])
+            .args(["network", "create", "--label", &owner, name])
             .output()
             .context("running docker network create")?;
         if !out.status.success() {
