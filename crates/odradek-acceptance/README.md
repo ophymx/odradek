@@ -345,7 +345,9 @@ Two subjects, six scenarios each: a producer, a consumer, and one per
 injected fault. The faults are the point — five of the eleven client
 checks have nothing to judge until one is armed, so a matrix that ran
 only the happy path would leave nearly half the catalogue skipping and
-report it as a pass. Between the six, every check is exercised.
+report it as a pass. Every check is exercised across the twelve, though
+not by each subject alone: `client/honours-throttle-time` reaches a
+verdict only for the sequential one, for the reason given above.
 
 The subjects are **kcat 1.7.1** (so librdkafka), run from its published
 image, and **`odradek-client`**, run as a cargo example from this
