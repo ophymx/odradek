@@ -348,16 +348,86 @@ enum LiveEdge {
     At(Option<i64>),
 }
 
-/// Whether the ring holds everything a subscriber at `cursor` is owed.
-///
-/// `ring_floor` is the position the ring begins after, so the test is
-/// simply whether the subscriber has got that far: it has seen
-/// everything up to the floor, and the ring covers the floor onward.
-/// `None` on either side is the start of the log, which sorts below
-/// every position — a subscriber replaying from the beginning is served
-/// from the ring exactly when the ring has never evicted anything.
-fn ring_covers(cursor: Option<i64>, ring_floor: Option<i64>) -> bool {
+/// The same test as [`Ring::covers`], for the one caller that has a
+/// floor value rather than the ring: `needs_fetch` is a method on a
+/// subscriber and the pump hands it the floor. Kept next to the ring so
+/// the two cannot drift.
+fn cursor_covered_by(cursor: Option<i64>, ring_floor: Option<i64>) -> bool {
     cursor >= ring_floor
+}
+
+/// The replay window, and the position it begins *after*.
+///
+/// A type rather than a `VecDeque` and a loose `Option<i64>` because
+/// the two have an invariant between them — the floor is the position
+/// of whatever last fell out — and an invariant maintained inline in a
+/// six-hundred-line loop is one nothing can be pointed at. Here it has
+/// a name, and the tests at the bottom of this file hold it to sparse
+/// positions, where getting it wrong is visible.
+///
+/// The floor is *carried*, not derived. Deriving it from the oldest
+/// event the ring still holds would need the position before that one,
+/// which is the arithmetic this engine does not do: on a source whose
+/// positions are not dense there is no such thing as "one before".
+/// Carrying it costs one assignment per eviction.
+struct Ring {
+    events: VecDeque<SharedEvent>,
+    /// `None` is the start of the log, which sorts below every
+    /// position — so a ring that has never evicted anything covers a
+    /// subscriber replaying from the beginning.
+    floor: Option<i64>,
+    capacity: usize,
+}
+
+impl Ring {
+    fn new(capacity: usize) -> Ring {
+        Ring {
+            events: VecDeque::new(),
+            floor: None,
+            capacity,
+        }
+    }
+
+    /// Everything this ring will ever hold comes after `start`.
+    ///
+    /// Said once, when the pump learns where live begins and the ring
+    /// is still empty.
+    fn rebase(&mut self, start: Option<i64>) {
+        self.floor = start;
+    }
+
+    /// Add the newest event, evicting the oldest if the window is full.
+    fn push(&mut self, event: SharedEvent) {
+        self.events.push_back(event);
+        while self.events.len() > self.capacity {
+            // What falls out is what the ring now begins after.
+            if let Some(dropped) = self.events.pop_front() {
+                self.floor = Some(dropped.offset);
+            }
+        }
+    }
+
+    fn floor(&self) -> Option<i64> {
+        self.floor
+    }
+
+    /// Whether the ring holds everything a subscriber at `cursor` is
+    /// owed: it has seen everything up to the floor, and the ring
+    /// covers the floor onward.
+    fn covers(&self, cursor: Option<i64>) -> bool {
+        cursor >= self.floor
+    }
+
+    /// The events after `cursor`, oldest first.
+    ///
+    /// A binary search rather than a scan over everything already sent;
+    /// the ring is position-sorted because a log is.
+    fn after(&self, cursor: Option<i64>) -> std::collections::vec_deque::Iter<'_, SharedEvent> {
+        let from = self
+            .events
+            .partition_point(|event| Some(event.offset) <= cursor);
+        self.events.range(from..)
+    }
 }
 
 struct SubState {
@@ -426,7 +496,9 @@ impl SubState {
         }
         match self.mode {
             Mode::Live => false,
-            Mode::CatchingUp => self.cursor < live_edge && !ring_covers(self.cursor, ring_floor),
+            Mode::CatchingUp => {
+                self.cursor < live_edge && !cursor_covered_by(self.cursor, ring_floor)
+            }
         }
     }
 }
@@ -534,17 +606,11 @@ async fn run_pump<S: RecordSource>(
     config: PumpConfig,
     mut commands: mpsc::Receiver<Command>,
 ) {
-    let mut ring: VecDeque<SharedEvent> = VecDeque::new();
+    let mut ring = Ring::new(config.ring_capacity);
     let mut subs = Subscribers::default();
     // How far the live path has read. `Unknown` until the first
     // iteration asks the source where "now" is.
     let mut live_edge = LiveEdge::Unknown;
-    // The position just before the ring's oldest event, so a subscriber
-    // sitting exactly on the boundary is known to be servable from
-    // memory. Deriving it from `ring.front()` instead would need the
-    // position *before* that event, which is the arithmetic this engine
-    // does not do; carrying it costs one assignment per eviction.
-    let mut ring_floor: Option<i64> = None;
     let mut consecutive_errors = 0u32;
 
     loop {
@@ -588,7 +654,7 @@ async fn run_pump<S: RecordSource>(
                     live_edge = LiveEdge::At(start);
                     // Nothing is in the ring yet, so everything it will
                     // ever hold comes after here.
-                    ring_floor = start;
+                    ring.rebase(start);
                     start
                 }
                 Err(e) => {
@@ -618,14 +684,7 @@ async fn run_pump<S: RecordSource>(
                     for sub in &mut subs.list {
                         sub.push_live(&event);
                     }
-                    ring.push_back(event);
-                    while ring.len() > config.ring_capacity {
-                        // What falls out of the ring is what the ring
-                        // now begins after.
-                        if let Some(dropped) = ring.pop_front() {
-                            ring_floor = Some(dropped.offset);
-                        }
-                    }
+                    ring.push(event);
                 }
                 // `None` sorts below every position, so a fetch that
                 // consumed nothing leaves the edge where it was.
@@ -652,9 +711,9 @@ async fn run_pump<S: RecordSource>(
             continue;
         };
         for sub in &mut subs.list {
-            advance_from_ring(sub, &ring, ring_floor, live_edge);
+            advance_from_ring(sub, &ring, live_edge);
         }
-        if let Some(index) = subs.next_fetch(ring_floor, live_edge) {
+        if let Some(index) = subs.next_fetch(ring.floor(), live_edge) {
             let outcome = fetch_catch_up(
                 &mut subs.list[index],
                 &mut source,
@@ -749,12 +808,7 @@ fn push_run<'a>(sub: &mut SubState, events: impl Iterator<Item = &'a SharedEvent
 /// Advance one catching-up subscriber as far as the ring allows — pure
 /// memory, so every laggard can have this every iteration. Subscribers
 /// behind the ring are left for [`fetch_catch_up`].
-fn advance_from_ring(
-    sub: &mut SubState,
-    ring: &VecDeque<SharedEvent>,
-    ring_floor: Option<i64>,
-    live_edge: Option<i64>,
-) {
+fn advance_from_ring(sub: &mut SubState, ring: &Ring, live_edge: Option<i64>) {
     if sub.mode != Mode::CatchingUp || sub.closed {
         return;
     }
@@ -767,15 +821,12 @@ fn advance_from_ring(
         return;
     }
     // Behind the ring (or the ring is empty): only a fetch can help.
-    if !ring_covers(sub.cursor, ring_floor) {
+    if !ring.covers(sub.cursor) {
         return;
     }
     // Inside the ring: serve the remainder from the cursor, then go
-    // live — the ring always ends at the live edge. The ring is
-    // offset-sorted, so finding the cursor is a binary search rather
-    // than a scan over everything already sent.
-    let from = ring.partition_point(|event| Some(event.offset) <= sub.cursor);
-    match push_run(sub, ring.range(from..)) {
+    // live — the ring always ends at the live edge.
+    match push_run(sub, ring.after(sub.cursor)) {
         PushOutcome::Delivered => sub.mode = Mode::Live,
         PushOutcome::Stalled => {}
         PushOutcome::Closed => sub.closed = true,
@@ -842,4 +893,123 @@ async fn fetch_catch_up<S: RecordSource>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::Event;
+
+    /// Positions that stride, the way a byte-addressed log's do. The
+    /// whole point of these tests is that nothing here is one apart: a
+    /// floor derived as "one before the oldest event" is correct for
+    /// Kafka and wrong here, and that is the mistake being guarded
+    /// against.
+    const STRIDE: i64 = 100;
+
+    fn at(position: i64) -> SharedEvent {
+        SharedEvent::new(Event::at("ring", 0, position, 1_700_000_000_000))
+    }
+
+    fn filled(capacity: usize, count: i64) -> Ring {
+        let mut ring = Ring::new(capacity);
+        for i in 1..=count {
+            ring.push(at(i * STRIDE));
+        }
+        ring
+    }
+
+    #[test]
+    fn a_ring_that_never_evicted_covers_the_start_of_the_log() {
+        let ring = filled(8, 3);
+        assert_eq!(ring.floor(), None);
+        assert!(ring.covers(None), "a full replay is served from memory");
+        assert_eq!(ring.after(None).count(), 3);
+    }
+
+    /// The invariant this type exists for.
+    ///
+    /// The floor is the position of the event that *fell out*, so a
+    /// subscriber sitting exactly on it has seen everything the ring no
+    /// longer holds and can be served the rest from memory. Deriving
+    /// the floor as "one before the oldest event still held" gives 199
+    /// where the answer is 100, and every one of these assertions
+    /// changes.
+    #[test]
+    fn the_floor_is_the_position_that_fell_out() {
+        let ring = filled(2, 3);
+        assert_eq!(
+            ring.floor(),
+            Some(STRIDE),
+            "the evicted event's own position"
+        );
+
+        assert!(
+            ring.covers(Some(STRIDE)),
+            "a cursor exactly on the floor is servable from memory"
+        );
+        assert_eq!(
+            ring.after(Some(STRIDE))
+                .map(|e| e.offset)
+                .collect::<Vec<_>>(),
+            vec![2 * STRIDE, 3 * STRIDE],
+            "and is served everything after it"
+        );
+
+        assert!(
+            !ring.covers(Some(STRIDE - 1)),
+            "a cursor below the floor needs the events the ring dropped"
+        );
+        assert!(
+            !ring.covers(None),
+            "and so does one replaying from the start of the log"
+        );
+    }
+
+    /// A position no event occupies still decides correctly.
+    ///
+    /// With sparse positions most integers fall between records rather
+    /// than on one, and a client may echo back any of them.
+    #[test]
+    fn a_position_between_events_is_covered_and_served() {
+        let ring = filled(2, 3);
+        let between = 2 * STRIDE + 1;
+        assert!(ring.covers(Some(between)));
+        assert_eq!(
+            ring.after(Some(between))
+                .map(|e| e.offset)
+                .collect::<Vec<_>>(),
+            vec![3 * STRIDE],
+            "served what follows it, not what precedes it"
+        );
+    }
+
+    #[test]
+    fn rebasing_an_empty_ring_sets_where_it_begins() {
+        let mut ring = Ring::new(4);
+        ring.rebase(Some(7 * STRIDE));
+        assert_eq!(ring.floor(), Some(7 * STRIDE));
+        assert!(!ring.covers(None), "the log before that is already gone");
+        assert!(ring.covers(Some(7 * STRIDE)));
+    }
+
+    /// `needs_fetch` asks the same question with a floor value rather
+    /// than the ring; the two must not drift.
+    #[test]
+    fn the_subscriber_side_predicate_agrees_with_the_ring() {
+        let ring = filled(2, 3);
+        for cursor in [
+            None,
+            Some(0),
+            Some(STRIDE - 1),
+            Some(STRIDE),
+            Some(3 * STRIDE),
+        ] {
+            assert_eq!(
+                cursor_covered_by(cursor, ring.floor()),
+                ring.covers(cursor),
+                "disagreed about {cursor:?}"
+            );
+        }
+    }
 }
