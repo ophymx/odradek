@@ -8871,14 +8871,38 @@ async fn cluster_committed_offsets_outlive_the_coordinator(ctx: &ServerCtx) -> V
         return skip;
     }
     let group = check_group("coordloss");
-    let Some(coordinator) = (match await_coordinator(ctx, &group).await {
-        Ok(addr) => addr,
+    // That the subject names a coordinator at all is a precondition;
+    // *which* one it names at this instant is not something to hold on
+    // to, so the answer is deliberately dropped.
+    match await_coordinator(ctx, &group).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Verdict::Skipped {
+                reason: format!("the subject named no coordinator for {group}"),
+            };
+        }
         Err(e) => return e.into_verdict(),
-    }) else {
-        return Verdict::Skipped {
-            reason: format!("the subject named no coordinator for {group}"),
-        };
+    }
+
+    // A number nothing else would produce by accident.
+    let committed = 23;
+    // A cluster is free to move a group's coordinator between naming
+    // one and being asked to commit — a Redpanda cluster still bringing
+    // its `__consumer_offsets` partitions up does exactly that — and
+    // NOT_COORDINATOR is that broker redirecting rather than refusing.
+    // So the commit is retried until one is accepted, and the broker to
+    // stop is read off the connection that accepted it. Stopping the
+    // one that was named earlier risks stopping a broker that never
+    // held the write, which would prove nothing and pass.
+    let conn = match commit_offset_settled(ctx, &group, &produced, committed, commit_version, 1_540)
+        .await
+    {
+        Ok(conn) => conn,
+        Err(e) => return e.context("OffsetCommit").into_verdict(),
     };
+    let coordinator = conn.peer().to_owned();
+    drop(conn);
+
     let Some(owner) = nodes.iter().find(|n| n.addr == coordinator) else {
         return Verdict::Skipped {
             reason: format!(
@@ -8895,30 +8919,6 @@ async fn cluster_committed_offsets_outlive_the_coordinator(ctx: &ServerCtx) -> V
         };
     };
     let survivor_addr = survivor.addr.clone();
-
-    // A number nothing else would produce by accident.
-    let committed = 23;
-    let mut conn = match open(ctx, &coordinator).await {
-        Ok(c) => c,
-        Err(e) => return e.into_verdict(),
-    };
-    if let Err(e) = await_topic_known(ctx, &mut conn, &produced.topic, 1_540).await {
-        return e.into_verdict();
-    }
-    if let Err(e) = commit_offset(
-        &mut conn,
-        commit_version,
-        &group,
-        &produced.topic,
-        produced.topic_id,
-        committed,
-        1_545,
-    )
-    .await
-    {
-        return e.context("OffsetCommit").into_verdict();
-    }
-    drop(conn);
 
     let topic = produced.topic.clone();
     let topic_id = produced.topic_id;
