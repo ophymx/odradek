@@ -282,6 +282,30 @@ was written expecting a refusal, the broker said otherwise, and the
 requirement it now states is the one that actually holds — the records
 must not end up outside the transaction, by either route.
 
+- Apache Kafka 4.1 **behind TLS** is the seventh subject, and the only
+  one reached over anything but a plaintext socket. Every other subject
+  is talked to the way nobody runs a broker. Its 9092 listener *is* the
+  TLS listener, so `{port}` is the TLS port and nothing else in the
+  harness changes; the four `sasl/*` checks skip, since it has no SASL
+  listener, which is the whole of its difference from the plain 4.1
+  subject.
+
+  The certificates are generated per run with `openssl` — a CA, a
+  server certificate naming `localhost` and 127.0.0.1, and a PKCS#12
+  keystore — and deleted afterwards. Not committed: a certificate in a
+  repository expires on a date nobody is watching, in a run that
+  changed nothing.
+
+  It gets no proxied pass. `examples/proxy.rs` is the protocol crate
+  plus a socket, and putting a TLS stack in it would make it a
+  different example than the one the proxy guarantee is a witness for.
+
+  What keeps this honest is that the suite fails without the CA: run
+  against the TLS listener in plaintext it passes nothing, and run
+  with a CA that did not sign the broker's certificate every check
+  reports `error` — infrastructure, "proves neither conformance nor
+  nonconformance" — rather than quietly falling back.
+
 ## The client matrix
 
 `cargo xtask client-matrix` is the mirror of the broker matrix, pointing
@@ -323,10 +347,10 @@ run was in the harness:
 
 ## What the baselines record
 
-Six subjects: Apache Kafka 4.1 and Redpanda 25.2, each as a single
+Seven subjects: Apache Kafka 4.1 and Redpanda 25.2, each as a single
 broker and again as a three-node cluster, plus Redpanda with SASL
-required on every connection, plus Apache Kafka 3.7 for the versions
-the others never reach.
+required on every connection, Apache Kafka 3.7 for the versions the
+others never reach, and Apache Kafka 4.1 behind TLS.
 
 The matrix overlaps by *brokers* rather than by subjects. Eight at once
 on a two-core runner is enough load to make a broker take seconds over

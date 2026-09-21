@@ -660,6 +660,7 @@ dependencies = [
  "snap",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "zstd",
 ]
 

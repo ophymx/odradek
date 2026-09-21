@@ -11,6 +11,17 @@ readme = "README.md"
 keywords = ["kafka", "protocol", "conformance", "testing"]
 categories = ["development-tools::testing", "network-programming"]
 
+[features]
+default = ["tls"]
+## TLS connections to the subject, via rustls. A broker that demands
+## TLS is the ordinary way to run one, and a suite that cannot speak it
+## cannot be pointed at a production-shaped deployment.
+##
+## Its own feature because the checks themselves need none of it: a
+## consumer of this crate that only wants the catalogue and the report
+## types should not acquire a TLS stack to get them.
+tls = ["dep:tokio-rustls"]
+
 [dependencies]
 odradek-protocol = { workspace = true }
 odradek-sasl = { workspace = true }
@@ -30,6 +41,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+# Written against rustls directly rather than through odradek-client's
+# `Tls`, for the same reason as the codecs above: the suite must not
+# reach into the implementation it validates.
+tokio-rustls = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Only for tests: the suite itself must stay independent of the client so

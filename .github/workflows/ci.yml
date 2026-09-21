@@ -52,6 +52,13 @@ jobs:
         run: cargo test -p odradek-protocol --features hardware-crc --locked
       - name: lean client builds (no tls/sasl/codecs)
         run: cargo check -p odradek-client --no-default-features --locked
+      - name: lean acceptance build (no tls)
+        # The suite's checks need no TLS stack; only being pointed at a
+        # broker that demands one does. A consumer taking the catalogue
+        # and the report types should not acquire rustls with them, and
+        # the cfgs that make that true are only compiled in this
+        # configuration.
+        run: cargo check -p odradek-acceptance --no-default-features --locked
       - name: lean web transports build (no kafka)
         run: cargo check -p odradek-web-sse -p odradek-web-ws --no-default-features --locked
       - name: generated code is in sync with the schemas
@@ -134,10 +141,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: enforce committed baselines against Kafka and Redpanda, single and clustered
-        # Six subjects: each implementation as one broker and as a
+        # Seven subjects: each implementation as one broker and as a
         # three-node cluster, plus a Redpanda that authenticates every
-        # connection and a Kafka 3.7 for the api versions 4.x no longer
-        # accepts. The single-node ones run twice — once against the
+        # connection, a Kafka 3.7 for the api versions 4.x no longer
+        # accepts, and a Kafka behind TLS — whose certificates are
+        # generated per run with openssl, so nothing here expires.
+        #
+        # The plaintext single-node ones run twice — once against the
         # broker, once through examples/proxy.rs, both enforced against
         # the same baseline — which is what keeps the protocol crate's
         # proxy guarantee honest: a dropped tagged field or a re-encoded

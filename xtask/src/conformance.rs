@@ -116,6 +116,11 @@ struct Subject {
     /// Commands to run inside the container once it is ready, before the
     /// suite starts — for state that cannot be configured at boot.
     provision: &'static [&'static [&'static str]],
+    /// Whether the subject's Kafka listener speaks TLS, so the suite
+    /// must too. A per-run CA and server certificate are generated and
+    /// mounted at `/certs`; `{port}` is then the TLS port, which keeps
+    /// every other piece of plumbing here unchanged.
+    tls: bool,
     /// How many broker containers this subject runs. More than one gets
     /// a docker network, a shared cluster id, and `{id}`/`{quorum}`
     /// substitution; the suite is pointed at the first node and finds
@@ -174,6 +179,7 @@ const SUBJECTS: &[Subject] = &[
         ],
         sasl_listener: true,
         authenticated: false,
+        tls: false,
         nodes: 1,
         // SCRAM credentials live in the metadata log, so they are added
         // after the broker is up rather than configured into it.
@@ -193,6 +199,69 @@ const SUBJECTS: &[Subject] = &[
             "--entity-name",
             "conformance",
         ]],
+    },
+    // The same broker again, behind TLS. Every other subject is
+    // reached in plaintext, which is not how a broker is run anywhere
+    // that matters -- and a suite that has never negotiated a
+    // handshake cannot be pointed at a deployment that requires one.
+    //
+    // Its 9092 listener *is* the TLS listener, so `{port}` is the TLS
+    // port and nothing else in this file changes. The certificate
+    // names `localhost` rather than the ephemeral address the
+    // container is published on, and the suite verifies against that
+    // name: a certificate per run would otherwise be a certificate per
+    // port.
+    Subject {
+        name: "apache-kafka-4.1.0-tls",
+        image: "apache/kafka:4.1.0",
+        run_args: &[
+            "-e",
+            "KAFKA_NODE_ID=1",
+            "-e",
+            "KAFKA_PROCESS_ROLES=broker,controller",
+            "-e",
+            "KAFKA_LISTENERS=SSL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,INTERNAL://0.0.0.0:9099",
+            "-e",
+            "KAFKA_ADVERTISED_LISTENERS=SSL://localhost:{port},INTERNAL://localhost:9099",
+            "-e",
+            "KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER",
+            "-e",
+            "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,SSL:SSL,INTERNAL:PLAINTEXT",
+            "-e",
+            "KAFKA_INTER_BROKER_LISTENER_NAME=INTERNAL",
+            // PEM rather than JKS: Kafka has taken it since 2.7, and a
+            // keystore built with keytool would need a JDK on whatever
+            // runs this.
+            "-e",
+            "KAFKA_SSL_KEYSTORE_TYPE=PKCS12",
+            // A filename and two credentials files rather than a path:
+            // the entrypoint derives the location from these and
+            // ignores KAFKA_SSL_KEYSTORE_LOCATION entirely.
+            "-e",
+            "KAFKA_SSL_KEYSTORE_FILENAME=server.keystore.p12",
+            "-e",
+            "KAFKA_SSL_KEYSTORE_CREDENTIALS=keystore_creds",
+            "-e",
+            "KAFKA_SSL_KEY_CREDENTIALS=key_creds",
+            // No client certificate asked for: what is under test is
+            // that the suite can speak TLS to a broker, not that it can
+            // prove who it is.
+            "-e",
+            "KAFKA_SSL_CLIENT_AUTH=none",
+            "-e",
+            "KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093",
+            "-e",
+            "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1",
+            "-e",
+            "KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1",
+            "-e",
+            "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1",
+        ],
+        sasl_listener: false,
+        authenticated: false,
+        tls: true,
+        nodes: 1,
+        provision: &[],
     },
     // The same broker, four minor releases back, for the versions the
     // 4.x subjects never reach. Kafka 4.0 raised the *minimum* api
@@ -241,6 +310,7 @@ const SUBJECTS: &[Subject] = &[
         ],
         sasl_listener: true,
         authenticated: false,
+        tls: false,
         nodes: 1,
         provision: &[&[
             "/opt/kafka/bin/kafka-configs.sh",
@@ -283,6 +353,7 @@ const SUBJECTS: &[Subject] = &[
         ],
         sasl_listener: false,
         authenticated: false,
+        tls: false,
         nodes: 1,
         provision: &[],
     },
@@ -345,6 +416,7 @@ const SUBJECTS: &[Subject] = &[
         ],
         sasl_listener: false,
         authenticated: false,
+        tls: false,
         nodes: 3,
         provision: &[],
     },
@@ -393,6 +465,7 @@ const SUBJECTS: &[Subject] = &[
         ],
         sasl_listener: false,
         authenticated: false,
+        tls: false,
         nodes: 3,
         provision: &[],
     },
@@ -435,6 +508,7 @@ const SUBJECTS: &[Subject] = &[
         ],
         sasl_listener: false,
         authenticated: true,
+        tls: false,
         nodes: 1,
         // The user is created through the admin api once the broker is
         // up: it lives in the cluster's own state, not in its config.
@@ -674,7 +748,17 @@ fn run_subject(
     // two equal node ports would.
     let mut ports = ephemeral_ports(usize::from(subject.nodes.max(1)) + 1)?;
     let sasl_port = ports.pop().expect("one more port than nodes");
-    let cluster = Cluster::start(subject, sasl_port, ports)?;
+    // One CA and one server certificate per subject that needs them,
+    // valid for `localhost` and 127.0.0.1 and for a day. Generated
+    // rather than committed: a certificate in a repository is one that
+    // expires on a date nobody remembers, in a run nobody changed.
+    let certs = if subject.tls {
+        Some(Certs::generate(subject.name)?)
+    } else {
+        None
+    };
+    let tls_ca = certs.as_ref().map(Certs::ca);
+    let cluster = Cluster::start(subject, sasl_port, ports, certs.as_ref().map(Certs::dir))?;
     // The suite is pointed at one node and finds the rest through
     // Metadata, which is the only way a client could find them either.
     let addr = cluster.bootstrap().to_owned();
@@ -693,7 +777,7 @@ fn run_subject(
     // Every node, not just the bootstrap: a partition led by a broker
     // that is not up yet is a check failing on the harness's impatience.
     for node in cluster.addrs() {
-        if let Err(e) = wait_ready(node) {
+        if let Err(e) = wait_ready(node, tls_ca.as_deref()) {
             cluster.dump_logs(log);
             return Err(e);
         }
@@ -716,11 +800,13 @@ fn run_subject(
     // subject was provisioned with; a conformance run brings its own
     // account rather than borrowing somebody's.
     let authenticate = subject.authenticated.then_some("conformance:conformance");
+    let tls_ca = certs.as_ref().map(Certs::ca);
     let target = Target {
         addr: &addr,
         sasl_addr: sasl_addr.as_deref(),
         control: control.as_deref(),
         authenticate,
+        tls_ca: tls_ca.as_deref(),
     };
     let direct = run_accept(accept, &target, &baseline, record, log)?;
     if !direct {
@@ -748,6 +834,17 @@ fn run_subject(
     // cluster properly needs a listener per broker, which is a different
     // example than the one this is a witness for.
     match (proxy, subject.nodes) {
+        // A TLS subject has no proxied pass either: `examples/proxy.rs`
+        // is the protocol crate plus a socket, and putting a TLS stack
+        // in it would make it a different example than the one this is
+        // a witness for.
+        (Some(_), _) if subject.tls => {
+            let _ = writeln!(
+                log,
+                "note: no proxied pass for {} — the proxy example speaks tcp, not tls",
+                subject.name
+            );
+        }
         (Some(proxy), 1) => proxy_pass(subject, accept, proxy, &target, &baseline, log)?,
         (Some(_), _) => {
             let _ = writeln!(
@@ -794,7 +891,9 @@ fn proxy_pass(
         .map(|a| Proxy::start(proxy, a))
         .transpose()?;
 
-    if let Err(e) = wait_ready(front.addr()) {
+    // Always plaintext: the proxy speaks tcp, and a tls subject never
+    // gets a proxied pass.
+    if let Err(e) = wait_ready(front.addr(), None) {
         front.dump_logs(log);
         return Err(e).context("proxy never became reachable");
     }
@@ -813,6 +912,9 @@ fn proxy_pass(
         // single-node subjects, which have no failover to watch.
         control: None,
         authenticate: target.authenticate,
+        // The proxy example terminates TCP, not TLS; a subject behind
+        // it is reached in plaintext or not at all.
+        tls_ca: None,
     };
     let matched = run_accept(accept, &proxied, baseline, false, log)?;
     if !matched {
@@ -842,6 +944,8 @@ struct Target<'a> {
     /// Credentials, when the subject's own listener will not answer
     /// without them.
     authenticate: Option<&'a str>,
+    /// The CA to trust, when the subject's listener speaks TLS.
+    tls_ca: Option<&'a str>,
 }
 
 fn run_accept(
@@ -861,6 +965,9 @@ fn run_accept(
     }
     if let Some(login) = target.authenticate {
         cmd.args(["--authenticate", login]);
+    }
+    if let Some(ca) = target.tls_ca {
+        cmd.args(["--tls-ca", ca]);
     }
     if record {
         cmd.args(["--write-baseline".as_ref(), baseline.as_os_str()]);
@@ -916,7 +1023,9 @@ pub fn node_control(args: &[String]) -> Result<()> {
         }
         "start" => {
             docker(&["start", &name])?;
-            wait_ready(addr).with_context(|| format!("{name} restarted but never served"))
+            // Plaintext: `cluster-node` is only used by the recovery
+            // checks, and no TLS subject is a cluster.
+            wait_ready(addr, None).with_context(|| format!("{name} restarted but never served"))
         }
         other => bail!("unknown verb {other:?}; expected stop or start"),
     }
@@ -936,6 +1045,182 @@ fn docker(args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// A per-run CA and server certificate, on disk, removed when dropped.
+///
+/// Generated with `openssl` rather than committed. A certificate in a
+/// repository has an expiry date nobody is watching, and the run that
+/// discovers it is one that changed nothing — the failure arrives
+/// detached from any cause, which is the worst kind to debug and the
+/// exact shape of the bug this campaign spent an afternoon on.
+struct Certs {
+    dir: std::path::PathBuf,
+}
+
+/// Protects a key that exists for one run on one loopback port. In the
+/// source because it has nothing to protect; see [`Certs::generate`].
+const KEY_PASSPHRASE: &str = "conformance";
+
+impl Certs {
+    fn generate(subject: &str) -> Result<Certs> {
+        let dir = std::env::temp_dir().join(format!(
+            "odradek-certs-{}-{}",
+            std::process::id(),
+            subject.replace('.', "-")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).context("creating the certificate directory")?;
+        let at = |name: &str| dir.join(name).to_string_lossy().into_owned();
+
+        // The broker's certificate names `localhost` and 127.0.0.1,
+        // because that is what the suite dials and what it verifies
+        // against. Without the SAN a modern TLS stack refuses the
+        // certificate outright -- CN alone has not been enough since
+        // rustls existed.
+        std::fs::write(
+            dir.join("ext.cnf"),
+            "subjectAltName=DNS:localhost,IP:127.0.0.1\n",
+        )
+        .context("writing the certificate extensions")?;
+
+        openssl(&[
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-sha256",
+            "-days",
+            "1",
+            "-nodes",
+            "-keyout",
+            &at("ca.key"),
+            "-out",
+            &at("ca.crt"),
+            "-subj",
+            "/CN=odradek conformance ca",
+        ])?;
+        // Encrypted, because the apache/kafka entrypoint insists on a
+        // key password: it reads one out of a credentials file and
+        // exports it whether or not the key has one, and an empty
+        // password against an unencrypted key is not the same as no
+        // password. It protects nothing -- these certificates live for
+        // one run on one loopback port -- which is why the passphrase
+        // is in this file.
+        openssl(&[
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-sha256",
+            "-keyout",
+            &at("server.key"),
+            "-out",
+            &at("server.csr"),
+            "-subj",
+            "/CN=localhost",
+            "-passout",
+            &format!("pass:{KEY_PASSPHRASE}"),
+        ])?;
+        openssl(&[
+            "x509",
+            "-req",
+            "-sha256",
+            "-days",
+            "1",
+            "-in",
+            &at("server.csr"),
+            "-CA",
+            &at("ca.crt"),
+            "-CAkey",
+            &at("ca.key"),
+            "-CAcreateserial",
+            "-extfile",
+            &at("ext.cnf"),
+            "-out",
+            &at("server.crt"),
+        ])?;
+
+        // PKCS#12 rather than PEM. Kafka reads both, but its PEM
+        // keystore refuses to be given a *store* password -- "SSL key
+        // store password cannot be specified with PEM format, only key
+        // password may be specified" -- and this image's entrypoint
+        // always sets one, out of a credentials file it requires. The
+        // two cannot both be satisfied. PKCS#12 takes both passwords,
+        // openssl builds it with no JDK anywhere in sight, and the
+        // entrypoint's convention is met as written.
+        openssl(&[
+            "pkcs12",
+            "-export",
+            "-in",
+            &at("server.crt"),
+            "-inkey",
+            &at("server.key"),
+            "-passin",
+            &format!("pass:{KEY_PASSPHRASE}"),
+            "-out",
+            &at("server.keystore.p12"),
+            "-name",
+            "broker",
+            "-passout",
+            &format!("pass:{KEY_PASSPHRASE}"),
+        ])?;
+        // The entrypoint reads the password out of a file rather than
+        // an environment variable, and refuses to start without one.
+        for name in ["keystore_creds", "key_creds"] {
+            std::fs::write(dir.join(name), format!("{KEY_PASSPHRASE}\n"))
+                .context("writing the credentials file")?;
+        }
+        // The broker reads these as a user the container picked, not as
+        // whoever ran the xtask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for name in [
+                "ca.crt",
+                "server.keystore.p12",
+                "keystore_creds",
+                "key_creds",
+            ] {
+                let _ = std::fs::set_permissions(
+                    dir.join(name),
+                    std::fs::Permissions::from_mode(0o644),
+                );
+            }
+        }
+        Ok(Certs { dir })
+    }
+
+    fn dir(&self) -> &str {
+        // Created from `temp_dir()` and a pid, so it is utf-8 unless
+        // TMPDIR is not, in which case docker would refuse it anyway.
+        self.dir.to_str().unwrap_or_default()
+    }
+
+    /// What the suite trusts.
+    fn ca(&self) -> String {
+        self.dir.join("ca.crt").to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for Certs {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn openssl(args: &[&str]) -> Result<()> {
+    let out = Command::new("openssl")
+        .args(args)
+        .output()
+        .context("running openssl (is it installed?)")?;
+    if !out.status.success() {
+        bail!(
+            "openssl {} failed: {}",
+            args.first().copied().unwrap_or_default(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Pick `n` distinct free TCP ports.
@@ -1040,7 +1325,12 @@ struct Cluster {
 }
 
 impl Cluster {
-    fn start(subject: &Subject, sasl_port: u16, ports: Vec<u16>) -> Result<Cluster> {
+    fn start(
+        subject: &Subject,
+        sasl_port: u16,
+        ports: Vec<u16>,
+        certs: Option<&str>,
+    ) -> Result<Cluster> {
         let count = usize::from(subject.nodes.max(1));
         debug_assert_eq!(ports.len(), count);
         // The names have to be known before the first container starts:
@@ -1089,6 +1379,7 @@ impl Cluster {
                     sasl_port,
                     quorum: &quorum,
                     network: cluster.network.as_ref().map(Network::name),
+                    certs,
                 },
             )?;
             cluster.nodes.push(node);
@@ -1182,6 +1473,9 @@ struct NodeSpec<'a> {
     sasl_port: u16,
     quorum: &'a str,
     network: Option<&'a str>,
+    /// Host directory holding this run's CA and server certificate,
+    /// mounted at `/certs` when the subject speaks TLS.
+    certs: Option<&'a str>,
 }
 
 impl Container {
@@ -1211,6 +1505,13 @@ impl Container {
         if subject.sasl_listener {
             args.push("-p".into());
             args.push(format!("127.0.0.1:{}:9094", spec.sasl_port));
+        }
+        if let Some(certs) = spec.certs {
+            args.push("-v".into());
+            // Where the apache/kafka entrypoint looks: it builds the
+            // keystore path out of `/etc/kafka/secrets` and a filename,
+            // and overwrites any location it is given.
+            args.push(format!("{certs}:/etc/kafka/secrets:ro"));
         }
         let mut trailing = false;
         for a in subject.run_args {
@@ -1340,17 +1641,60 @@ impl Drop for Network {
 /// the request path works — so probe with a real (hand-rolled) exchange:
 /// header v1 for api key 18 version 0 with a null client id and an empty
 /// body, answered by anything frame-shaped.
-fn wait_ready(addr: &str) -> Result<()> {
+/// Wait until `addr` answers, over TLS when `ca` says the listener
+/// speaks it.
+///
+/// The plaintext probe against a TLS listener does not merely fail, it
+/// fails silently-ish: the broker is perfectly healthy, logs a handshake
+/// failure every 250ms for ninety seconds, and the xtask reports the
+/// subject as never having started.
+fn wait_ready(addr: &str, ca: Option<&str>) -> Result<()> {
     let deadline = Instant::now() + READY_TIMEOUT;
     let mut last_err = String::new();
     while Instant::now() < deadline {
-        match probe(addr) {
+        let attempt = match ca {
+            Some(ca) => probe_tls(addr, ca),
+            None => probe(addr),
+        };
+        match attempt {
             Ok(()) => return Ok(()),
             Err(e) => last_err = e.to_string(),
         }
         std::thread::sleep(Duration::from_millis(250));
     }
     bail!("{addr} not ready after {READY_TIMEOUT:?}: {last_err}");
+}
+
+/// Readiness for a TLS listener: a full handshake, verified against the
+/// same CA the suite will use.
+///
+/// `openssl s_client` rather than a TLS stack in this crate. openssl is
+/// already required here to make the certificates, and what is being
+/// waited for is that the listener completes a handshake — which is
+/// exactly what this asks and nothing more.
+fn probe_tls(addr: &str, ca: &str) -> Result<()> {
+    let out = Command::new("openssl")
+        .args([
+            "s_client",
+            "-connect",
+            addr,
+            "-servername",
+            "localhost",
+            "-CAfile",
+            ca,
+            "-verify_return_error",
+            "-brief",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .context("running openssl s_client")?;
+    if !out.status.success() {
+        bail!(
+            "tls handshake refused: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 fn probe(addr: &str) -> Result<()> {

@@ -608,6 +608,12 @@ pub struct ProbeConfig {
     /// by default. A budget tight enough for topic creation would report
     /// every healthy cluster as one that never recovers.
     pub recovery_budget: Duration,
+    /// What to trust, when the subject speaks TLS. `None` is
+    /// plaintext, which is what a locally-run broker usually is and
+    /// what every subject in the matrix was until there was one that
+    /// was not.
+    #[cfg(feature = "tls")]
+    pub tls: Option<crate::raw::TlsTrust>,
 }
 
 impl Default for ProbeConfig {
@@ -618,6 +624,8 @@ impl Default for ProbeConfig {
             control: None,
             credentials: None,
             recovery_budget: Duration::from_secs(60),
+            #[cfg(feature = "tls")]
+            tls: None,
         }
     }
 }
@@ -782,8 +790,14 @@ impl From<WireError> for CheckError {
         match e {
             // An implausible frame length is the subject talking garbage.
             WireError::BadFrameLength(_) => CheckError::Violation(e.to_string()),
-            // I/o trouble, timeouts, and our own encode failures mean the
-            // exchange never got a fair chance to observe the subject.
+            // I/o trouble, timeouts, our own encode failures, and a
+            // handshake that never completed all mean the exchange
+            // never got a fair chance to observe the subject. A TLS
+            // failure in particular is about certificates and trust —
+            // the suite's configuration or the operator's — and not
+            // about whether the broker speaks the protocol correctly.
+            #[cfg(feature = "tls")]
+            WireError::Tls(_) => CheckError::Infra(e.to_string()),
             WireError::Io(_) | WireError::Timeout | WireError::Encode(_) => {
                 CheckError::Infra(e.to_string())
             }
@@ -791,7 +805,19 @@ impl From<WireError> for CheckError {
     }
 }
 
-async fn connect(addr: &str) -> Result<RawConnection, CheckError> {
+/// Open a connection the way this run's configuration says to.
+///
+/// Takes the config rather than the context because the very first
+/// exchange a run makes — the ApiVersions discovery that *builds* the
+/// context — has to go over the same transport as everything after it.
+async fn connect(config: &ProbeConfig, addr: &str) -> Result<RawConnection, CheckError> {
+    #[cfg(feature = "tls")]
+    if let Some(trust) = &config.tls {
+        return RawConnection::connect_tls(addr, trust)
+            .await
+            .map_err(|e| CheckError::Infra(format!("connect {addr} over tls: {e}")));
+    }
+    let _ = config;
     RawConnection::connect(addr)
         .await
         .map_err(|e| CheckError::Infra(format!("connect {addr}: {e}")))
@@ -813,7 +839,7 @@ async fn connect(addr: &str) -> Result<RawConnection, CheckError> {
 /// second for the `sasl/*` checks. Redpanda switches it on cluster-wide,
 /// and there is no plaintext listener left to fall back to.
 async fn open(ctx: &ServerCtx, addr: &str) -> Result<RawConnection, CheckError> {
-    let mut conn = connect(addr).await?;
+    let mut conn = connect(&ctx.config, addr).await?;
     if let Some(login) = &ctx.config.credentials {
         authenticate(ctx, &mut conn, login).await?;
     }
@@ -964,7 +990,7 @@ pub(crate) struct ServerCtx {
 
 impl ServerCtx {
     async fn discover(addr: &str, config: ProbeConfig) -> ServerCtx {
-        let discovery = match exchange(addr, 0, 1, 9, 0).await {
+        let discovery = match exchange(&config, addr, 0, 1, 9, 0).await {
             Ok(resp) => Ok(resp.api_keys),
             Err(CheckError::Violation(_)) => Ok(Vec::new()),
             Err(CheckError::Infra(details)) => {
@@ -2013,7 +2039,7 @@ async fn scram_begin(
         SaslAuthenticateRequest::MIN_VERSION,
         SaslAuthenticateRequest::MAX_VERSION,
     )?;
-    let mut conn = connect(&sasl_addr)
+    let mut conn = connect(&ctx.config, &sasl_addr)
         .await
         .map_err(CheckError::into_verdict)?;
 
@@ -2223,7 +2249,7 @@ async fn scram_server_proves_itself(ctx: &ServerCtx) -> Verdict {
         }
     };
 
-    let mut conn = match connect(&sasl_addr).await {
+    let mut conn = match connect(&ctx.config, &sasl_addr).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
@@ -2369,7 +2395,7 @@ async fn sasl_refusal_names_mechanisms(ctx: &ServerCtx) -> Verdict {
         Ok(v) => v,
         Err(skip) => return skip,
     };
-    let mut conn = match connect(&sasl_addr).await {
+    let mut conn = match connect(&ctx.config, &sasl_addr).await {
         Ok(c) => c,
         Err(e) => return e.into_verdict(),
     };
@@ -3470,13 +3496,14 @@ fn negotiate_all(
 /// One ApiVersions exchange on a fresh connection. The response header is
 /// always decoded at v0 (the negotiation-bootstrap quirk).
 async fn exchange(
+    config: &ProbeConfig,
     addr: &str,
     api_version: i16,
     header_version: i16,
     correlation_id: i32,
     decode_at: i16,
 ) -> Result<ApiVersionsResponse, CheckError> {
-    let mut conn = connect(addr).await?;
+    let mut conn = connect(config, addr).await?;
     let mut body = BytesMut::new();
     let mut req = ApiVersionsRequest::default();
     req.client_software_name = "odradek-acceptance".into();
@@ -3501,7 +3528,7 @@ async fn exchange(
 }
 
 async fn v0_basic(ctx: &ServerCtx) -> Verdict {
-    let resp = match exchange(&ctx.addr, 0, 1, 1, 0).await {
+    let resp = match exchange(&ctx.config, &ctx.addr, 0, 1, 1, 0).await {
         Ok(resp) => resp,
         Err(e) => return e.into_verdict(),
     };
@@ -3535,7 +3562,7 @@ async fn v0_basic(ctx: &ServerCtx) -> Verdict {
 }
 
 async fn correlation_echo(ctx: &ServerCtx) -> Verdict {
-    match exchange(&ctx.addr, 0, 1, i32::MAX - 17, 0).await {
+    match exchange(&ctx.config, &ctx.addr, 0, 1, i32::MAX - 17, 0).await {
         Ok(_) => Verdict::Pass,
         Err(e) => e.into_verdict(),
     }
@@ -3557,7 +3584,7 @@ async fn flexible_v3(ctx: &ServerCtx) -> Verdict {
         };
     }
     let version = max.min(ApiVersionsRequest::MAX_VERSION);
-    match exchange(&ctx.addr, version, 2, 2, version).await {
+    match exchange(&ctx.config, &ctx.addr, version, 2, 2, version).await {
         Ok(resp) if ErrorCode(resp.error_code).is_ok() => Verdict::Pass,
         Ok(resp) => Verdict::Fail {
             details: format!("error code {}", ErrorCode(resp.error_code)),
@@ -3584,7 +3611,7 @@ async fn unsupported_version(ctx: &ServerCtx) -> Verdict {
         };
     }
     let probe = max + 7;
-    let resp = match exchange(&ctx.addr, probe, 2, 3, 0).await {
+    let resp = match exchange(&ctx.config, &ctx.addr, probe, 2, 3, 0).await {
         Ok(resp) => resp,
         Err(e) => return e.into_verdict(),
     };

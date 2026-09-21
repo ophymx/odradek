@@ -35,6 +35,10 @@ fn usage() -> ExitCode {
          \x20 [--authenticate <user>:<password>]  authenticate every\n\
          \x20                    connection with SCRAM-SHA-256, for a subject\n\
          \x20                    that will not answer otherwise\n\
+         \x20 [--tls-ca <file>]  speak TLS to the subject, trusting exactly\n\
+         \x20                    the certificates in this PEM file\n\
+         \x20 [--tls-name <host>]  the name to verify the broker's\n\
+         \x20                    certificate against (default: localhost)\n\
          \x20 [--cluster-control <cmd>]    how to stop and start a broker: run\n\
          \x20                    as `<cmd> <stop|start> <node-id> <host:port>`.\n\
          \x20                    Both names are given because not every\n\
@@ -57,6 +61,8 @@ struct Args {
     sasl_server: Option<String>,
     cluster_control: Option<String>,
     authenticate: Option<String>,
+    tls_ca: Option<String>,
+    tls_name: Option<String>,
     client_listen: Option<String>,
     list: bool,
     fault: Option<checks::client::HarnessFault>,
@@ -71,6 +77,8 @@ fn parse_args(args: &[String]) -> Option<Args> {
         sasl_server: None,
         cluster_control: None,
         authenticate: None,
+        tls_ca: None,
+        tls_name: None,
         client_listen: None,
         list: false,
         fault: None,
@@ -85,6 +93,8 @@ fn parse_args(args: &[String]) -> Option<Args> {
             "--sasl-server" => parsed.sasl_server = Some(it.next()?.clone()),
             "--cluster-control" => parsed.cluster_control = Some(it.next()?.clone()),
             "--authenticate" => parsed.authenticate = Some(it.next()?.clone()),
+            "--tls-ca" => parsed.tls_ca = Some(it.next()?.clone()),
+            "--tls-name" => parsed.tls_name = Some(it.next()?.clone()),
             "--client-listen" => parsed.client_listen = Some(it.next()?.clone()),
             "--list" => parsed.list = true,
             "--fault" => {
@@ -112,6 +122,8 @@ fn parse_args(args: &[String]) -> Option<Args> {
             && parsed.fault.is_none()
             && parsed.cluster_control.is_none()
             && parsed.authenticate.is_none()
+            && parsed.tls_ca.is_none()
+            && parsed.tls_name.is_none()
             && !parsed.json
             && parsed.baseline.is_none()
             && parsed.write_baseline.is_none();
@@ -155,6 +167,34 @@ async fn main() -> ExitCode {
                 })
             },
         );
+        #[cfg(feature = "tls")]
+        if let Some(path) = &args.tls_ca {
+            let pem = match std::fs::read(path) {
+                Ok(pem) => pem,
+                Err(e) => {
+                    eprintln!("--tls-ca {path}: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            // `localhost` by default: a broker's certificate names the
+            // host an operator configured it for, and the suite reaches
+            // it at whatever ephemeral port a container was published
+            // on. Verifying against the dialled address would need a
+            // certificate per run.
+            let name = args.tls_name.as_deref().unwrap_or("localhost");
+            match odradek_acceptance::raw::TlsTrust::from_ca_pem(&pem, name) {
+                Ok(trust) => config.tls = Some(trust),
+                Err(e) => {
+                    eprintln!("--tls-ca {path}: {e}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        #[cfg(not(feature = "tls"))]
+        if args.tls_ca.is_some() {
+            eprintln!("--tls-ca needs this build's `tls` feature, which is off");
+            return ExitCode::from(2);
+        }
         if let Some(login) = &args.authenticate {
             // Split on the first colon: a password may contain one, a
             // username may not.
