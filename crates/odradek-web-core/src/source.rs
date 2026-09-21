@@ -13,6 +13,19 @@ use odradek_client::{ClientConfig, Cluster, Consumer};
 use crate::event::Event;
 
 /// A fetch's worth of events plus the position that follows it.
+///
+/// There was a `high_watermark` here once, filled in by every source
+/// and read by nothing. It was Kafka's next-offset — a dense-log
+/// number, in a struct whose whole point is that positions need not be
+/// dense — and it survived the change that retired `earliest_offset`
+/// and renamed the rest only because nothing pointed at it. Writing an
+/// adapter over a byte-addressed log is what found it: the question
+/// "what do I put here?" has no answer when the field means nothing to
+/// the store and nobody reads it.
+///
+/// If lag ever needs reporting, it should arrive in this trait's own
+/// vocabulary rather than Kafka's, and adding a field to a
+/// `#[non_exhaustive]` struct breaks nobody.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct SourceBatch {
@@ -26,7 +39,6 @@ pub struct SourceBatch {
     /// stretch forever. `None` means the fetch consumed nothing and
     /// the caller's position stands.
     pub next_after: Option<i64>,
-    pub high_watermark: i64,
 }
 
 /// What broke, coarsely — the part of a source error the pump and the
@@ -317,7 +329,6 @@ impl RecordSource for KafkaSource {
             // fetch that advanced nothing leaves the caller's position
             // alone rather than reporting one below it.
             next_after: (result.next_offset > from).then(|| result.next_offset - 1),
-            high_watermark: result.high_watermark,
         })
     }
 

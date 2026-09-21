@@ -138,7 +138,6 @@ impl RecordSource for MemorySource {
             // the last event returned; an empty batch consumed nothing.
             next_after: batch.last().map(|e| e.offset),
             events: batch,
-            high_watermark: len,
         })
     }
 

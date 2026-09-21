@@ -50,7 +50,6 @@ impl RecordSource for SlowSource {
         // this test is the proof that path is usable.
         let mut batch = SourceBatch::default();
         batch.next_after = after;
-        batch.high_watermark = 0;
         Ok(batch)
     }
 
@@ -881,7 +880,6 @@ impl RecordSource for TruncatedSource {
         }
         let mut batch = SourceBatch::default();
         batch.next_after = Some(self.log_start);
-        batch.high_watermark = self.log_start;
         Ok(batch)
     }
 

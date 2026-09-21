@@ -156,7 +156,6 @@ impl RecordSource for SegmentSource {
         // the next fetch asks the same question and gets the same
         // answer forever.
         batch.next_after = taken.last().map(|entry| entry.at);
-        batch.high_watermark = segment.end();
         Ok(batch)
     }
 
