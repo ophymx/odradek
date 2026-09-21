@@ -189,6 +189,19 @@ impl From<odradek_client::ClientError> for SourceError {
 /// what an implementor could write. `Message::decode_with_limits` in
 /// `odradek-protocol` is the pattern already in use, and says so where
 /// it is defined.
+///
+/// **There is a worked example of a source that is not dense.**
+/// `tests/sparse_source.rs` implements this trait over a byte-addressed
+/// log — positions are byte offsets, so they stride by record length,
+/// start after a header rather than at zero, and leave gaps where an
+/// entry carries no event. It is written from outside the crate against
+/// the public API only, which is what makes it evidence rather than
+/// decoration: both sources shipped here are dense, so until it existed
+/// the claim in this doc had two witnesses that agreed with each other
+/// and nothing that disagreed. It is also where
+/// [`SourceBatch::next_after`] is held to anything — a dense source
+/// sets that field to the last event's position, so an engine that
+/// ignored it passes every test written against one.
 pub trait RecordSource: Send + 'static {
     /// Records strictly after `after`, oldest first; `None` starts at
     /// the oldest record the source still holds.
