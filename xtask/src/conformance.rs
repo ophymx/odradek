@@ -668,8 +668,13 @@ fn run_subject(
     record: bool,
     log: &mut String,
 ) -> Result<()> {
-    let sasl_port = ephemeral_port()?;
-    let cluster = Cluster::start(subject, sasl_port)?;
+    // Chosen in one batch with the node ports, for the reason
+    // `ephemeral_ports` gives: the sasl listener is published alongside
+    // them, so a node port that happens to equal it collides exactly as
+    // two equal node ports would.
+    let mut ports = ephemeral_ports(usize::from(subject.nodes.max(1)) + 1)?;
+    let sasl_port = ports.pop().expect("one more port than nodes");
+    let cluster = Cluster::start(subject, sasl_port, ports)?;
     // The suite is pointed at one node and finds the rest through
     // Metadata, which is the only way a client could find them either.
     let addr = cluster.bootstrap().to_owned();
@@ -933,11 +938,31 @@ fn docker(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Pick a free TCP port. Racy in principle; in practice docker publishes
-/// the port fast enough that collisions with other suites are negligible.
+/// Pick `n` distinct free TCP ports.
+///
+/// Every listener is held open until the last port has been chosen, and
+/// only then are they all released. Asking one at a time and releasing
+/// each before asking for the next lets the kernel hand the same port
+/// straight back — it is free again by then — and two containers told
+/// to publish the same host port is a `docker run` failure that reads
+/// as the subject's fault. That is what it read as: a three-node
+/// cluster failing on its third node with "port is already allocated",
+/// once, on a loaded runner.
+///
+/// Still racy against the rest of the machine, which nothing short of
+/// letting docker choose can fix; not racy against itself any more.
+fn ephemeral_ports(n: usize) -> Result<Vec<u16>> {
+    let listeners: Vec<TcpListener> = (0..n)
+        .map(|_| TcpListener::bind("127.0.0.1:0"))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    listeners
+        .iter()
+        .map(|listener| Ok(listener.local_addr()?.port()))
+        .collect()
+}
+
 fn ephemeral_port() -> Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    Ok(listener.local_addr()?.port())
+    Ok(ephemeral_ports(1)?[0])
 }
 
 /// A running `examples/proxy` in front of one upstream listener.
@@ -1015,11 +1040,9 @@ struct Cluster {
 }
 
 impl Cluster {
-    fn start(subject: &Subject, sasl_port: u16) -> Result<Cluster> {
+    fn start(subject: &Subject, sasl_port: u16, ports: Vec<u16>) -> Result<Cluster> {
         let count = usize::from(subject.nodes.max(1));
-        let ports: Vec<u16> = (0..count)
-            .map(|_| ephemeral_port())
-            .collect::<Result<_>>()?;
+        debug_assert_eq!(ports.len(), count);
         // The names have to be known before the first container starts:
         // each node's quorum string names all of them, including the
         // ones that do not exist yet.

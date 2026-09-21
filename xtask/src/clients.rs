@@ -75,10 +75,28 @@ const SUBJECTS: &[ClientSubject] = &[ClientSubject {
             args: &["-b", "{addr}", "-t", "odradek-routing", "-P"],
             stdin: PRODUCE_LINES,
         },
+        // Pinned to one partition, one message per request. The check
+        // can only judge a throttle the client had a chance to observe
+        // — one followed by more traffic on the *same* connection —
+        // and a producer that batches five messages into a single
+        // request to a leader it then says goodbye to gives it nothing
+        // to measure. That is not hypothetical: with default batching
+        // this scenario skipped about one run in six, which is a flaky
+        // baseline however green it looks the other five times.
         Scenario {
             name: "throttle",
             fault: Some("throttle"),
-            args: &["-b", "{addr}", "-t", "odradek-routing", "-P"],
+            args: &[
+                "-b",
+                "{addr}",
+                "-t",
+                "odradek-routing",
+                "-P",
+                "-p",
+                "0",
+                "-X",
+                "batch.num.messages=1",
+            ],
             stdin: PRODUCE_LINES,
         },
         Scenario {

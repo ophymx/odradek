@@ -299,6 +299,10 @@ struct Observation {
 /// enough not to dominate the suite's own runtime.
 const THROTTLE_MS: i32 = 400;
 
+/// The first Produce and Fetch versions carrying `throttle_time_ms`.
+const PRODUCE_THROTTLE_MIN: i16 = 1;
+const FETCH_THROTTLE_MIN: i16 = 1;
+
 /// Metadata carries `throttle_time_ms` from v3.
 const METADATA_THROTTLE_MIN: i16 = 3;
 
@@ -880,14 +884,7 @@ async fn respond(stream: &mut TcpStream, req: Answering<'_>, view: &ClusterView,
                 });
                 view.tagged.lock().unwrap().push((conn_id, index));
             }
-            if view.fault == Some(HarnessFault::Throttle) && v >= METADATA_THROTTLE_MIN {
-                resp.throttle_time_ms = THROTTLE_MS;
-                let sent_at = u64::try_from(view.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                view.throttles
-                    .lock()
-                    .unwrap()
-                    .push((conn_id, index, sent_at));
-            }
+            resp.throttle_time_ms = throttle_for(view, conn_id, index, v >= METADATA_THROTTLE_MIN);
             resp.brokers = view
                 .ports
                 .iter()
@@ -1051,6 +1048,7 @@ async fn respond(stream: &mut TcpStream, req: Answering<'_>, view: &ClusterView,
             }
             let mut resp = ProduceResponse::default();
             resp.responses = responses;
+            resp.throttle_time_ms = throttle_for(view, conn_id, index, v >= PRODUCE_THROTTLE_MIN);
             let mut buf = BytesMut::new();
             let Ok(()) = resp.encode(&mut buf, v) else {
                 return;
@@ -1146,6 +1144,7 @@ async fn respond(stream: &mut TcpStream, req: Answering<'_>, view: &ClusterView,
             }
             let mut resp = FetchResponse::default();
             resp.responses = responses;
+            resp.throttle_time_ms = throttle_for(view, conn_id, index, v >= FETCH_THROTTLE_MIN);
             let mut buf = BytesMut::new();
             let Ok(()) = resp.encode(&mut buf, v) else {
                 return;
@@ -1170,6 +1169,28 @@ async fn respond(stream: &mut TcpStream, req: Answering<'_>, view: &ClusterView,
         return;
     };
     let _ = stream.write_all(&out).await;
+}
+
+/// Stamp a throttle on a response, and record that it went out.
+///
+/// Applied to produce and fetch as well as metadata, which is not
+/// decoration: the check this arms measures whether the client paused
+/// *on the throttled connection*, and a producer that has finished
+/// sending never speaks on the bootstrap connection again. Throttling
+/// only metadata therefore left the question unanswerable whenever the
+/// client happened to finish first — which is how the scenario passed
+/// here and skipped on a slower runner. A quota in Kafka bites on the
+/// data path; so does this.
+fn throttle_for(view: &ClusterView, conn_id: usize, index: usize, supported: bool) -> i32 {
+    if !supported || view.fault != Some(HarnessFault::Throttle) {
+        return 0;
+    }
+    let sent_at = u64::try_from(view.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    view.throttles
+        .lock()
+        .unwrap()
+        .push((conn_id, index, sent_at));
+    THROTTLE_MS
 }
 
 fn encode_api_versions(
