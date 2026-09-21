@@ -2,15 +2,15 @@
   "format": 1,
   "suite": "0.1.0",
   "checks": {
-    "client/acknowledges-sasl-rejection": "skipped",
+    "client/acknowledges-sasl-rejection": "pass",
     "client/body-decodes": "pass",
     "client/correlation-ids-unique": "pass",
     "client/header-well-formed": "pass",
-    "client/heeds-sasl-rejection": "skipped",
+    "client/heeds-sasl-rejection": "pass",
     "client/honours-throttle-time": "skipped",
     "client/recovers-from-leader-change": "skipped",
     "client/respects-advertised-versions": "pass",
-    "client/routes-to-partition-leader": "pass",
+    "client/routes-to-partition-leader": "skipped",
     "client/starts-with-api-versions": "pass",
     "client/tolerates-unknown-tagged-fields": "skipped"
   }

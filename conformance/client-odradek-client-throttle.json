@@ -7,7 +7,7 @@
     "client/correlation-ids-unique": "pass",
     "client/header-well-formed": "pass",
     "client/heeds-sasl-rejection": "skipped",
-    "client/honours-throttle-time": "skipped",
+    "client/honours-throttle-time": "pass",
     "client/recovers-from-leader-change": "skipped",
     "client/respects-advertised-versions": "pass",
     "client/routes-to-partition-leader": "pass",

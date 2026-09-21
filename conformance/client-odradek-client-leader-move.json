@@ -8,7 +8,7 @@
     "client/header-well-formed": "pass",
     "client/heeds-sasl-rejection": "skipped",
     "client/honours-throttle-time": "skipped",
-    "client/recovers-from-leader-change": "skipped",
+    "client/recovers-from-leader-change": "pass",
     "client/respects-advertised-versions": "pass",
     "client/routes-to-partition-leader": "pass",
     "client/starts-with-api-versions": "pass",

@@ -1539,35 +1539,41 @@ fn recovers_from_leader_change(s: &Session) -> Verdict {
 /// Judged on the connection the throttle arrived on: a pause is
 /// per connection, and a client with work for another broker is right
 /// to keep going there.
+///
+/// A throttle is only judged when the client said something that
+/// *settles* it, which is narrower than "said anything afterwards".
+/// Every window splits into three, and only two of them are verdicts:
+/// traffic in the front crossed in flight and proves nothing, traffic in
+/// the middle is a violation, and traffic past the end is a client that
+/// waited and resumed. A client whose whole remaining conversation fits
+/// in the front — five requests in sixteen milliseconds, then goodbye —
+/// leaves the question open, and reading that silence as compliance was
+/// this check's own bug: it passed a client with the pause deliberately
+/// removed, because the offender it went looking for had gone home
+/// before the window it was looking in.
+///
+/// Only throttles carried on the data path settle anything, for the
+/// mirror-image reason. Every pause here is inferred from a gap, and a
+/// gap after a *metadata* answer is as easily a client that had nothing
+/// queued yet: one that spent two seconds reading its input, then
+/// produced, passed a version of this check that counted that silence —
+/// having honoured nothing. After a produce or fetch answer the client
+/// is demonstrably mid-stream with more of the same work behind it, so
+/// the gap means what it looks like. This remains an inference rather
+/// than a proof; see the crate README on what would make it one.
 fn honours_throttle_time(session: &Session) -> Verdict {
     if session.throttles.is_empty() {
         return Verdict::Skipped {
             reason: "no response carried a throttle in this session".into(),
         };
     }
-    // The first throttle the client actually had a chance to observe.
-    // Clients open several connections — bootstrap, control, one per
-    // partition leader — and a throttle on one the client never speaks
-    // to again says nothing, which is not the same as passing.
-    let Some((sent_at, spoke)) = session
-        .throttles
-        .iter()
-        .find_map(|&(conn_id, index, sent_at)| {
-            let after: Vec<&Observation> = session
-                .observations
-                .iter()
-                .filter(|obs| obs.conn_id == conn_id && obs.index > index)
-                .collect();
-            (!after.is_empty()).then_some((sent_at, after))
+    let on_data_path = |conn_id: usize, index: usize| {
+        session.observations.iter().any(|obs| {
+            obs.conn_id == conn_id
+                && obs.index == index
+                && (obs.api_key == ProduceRequest::API_KEY || obs.api_key == FetchRequest::API_KEY)
         })
-    else {
-        return Verdict::Skipped {
-            reason: "every throttled connection went quiet afterwards, so there was no \
-                     pause to observe"
-                .into(),
-        };
     };
-
     // Judged on the *back half* of the window, not on the next request.
     // A client may have requests on the wire already when the throttled
     // answer arrives — Kafka's own producer does — and those are not
@@ -1580,24 +1586,46 @@ fn honours_throttle_time(session: &Session) -> Verdict {
     // resuming a little early, which is a rounding difference rather
     // than a refusal to wait.
     let window = u64::try_from(THROTTLE_MS).unwrap_or(0);
-    let enforced_from = sent_at + window / 2;
-    let enforced_until = sent_at + window - window / 8;
-    let Some(offender) = spoke
-        .iter()
-        .find(|obs| obs.at_ms >= enforced_from && obs.at_ms < enforced_until)
-    else {
-        return Verdict::Pass;
-    };
-    Verdict::Fail {
-        details: format!(
-            "answered with throttle_time_ms={THROTTLE_MS} and the client was still sending \
-             {}ms into the pause (api {} v{}); requests already in flight are fair, but by \
-             now they have drained and the broker is not reading yet — that request waits \
-             out the mute instead of the client waiting out the throttle",
-            offender.at_ms.saturating_sub(sent_at),
-            offender.api_key,
-            offender.api_version
-        ),
+    // Every throttle is examined, not just the first with traffic after
+    // it: one connection's inconclusive window says nothing about
+    // another's, and a client that honours the first pause and ignores
+    // the second has not honoured the pause.
+    let mut settled = false;
+    for &(conn_id, index, sent_at) in &session.throttles {
+        let enforced_from = sent_at + window / 2;
+        let enforced_until = sent_at + window - window / 8;
+        let data_path = on_data_path(conn_id, index);
+        let after = session
+            .observations
+            .iter()
+            .filter(|obs| obs.conn_id == conn_id && obs.index > index);
+        for obs in after {
+            if obs.at_ms >= enforced_from && obs.at_ms < enforced_until {
+                return Verdict::Fail {
+                    details: format!(
+                        "answered with throttle_time_ms={THROTTLE_MS} and the client was \
+                         still sending {}ms into the pause (api {} v{}); requests already \
+                         in flight are fair, but by now they have drained and the broker \
+                         is not reading yet — that request waits out the mute instead of \
+                         the client waiting out the throttle",
+                        obs.at_ms.saturating_sub(sent_at),
+                        obs.api_key,
+                        obs.api_version
+                    ),
+                };
+            }
+            settled |= data_path && obs.at_ms >= enforced_until;
+        }
+    }
+    if settled {
+        Verdict::Pass
+    } else {
+        Verdict::Skipped {
+            reason: "no throttled produce or fetch was followed by more traffic on that \
+                     connection once the pause elapsed, so nothing distinguishes a client \
+                     that waited from one that had already sent everything it had"
+                .into(),
+        }
     }
 }
 

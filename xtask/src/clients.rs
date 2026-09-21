@@ -1,12 +1,9 @@
-//! `cargo xtask client-matrix` — third-party clients through the
-//! client-side harness.
+//! `cargo xtask client-matrix` — clients through the client-side
+//! harness.
 //!
 //! The mirror of `conformance.rs`, pointing the other way. There, real
 //! brokers answer our checks; here, real clients are answered by our
-//! harness and judged on what they say. The server matrix has six
-//! subjects and sixty-two checks; this side had eleven checks and two
-//! clients that had ever run against it, one of which we wrote and the
-//! other of which we drove by hand, once.
+//! harness and judged on what they say.
 //!
 //! Each scenario is one harness configuration and one client
 //! invocation, enforced against a committed baseline exactly as the
@@ -15,9 +12,19 @@
 //! a matrix that ran the happy path alone would leave nearly half the
 //! catalogue skipping and call it a pass.
 //!
-//! The client runs in Docker on the host network, because the harness
-//! advertises itself as three brokers on three loopback ports and a
-//! bridged container cannot reach them.
+//! A containerised subject runs on the host network, because the
+//! harness advertises itself as three brokers on three loopback ports
+//! and a bridged container cannot reach them.
+//!
+//! `odradek-client` is a subject here too, and adding it was worth more
+//! than the row it occupies. It is the one party in this workspace that
+//! nothing had ever graded — the broker matrix runs the other direction
+//! and its own tests answer it with fixtures it agrees with by
+//! construction — and the first thing it did on arrival was reveal that
+//! `client/honours-throttle-time` passed a client with the pause taken
+//! out. See the check's own docs; the short version is that it treated
+//! an absence of evidence as evidence, and so had been green for both
+//! subjects without ever having been answered by either.
 
 use std::io::{BufRead as _, Write as _};
 use std::net::TcpListener;
@@ -30,8 +37,35 @@ use anyhow::{Context, Result, bail};
 struct ClientSubject {
     /// Baseline file stem, e.g. `kcat-1.7.1`.
     name: &'static str,
-    image: &'static str,
+    runner: Runner,
     scenarios: &'static [Scenario],
+}
+
+/// How a subject is started.
+enum Runner {
+    /// A published container image, on the host network.
+    Docker(&'static str),
+    /// A cargo example from this workspace, built and run directly.
+    ///
+    /// This is how our own client gets in here, and it is worth being
+    /// precise about why that is not the suite marking its own homework.
+    /// The rule that `odradek-acceptance` never depends on
+    /// `odradek-client` is about the *harness*: a judge that imported
+    /// the thing it judges would agree with it by construction. A
+    /// subject is the opposite arrangement — it arrives over a socket
+    /// and is read exactly as kcat is, by a harness that does not know
+    /// which one it is talking to.
+    Example(&'static str),
+}
+
+impl Runner {
+    /// What to call this in the log.
+    fn describe(&self) -> String {
+        match self {
+            Runner::Docker(image) => (*image).to_owned(),
+            Runner::Example(name) => format!("cargo example {name}"),
+        }
+    }
 }
 
 /// One harness configuration and the client invocation that meets it.
@@ -50,88 +84,152 @@ struct Scenario {
 /// back, and a leader move is only observable if there is a retry.
 const PRODUCE_LINES: &str = "one\ntwo\nthree\nfour\nfive\n";
 
-const SUBJECTS: &[ClientSubject] = &[ClientSubject {
-    name: "kcat-1.7.1",
-    image: "edenhill/kcat:1.7.1",
-    scenarios: &[
-        Scenario {
-            name: "produce",
-            fault: None,
-            args: &["-b", "{addr}", "-t", "odradek-routing", "-P"],
-            stdin: PRODUCE_LINES,
-        },
-        // The other half of `routes-to-partition-leader`. A consumer
-        // asks where the log starts before it fetches, so this scenario
-        // is the reason the harness answers ListOffsets at all.
-        Scenario {
-            name: "consume",
-            fault: None,
-            args: &["-b", "{addr}", "-t", "odradek-routing", "-C", "-e", "-q"],
-            stdin: "",
-        },
-        Scenario {
-            name: "leader-move",
-            fault: Some("leader-move"),
-            args: &["-b", "{addr}", "-t", "odradek-routing", "-P"],
-            stdin: PRODUCE_LINES,
-        },
-        // Pinned to one partition, one message per request. The check
-        // can only judge a throttle the client had a chance to observe
-        // — one followed by more traffic on the *same* connection —
-        // and a producer that batches five messages into a single
-        // request to a leader it then says goodbye to gives it nothing
-        // to measure. That is not hypothetical: with default batching
-        // this scenario skipped about one run in six, which is a flaky
-        // baseline however green it looks the other five times.
-        Scenario {
-            name: "throttle",
-            fault: Some("throttle"),
-            args: &[
-                "-b",
-                "{addr}",
-                "-t",
-                "odradek-routing",
-                "-P",
-                "-p",
-                "0",
-                "-X",
-                "batch.num.messages=1",
-            ],
-            stdin: PRODUCE_LINES,
-        },
-        Scenario {
-            name: "unknown-tagged-field",
-            fault: Some("unknown-tagged-field"),
-            args: &["-b", "{addr}", "-t", "odradek-routing", "-P"],
-            stdin: PRODUCE_LINES,
-        },
-        // OAUTHBEARER specifically: the refusal this fault injects is
-        // RFC 7628's success-shaped failure challenge, which no other
-        // mechanism has. Under PLAIN the harness refuses the handshake
-        // and these two checks skip, which is correct and uninteresting
-        // — so the matrix asks the question that has an answer.
-        Scenario {
-            name: "sasl-oauthbearer",
-            fault: Some("reject-sasl-token"),
-            args: &[
-                "-b",
-                "{addr}",
-                "-t",
-                "odradek-routing",
-                "-P",
-                "-X",
-                "security.protocol=SASL_PLAINTEXT",
-                "-X",
-                "sasl.mechanism=OAUTHBEARER",
-                "-X",
-                "enable.sasl.oauthbearer.unsecure.jwt=true",
-                "-X",
-                "sasl.oauthbearer.config=principal=odradek",
-            ],
-            stdin: PRODUCE_LINES,
-        },
-    ],
-}];
+const SUBJECTS: &[ClientSubject] = &[
+    ClientSubject {
+        name: "kcat-1.7.1",
+        runner: Runner::Docker("edenhill/kcat:1.7.1"),
+        scenarios: &[
+            Scenario {
+                name: "produce",
+                fault: None,
+                args: &["-b", "{addr}", "-t", "odradek-routing", "-P"],
+                stdin: PRODUCE_LINES,
+            },
+            // The other half of `routes-to-partition-leader`. A consumer
+            // asks where the log starts before it fetches, so this scenario
+            // is the reason the harness answers ListOffsets at all.
+            Scenario {
+                name: "consume",
+                fault: None,
+                args: &["-b", "{addr}", "-t", "odradek-routing", "-C", "-e", "-q"],
+                stdin: "",
+            },
+            Scenario {
+                name: "leader-move",
+                fault: Some("leader-move"),
+                args: &["-b", "{addr}", "-t", "odradek-routing", "-P"],
+                stdin: PRODUCE_LINES,
+            },
+            // Pinned to one partition, one message per request. The check
+            // can only judge a throttle the client had a chance to observe
+            // — one followed by more traffic on the *same* connection —
+            // and a producer that batches five messages into a single
+            // request to a leader it then says goodbye to gives it nothing
+            // to measure. That is not hypothetical: with default batching
+            // this scenario skipped about one run in six, which is a flaky
+            // baseline however green it looks the other five times.
+            Scenario {
+                name: "throttle",
+                fault: Some("throttle"),
+                args: &[
+                    "-b",
+                    "{addr}",
+                    "-t",
+                    "odradek-routing",
+                    "-P",
+                    "-p",
+                    "0",
+                    "-X",
+                    "batch.num.messages=1",
+                ],
+                stdin: PRODUCE_LINES,
+            },
+            Scenario {
+                name: "unknown-tagged-field",
+                fault: Some("unknown-tagged-field"),
+                args: &["-b", "{addr}", "-t", "odradek-routing", "-P"],
+                stdin: PRODUCE_LINES,
+            },
+            // OAUTHBEARER specifically: the refusal this fault injects is
+            // RFC 7628's success-shaped failure challenge, which no other
+            // mechanism has. Under PLAIN the harness refuses the handshake
+            // and these two checks skip, which is correct and uninteresting
+            // — so the matrix asks the question that has an answer.
+            Scenario {
+                name: "sasl-oauthbearer",
+                fault: Some("reject-sasl-token"),
+                args: &[
+                    "-b",
+                    "{addr}",
+                    "-t",
+                    "odradek-routing",
+                    "-P",
+                    "-X",
+                    "security.protocol=SASL_PLAINTEXT",
+                    "-X",
+                    "sasl.mechanism=OAUTHBEARER",
+                    "-X",
+                    "enable.sasl.oauthbearer.unsecure.jwt=true",
+                    "-X",
+                    "sasl.oauthbearer.config=principal=odradek",
+                ],
+                stdin: PRODUCE_LINES,
+            },
+        ],
+    },
+    // Our own client, as a subject rather than as the thing doing the
+    // asking. Until this row existed it was the only participant in the
+    // constellation that nothing ever graded: the broker matrix runs the
+    // other direction entirely, and its own tests answer it with fixtures
+    // it agrees with by construction.
+    ClientSubject {
+        name: "odradek-client",
+        runner: Runner::Example("matrix_subject"),
+        scenarios: &[
+            Scenario {
+                name: "produce",
+                fault: None,
+                args: &["{addr}", "produce"],
+                stdin: "",
+            },
+            Scenario {
+                name: "consume",
+                fault: None,
+                args: &["{addr}", "consume"],
+                stdin: "",
+            },
+            Scenario {
+                name: "leader-move",
+                fault: Some("leader-move"),
+                args: &["{addr}", "produce"],
+                stdin: "",
+            },
+            // One record per request, pinned, for the same reason kcat is —
+            // a throttle needs a later request on the same connection to
+            // hold back. This client is sequential where librdkafka
+            // pipelines, which is why the check can settle it and cannot
+            // settle kcat: a producer that has already written its whole
+            // backlog to the socket has nothing left to delay.
+            Scenario {
+                name: "throttle",
+                fault: Some("throttle"),
+                args: &[
+                    "{addr}",
+                    "produce",
+                    "--partition",
+                    "0",
+                    "--record-per-request",
+                ],
+                stdin: "",
+            },
+            Scenario {
+                name: "unknown-tagged-field",
+                fault: Some("unknown-tagged-field"),
+                args: &["{addr}", "produce"],
+                stdin: "",
+            },
+            // Expected to exit non-zero: the token is refused and the
+            // client says so. What is being graded is how it takes the
+            // refusal, not whether it got in.
+            Scenario {
+                name: "sasl-oauthbearer",
+                fault: Some("reject-sasl-token"),
+                args: &["{addr}", "produce", "--oauthbearer"],
+                stdin: "",
+            },
+        ],
+    },
+];
 
 pub fn client_matrix(args: &[String]) -> Result<()> {
     let root = crate::workspace_root();
@@ -139,6 +237,11 @@ pub fn client_matrix(args: &[String]) -> Result<()> {
     let filters: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
 
     let accept = build_accept(&root)?;
+    for subject in SUBJECTS {
+        if let Runner::Example(name) = subject.runner {
+            build_example(&root, name)?;
+        }
+    }
     let mut log = std::io::stdout().lock();
     let mut failures = Vec::new();
 
@@ -148,9 +251,11 @@ pub fn client_matrix(args: &[String]) -> Result<()> {
             if !filters.is_empty() && !filters.iter().any(|f| id.contains(f.as_str())) {
                 continue;
             }
-            let _ = writeln!(log, "=== {id} ({}) ===", subject.image);
+            let _ = writeln!(log, "=== {id} ({}) ===", subject.runner.describe());
             let baseline = root.join(format!("conformance/client-{id}.json"));
-            match run_scenario(&accept, subject, scenario, &baseline, record, &mut log) {
+            match run_scenario(
+                &root, &accept, subject, scenario, &baseline, record, &mut log,
+            ) {
                 Ok(true) => {}
                 Ok(false) => failures.push(id),
                 Err(e) => {
@@ -183,8 +288,21 @@ fn build_accept(root: &Path) -> Result<PathBuf> {
     Ok(root.join("target/debug/odradek-accept"))
 }
 
+fn build_example(root: &Path, name: &str) -> Result<PathBuf> {
+    let status = Command::new(env!("CARGO"))
+        .current_dir(root)
+        .args(["build", "-p", "odradek-client", "--example", name])
+        .status()
+        .with_context(|| format!("building the {name} example"))?;
+    if !status.success() {
+        bail!("building the {name} example failed");
+    }
+    Ok(root.join(format!("target/debug/examples/{name}")))
+}
+
 /// Run one scenario; `Ok(true)` when the report matched its baseline.
 fn run_scenario(
+    root: &Path,
     accept: &Path,
     subject: &ClientSubject,
     scenario: &Scenario,
@@ -240,10 +358,16 @@ fn run_scenario(
         .iter()
         .map(|a| a.replace("{addr}", &addr))
         .collect();
-    let mut docker = Command::new("docker");
-    docker.args(["run", "--rm", "-i", "--network", "host", subject.image]);
-    docker.args(&client_args);
-    let mut child = docker
+    let mut client = match subject.runner {
+        Runner::Docker(image) => {
+            let mut docker = Command::new("docker");
+            docker.args(["run", "--rm", "-i", "--network", "host", image]);
+            docker
+        }
+        Runner::Example(name) => Command::new(root.join(format!("target/debug/examples/{name}"))),
+    };
+    client.args(&client_args);
+    let mut child = client
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -267,7 +391,7 @@ fn run_scenario(
         let _ = writeln!(
             log,
             "--- {} stderr (tail) ---\n{}",
-            subject.image,
+            subject.runner.describe(),
             tail(&String::from_utf8_lossy(&client.stderr), 12)
         );
         return Ok(false);

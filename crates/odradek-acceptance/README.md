@@ -223,9 +223,9 @@ broker does — and the client is expected to keep it and carry on. One
 that refuses instead breaks against every broker newer than itself, and
 breaks on upgrade day in somebody's cluster rather than in a test suite.
 
-`client/honours-throttle-time` is the one that has been wrong twice,
-in both directions. It found a gap in this crate's own client, which
-read `throttle_time_ms` from nothing at all — Quota
+`client/honours-throttle-time` is the one that has been wrong three
+times, in every direction available to it. It found a gap in this
+crate's own client, which read `throttle_time_ms` from nothing at all — Quota
 enforcement is not advice a client can decline: the broker answers,
 sets the field, and then stops reading that connection for that long,
 so a client that ignores it does not get its next request in sooner —
@@ -245,6 +245,35 @@ still talking in between. Pointing a foreign client at the harness is
 the only thing that could have shown this: every client check here was
 written, calibrated, and dogfooded by the same author against the same
 client, which is a closed loop no amount of care escapes.
+
+The third time was the widest. Looking for an offender in the middle of
+the pause and passing when it found none reads an absence as a fact: a
+client whose whole remaining conversation fits in the front exemption —
+five requests in sixteen milliseconds, then goodbye — is not one that
+waited, it is one nobody watched. The check passed our client with the
+pause deliberately removed, at 19ms against 1619ms for the same client
+intact, and it had been passing librdkafka for the same reason. Now a
+throttle is only judged when the client said something that settles it:
+traffic in the middle is a violation, traffic once the window has
+closed is a client that waited and resumed, and anything else is a
+skip.
+
+It is a skip for kcat, and that is the honest answer rather than a
+gap to be closed. librdkafka writes its whole produce backlog to the
+socket before the first throttled answer comes back — 30 requests in 8ms
+on a harness that answers instantly — so there is never a request left
+for it to delay. Nothing it did was wrong; the scenario simply cannot
+ask it the question. Our client is sequential in that scenario and can
+be asked.
+
+What is left is still an inference, not a proof: a pause is measured as
+a gap, and a gap is only evidence when the client had work behind it.
+That is why only throttles carried on the **data path** settle anything.
+An earlier version of this fix counted metadata pauses too, and passed a
+kcat that had spent two seconds reading its input and honoured nothing.
+Making it a proof would need a control — throttling some answers and not
+others, and comparing the gaps after each — which is a bigger change
+than this check has yet earned.
 
 Five checks sweep **every version the subject advertises** rather than
 negotiating one and stopping. Against Kafka 4.1 that is 13 Metadata
@@ -312,15 +341,32 @@ must not end up outside the transaction, by either route.
 the other way: the harness answers, a real client is judged on what it
 says, and each scenario is enforced against a committed baseline.
 
-Six scenarios for one client (kcat 1.7.1, so librdkafka): a producer, a
-consumer, and one per injected fault. The faults are the point — five of
-the eleven client checks have nothing to judge until one is armed, so a
-matrix that ran only the happy path would leave nearly half the
-catalogue skipping and report it as a pass. Between the six, every check
-is exercised.
+Two subjects, six scenarios each: a producer, a consumer, and one per
+injected fault. The faults are the point — five of the eleven client
+checks have nothing to judge until one is armed, so a matrix that ran
+only the happy path would leave nearly half the catalogue skipping and
+report it as a pass. Between the six, every check is exercised.
 
-librdkafka passes all eleven. Everything the matrix found on its first
-run was in the harness:
+The subjects are **kcat 1.7.1** (so librdkafka), run from its published
+image, and **`odradek-client`**, run as a cargo example from this
+workspace. The second is not the suite marking its own homework, and the
+distinction is worth stating precisely: the rule that this crate never
+depends on `odradek-client` is about the *harness*, because a judge that
+imported what it judges would agree with it by construction. A subject
+is the opposite arrangement. It arrives over a socket and is read
+exactly as kcat is, by a harness that cannot tell which one it is
+talking to.
+
+Adding it was overdue. `odradek-client` was the one party in the
+workspace that nothing had ever graded — the broker matrix runs the
+other direction entirely, and the client's own tests answer it with
+fixtures it agrees with by construction — and what it found on arrival
+was `client/honours-throttle-time` passing a client with the pause taken
+out. That check had been green for both subjects without ever having
+been answered by either; see above for what it does now.
+
+Both clients pass every check that can be put to them. Everything the
+matrix found on its first run was in the harness:
 
 - **A mechanism was agreed that had never been offered.** The
   SaslHandshake answer was `NONE` to everything while advertising only

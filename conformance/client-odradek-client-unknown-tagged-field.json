@@ -12,6 +12,6 @@
     "client/respects-advertised-versions": "pass",
     "client/routes-to-partition-leader": "pass",
     "client/starts-with-api-versions": "pass",
-    "client/tolerates-unknown-tagged-fields": "skipped"
+    "client/tolerates-unknown-tagged-fields": "pass"
   }
 }

@@ -110,20 +110,27 @@ jobs:
           command: check
 
   client-matrix:
-    name: third-party client matrix
+    name: client matrix
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - name: enforce committed baselines against a real third-party client
+      - name: enforce committed baselines against a real client
         # The other direction from the conformance job: there real
         # brokers answer our checks, here a real client is answered by
-        # our harness and judged on what it says. Six scenarios — a
-        # producer, a consumer, and one per injected fault — because
-        # five of the eleven client checks have nothing to judge until
-        # a fault is armed, and a matrix that ran the happy path alone
-        # would leave half the catalogue skipping and call it a pass.
+        # our harness and judged on what it says. Two subjects — kcat
+        # from its image, and odradek-client as a cargo example — six
+        # scenarios each: a producer, a consumer, and one per injected
+        # fault, because five of the eleven client checks have nothing
+        # to judge until a fault is armed, and a matrix that ran the
+        # happy path alone would leave half the catalogue skipping and
+        # call it a pass.
+        #
+        # Our own client is a subject here, not the harness's
+        # implementation: it arrives over a socket like kcat does, and
+        # its first run found a check that had been passing both of them
+        # without having been answered by either.
         #
         # Its own job rather than a step of the conformance one: it
         # needs no broker, finishes in well under a minute, and a

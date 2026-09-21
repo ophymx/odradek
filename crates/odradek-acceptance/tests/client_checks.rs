@@ -452,13 +452,16 @@ async fn odradek_client_waits_out_a_throttle() {
     let mut client_config = ClientConfig::default();
     client_config.bootstrap_servers = vec![addr];
     client_config.client_id = "odradek".into();
-    // Connecting refreshes metadata, and that answer carries the
-    // throttle. The second refresh rides the same control connection,
-    // so it is the one that has to wait — a produce would not do, since
-    // it opens its own connection to the partition leader and a pause
-    // is per connection.
     let cluster = Cluster::connect(client_config).await.unwrap();
-    // Refreshing in a loop for longer than the throttle window is what
+    // Produced, not metadata-refreshed. Either drives requests down one
+    // connection, but only the produce path carries the thing the check
+    // now requires before it will call a gap a pause: a client that is
+    // demonstrably mid-stream. A metadata refresh loop settled the old
+    // version of this check and would settle nothing now — which is the
+    // point, since a client idle between metadata calls looks exactly
+    // like one honouring a throttle.
+    let mut producer = Producer::new(cluster.clone());
+    // Producing in a loop for longer than the throttle window is what
     // makes this observable. A client that waits sends a handful of
     // requests spaced a window apart, and is silent through the middle
     // of each one; a client that does not is talking the whole time,
@@ -466,8 +469,16 @@ async fn odradek_client_waits_out_a_throttle() {
     // the loop the test passes either way — its first version did.
     let until = std::time::Instant::now() + Duration::from_millis(900);
     while std::time::Instant::now() < until {
-        cluster.refresh_metadata(&[ROUTING_TOPIC]).await.unwrap();
+        let record = odradek_protocol::records::Record {
+            value: Some(Bytes::from_static(b"throttled")),
+            ..Default::default()
+        };
+        producer
+            .produce(ROUTING_TOPIC, 0, vec![record])
+            .await
+            .unwrap();
     }
+    drop(producer);
     drop(cluster);
 
     let report = harness.await.unwrap().expect("harness ran");
