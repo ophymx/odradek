@@ -3701,6 +3701,34 @@ fn unique_topic(tag: &str) -> String {
     format!("odradek-accept-{tag}-{}-{nanos}", std::process::id())
 }
 
+/// The timestamp every probe record carries: when this process started.
+///
+/// Fixed for the run, because `offsets/by-timestamp` produces a batch
+/// and then asks the broker to find it by the timestamps it was stamped
+/// with — the two calls to [`probe_batch`] have to agree, and so do the
+/// produced and fetched bytes every integrity check compares.
+///
+/// *Current*, because retention is applied to what the record says, not
+/// to when it arrived. A constant baked in the day it was written is a
+/// day older every day, and once it passes the default seven days every
+/// topic the suite creates is born eligible for deletion. That does not
+/// arrive as a clear failure: it arrives as a segment disappearing
+/// underneath a check that was midway through reading it, minutes later,
+/// only when a retention pass happens to land in the window — which
+/// reads as an intermittent fault in whatever the check was about.
+fn probe_timestamp() -> i64 {
+    static AT: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        let since_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        // A clock this broken has no right answer, but zero is the one
+        // wrong answer worth avoiding: it is 1970, which is precisely
+        // the state this function exists to keep the suite out of.
+        i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX / 2)
+    })
+}
+
 /// The batch every produce/fetch check sends: two records with keys,
 /// values, a header, and a tombstone — enough shape to make byte-level
 /// integrity meaningful.
@@ -3708,8 +3736,8 @@ fn probe_batch() -> RecordBatch {
     RecordBatch {
         base_offset: 0,
         last_offset_delta: 1,
-        base_timestamp: 1_758_000_000_000,
-        max_timestamp: 1_758_000_000_001,
+        base_timestamp: probe_timestamp(),
+        max_timestamp: probe_timestamp() + 1,
         producer_id: -1,
         producer_epoch: -1,
         base_sequence: -1,
@@ -5125,13 +5153,32 @@ async fn await_abort_marker(
     // that meant "not yet". That is the failure this check is about —
     // the marker never landed — and saying so beats reporting the last
     // refusal as if the fetch itself were the problem.
-    let data = data.ok_or_else(|| Verdict::Fail {
-        details: format!(
-            "{context} nothing was readable at {first_offset} within {:?}: every \
-             read_committed fetch was refused, so the transaction was never resolved",
-            ctx.config.recovery_budget
-        ),
-    })?;
+    let data = match data {
+        Some(data) => data,
+        None => {
+            let evidence = marker_evidence(
+                conn,
+                fetch_version,
+                FetchAt {
+                    topic,
+                    partition: 0,
+                    offset: first_offset,
+                    isolation_level: READ_UNCOMMITTED,
+                },
+                producer_id,
+                correlation + 880,
+            )
+            .await;
+            return Err(Verdict::Fail {
+                details: format!(
+                    "{context} nothing was readable at {first_offset} within {:?}: every \
+                     read_committed fetch was refused, so the transaction was never \
+                     resolved{evidence}",
+                    ctx.config.recovery_budget
+                ),
+            });
+        }
+    };
 
     if data.last_stable_offset <= first_offset {
         // The watermarks go in the message because they are what
@@ -5141,13 +5188,27 @@ async fn await_abort_marker(
         // never wrote, or wrote it for partitions not including this
         // one. A high watermark that is also stuck means the write
         // itself never became visible, which is a different fault in a
-        // different component, and guessing between them from one
-        // number is how an hour goes missing.
+        // different component. `marker_evidence` then goes and looks,
+        // so the report names the component rather than leaving it to
+        // be inferred from three numbers.
+        let evidence = marker_evidence(
+            conn,
+            fetch_version,
+            FetchAt {
+                topic,
+                partition: 0,
+                offset: first_offset,
+                isolation_level: READ_UNCOMMITTED,
+            },
+            producer_id,
+            correlation + 900,
+        )
+        .await;
         return Err(Verdict::Fail {
             details: format!(
                 "{context} the stable offset never moved past {first_offset} within {:?} \
                  (stable {}, high watermark {}, log start {}), so the partition stays \
-                 blocked on a transaction that has already finished",
+                 blocked on a transaction that has already finished{evidence}",
                 ctx.config.recovery_budget,
                 data.last_stable_offset,
                 data.high_watermark,
@@ -5168,6 +5229,112 @@ async fn await_abort_marker(
         });
     }
     Ok(())
+}
+
+/// What is actually written on the partition, for a marker that never
+/// arrived.
+///
+/// A stable offset that will not move has two causes in two different
+/// components, and the stable offset alone cannot tell them apart. A
+/// `read_uncommitted` fetch can: it is not held back by the stable
+/// offset, so it reports the log as written. Either the control batch
+/// that ends the transaction is on disk — the marker landed and the
+/// partition is failing to account for it — or it is not, and the
+/// coordinator acknowledged an end whose marker it never delivered.
+/// Those are a partition bug and a coordinator bug, and picking between
+/// them by guessing is how an afternoon goes missing.
+///
+/// Diagnostic only. The caller has already decided the verdict, so
+/// everything that can go wrong here is reported as "could not be
+/// determined" rather than raised: a second fetch that fails must
+/// describe the finding, never replace it.
+async fn marker_evidence(
+    conn: &mut RawConnection,
+    fetch_version: i16,
+    at: FetchAt<'_>,
+    producer_id: i64,
+    correlation: i32,
+) -> String {
+    // A fetch is answered from one log segment, so a marker that landed
+    // in the segment after the records it ends is not in the same reply
+    // they are — and a segment boundary right there is not unusual,
+    // because the marker is the first thing written after them. Walk
+    // forward until the marker turns up or the log stops yielding: one
+    // reply is not the log.
+    let mut offset = at.offset;
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    for step in 0..8 {
+        let at = FetchAt {
+            isolation_level: READ_UNCOMMITTED,
+            offset,
+            ..at
+        };
+        let data = match fetch_partition(conn, fetch_version, at, correlation + step).await {
+            Ok(data) => data,
+            Err(e) if batches.is_empty() => {
+                let details = e.details();
+                // Out of range with nothing holding the read back is
+                // the log itself saying it no longer covers that
+                // offset — the records were taken out from under the
+                // check, by retention or by a truncation, rather than
+                // never written. Under `read_committed` the same code
+                // is ambiguous, which is why `still_resolving` waits
+                // it out; here it is not, and the difference is worth
+                // the sentence.
+                return if fetch_refusal_names(details, &[ErrorCode::OFFSET_OUT_OF_RANGE]) {
+                    format!(
+                        "; read_uncommitted cannot see {offset} either ({details}), so the \
+                         log no longer covers the records and they were removed from under \
+                         the check rather than never written"
+                    )
+                } else {
+                    format!("; what is on the partition could not be determined ({details})")
+                };
+            }
+            // Something is already in hand; describe that rather than
+            // discard it for a refusal at the far end of the walk.
+            Err(_) => break,
+        };
+        let mut records = data.records.clone().unwrap_or_default();
+        let decoded = match decode_set(&mut records) {
+            Ok(decoded) => decoded,
+            Err(e) => return format!("; the read_uncommitted record set does not decode ({e})"),
+        };
+        let Some(last) = decoded.last() else { break };
+        let next = last.base_offset + i64::from(last.last_offset_delta) + 1;
+        let found = decoded
+            .iter()
+            .any(|batch| batch.is_control() && batch.producer_id == producer_id);
+        batches.extend(decoded);
+        if found || next <= offset {
+            break;
+        }
+        offset = next;
+    }
+    // Matched on the producer id, not merely on being a control batch:
+    // an unrelated transaction on the same partition also ends in one,
+    // and "a marker is present" is not the claim — "the marker for this
+    // transaction is present" is.
+    let marker = batches
+        .iter()
+        .find(|batch| batch.is_control() && batch.producer_id == producer_id);
+    match (marker, batches.len()) {
+        (Some(batch), _) => format!(
+            "; read_uncommitted shows the marker for producer {producer_id} on disk at offset \
+             {}, so the batch that ends the transaction was written and the partition is not \
+             accounting for it",
+            batch.base_offset
+        ),
+        (None, 0) => format!(
+            "; read_uncommitted shows nothing at {} either, so the write never became visible",
+            at.offset
+        ),
+        (None, n) => format!(
+            "; read_uncommitted shows {n} batch(es) from {} and no control batch for producer \
+             {producer_id}, so the marker was never written to this partition",
+            batches.first().map_or(at.offset, |batch| batch.base_offset)
+        ),
+    }
 }
 
 /// One aborted transaction's footprint on one partition.
@@ -7086,22 +7253,49 @@ async fn txn_commit_is_visible_to_readers(ctx: &ServerCtx) -> Verdict {
     let data = match data {
         Some(data) => data,
         None => {
+            let evidence = marker_evidence(
+                &mut leader,
+                versions.fetch,
+                FetchAt {
+                    topic: &topic,
+                    partition: 0,
+                    offset: first_offset,
+                    isolation_level: READ_UNCOMMITTED,
+                },
+                identity.producer_id,
+                1_880,
+            )
+            .await;
             return Verdict::Fail {
                 details: format!(
                     "the commit was acknowledged but nothing was readable at {first_offset} \
                      within {:?}: every read_committed fetch was refused, so the commit \
-                     marker never landed",
+                     marker never landed{evidence}",
                     ctx.config.recovery_budget
                 ),
             };
         }
     };
     if data.last_stable_offset <= first_offset {
+        let evidence = marker_evidence(
+            &mut leader,
+            versions.fetch,
+            FetchAt {
+                topic: &topic,
+                partition: 0,
+                offset: first_offset,
+                isolation_level: READ_UNCOMMITTED,
+            },
+            identity.producer_id,
+            1_900,
+        )
+        .await;
         return Verdict::Fail {
             details: format!(
                 "the commit was acknowledged but the stable offset never moved past \
                  {first_offset} within {:?} (stable {}, high watermark {}, log start {}); a \
-                 read_committed consumer stays blocked on a transaction that finished",
+                 read_committed consumer stays blocked on a transaction that \
+                 finished{evidence}",
                 ctx.config.recovery_budget,
                 data.last_stable_offset,
                 data.high_watermark,
@@ -9101,5 +9295,65 @@ fn span(versions: &[i16]) -> String {
         (Some(first), Some(last)) if first != last => format!("v{first}-{last}"),
         (Some(only), _) => format!("v{only}"),
         _ => "none".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{probe_batch, probe_timestamp};
+
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+    /// Kafka's `log.retention.hours` default, in milliseconds.
+    const DEFAULT_RETENTION_MS: i64 = 7 * DAY_MS;
+
+    fn now_ms() -> i64 {
+        let since_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is before the unix epoch");
+        i64::try_from(since_epoch.as_millis()).expect("the clock is beyond year 292 million")
+    }
+
+    /// Probe records must not be born past a broker's retention.
+    ///
+    /// Retention is applied to what the record says its timestamp is,
+    /// not to when the broker received it, so a probe stamped with a
+    /// constant sits inside the default seven-day window on the day
+    /// that constant is written and outside it a week later. From then
+    /// on every topic the suite creates is eligible for deletion the
+    /// moment its first segment rolls, and a retention pass can take
+    /// the records out from under a check that is still reading them.
+    /// What that looks like is an intermittent failure of whatever the
+    /// check was about — a transaction marker that never lands, a
+    /// fetch that finds nothing — and not like a clock at all. This
+    /// suite has already lost the time once; the assertion is cheap.
+    #[test]
+    fn probe_records_are_not_born_expired() {
+        // The largest timestamp in the batch, because that is the one
+        // retention is decided on. A minute of slack ahead of the
+        // clock covers the batch's own `+1` without admitting a
+        // timestamp from the future, which breaks `by-timestamp`
+        // lookups instead; a day of margin behind it leaves the
+        // assertion about a constant drifting out of the window rather
+        // than about the exact hour it crosses.
+        let age = now_ms() - probe_batch().max_timestamp;
+        assert!(
+            (-60_000..DEFAULT_RETENTION_MS - DAY_MS).contains(&age),
+            "probe records are stamped {age}ms from now; a broker applying the default \
+             {DEFAULT_RETENTION_MS}ms retention may delete them while a check is reading"
+        );
+    }
+
+    /// And they must say the same thing every time they are asked.
+    ///
+    /// `offsets/by-timestamp` produces a batch and then calls
+    /// [`probe_batch`] again to recover the timestamps to look it up
+    /// by, and every integrity check compares produced bytes against
+    /// fetched ones. Reading the clock per call would satisfy the test
+    /// above and break both.
+    #[test]
+    fn probe_timestamps_agree_across_calls() {
+        assert_eq!(probe_timestamp(), probe_timestamp());
+        assert_eq!(probe_batch().base_timestamp, probe_batch().base_timestamp);
+        assert_eq!(probe_batch().max_timestamp, probe_batch().max_timestamp);
     }
 }
