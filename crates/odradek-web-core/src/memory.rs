@@ -109,16 +109,21 @@ impl MemorySource {
     }
 }
 
+/// Offsets here are indexes into a `Vec`, which is as dense as a log
+/// gets, so this adapter converts from exclusive positions the same way
+/// the Kafka one does — and for the same reason: the arithmetic belongs
+/// where the numbering is known, not above the trait.
 impl RecordSource for MemorySource {
     async fn fetch(
         &mut self,
         topic: &str,
         partition: i32,
-        offset: i64,
+        after: Option<i64>,
     ) -> Result<SourceBatch, SourceError> {
         let events = self.partition(partition)?.lock().unwrap();
         let len = i64::try_from(events.len()).unwrap_or(i64::MAX);
-        let start = usize::try_from(offset.clamp(0, len)).unwrap_or(usize::MAX);
+        let from = after.map_or(0, |position| position + 1);
+        let start = usize::try_from(from.clamp(0, len)).unwrap_or(usize::MAX);
         let batch: Vec<Event> = events
             .iter()
             .skip(start)
@@ -128,21 +133,22 @@ impl RecordSource for MemorySource {
                 ..e.clone()
             })
             .collect();
-        let next_offset = offset.max(0) + i64::try_from(batch.len()).unwrap_or(0);
         Ok(SourceBatch {
+            // The log has no gaps, so the position consumed is simply
+            // the last event returned; an empty batch consumed nothing.
+            next_after: batch.last().map(|e| e.offset),
             events: batch,
-            next_offset,
             high_watermark: len,
         })
     }
 
-    async fn earliest_offset(&mut self, _topic: &str, partition: i32) -> Result<i64, SourceError> {
-        self.partition(partition)?;
-        Ok(0)
-    }
-
-    async fn latest_offset(&mut self, _topic: &str, partition: i32) -> Result<i64, SourceError> {
-        Ok(i64::try_from(self.partition(partition)?.lock().unwrap().len()).unwrap_or(i64::MAX))
+    async fn live_start(
+        &mut self,
+        _topic: &str,
+        partition: i32,
+    ) -> Result<Option<i64>, SourceError> {
+        let events = self.partition(partition)?.lock().unwrap();
+        Ok(events.last().map(|e| e.offset))
     }
 }
 

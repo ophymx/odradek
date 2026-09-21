@@ -12,10 +12,14 @@
 //!   carry the record's JSON rendering with them, computed once however
 //!   many subscribers ask for it.
 //! - **Replay**: subscribers start [`Earliest`](Position::Earliest),
-//!   [`Latest`](Position::Latest), or at an exact offset — and every
-//!   [`Event`] carries its offset, from which a transport mints the
-//!   resume token it hands the client (`Last-Event-ID`, in SSE terms).
-//!   The token is opaque to that client: echoed back, never parsed.
+//!   [`Latest`](Position::Latest), or [`After`](Position::After) an
+//!   offset — and every [`Event`] carries its offset, which *is* the
+//!   resume token a transport hands the client (`Last-Event-ID`, in SSE
+//!   terms). The token is opaque to that client: echoed back, never
+//!   parsed. Positions are exclusive throughout, which is what lets the
+//!   engine pass one back unchanged rather than computing the next one
+//!   — see [`RecordSource`] for what that buys a source that does not
+//!   number its records the way Kafka does.
 //! - **Filtering**: per-subscriber [`Filter`]s (key prefix, header
 //!   match) applied before anything is queued.
 //! - **Self-healing backpressure**: a slow subscriber falls out of the

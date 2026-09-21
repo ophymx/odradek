@@ -12,13 +12,20 @@ use odradek_client::{ClientConfig, Cluster, Consumer};
 
 use crate::event::Event;
 
-/// A fetch's worth of events plus the cursors that follow it.
+/// A fetch's worth of events plus the position that follows it.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct SourceBatch {
     pub events: Vec<Event>,
-    /// Where the next fetch should start.
-    pub next_offset: i64,
+    /// What to pass as `after` on the next fetch.
+    ///
+    /// Normally the last event's position, but it may be further on:
+    /// a stretch of the log that yields no events (compaction gaps,
+    /// control batches, records the source filtered) still has to
+    /// advance the cursor, or a subscriber fetches the same empty
+    /// stretch forever. `None` means the fetch consumed nothing and
+    /// the caller's position stands.
+    pub next_after: Option<i64>,
     pub high_watermark: i64,
 }
 
@@ -143,6 +150,22 @@ impl From<odradek_client::ClientError> for SourceError {
 
 /// An offset-addressed stream of records for one partition.
 ///
+/// # Positions are exclusive
+///
+/// Every position in this trait names a record that has *already been
+/// seen*, and asks for what comes after it. `None` is the position
+/// before the oldest record the source still holds, so a full replay
+/// is `fetch(.., None)` and needs no lookup to begin.
+///
+/// The engine therefore never computes one position from another: it
+/// says "after the event I just delivered" and hands back exactly the
+/// position the source gave it. That is what lets a source number its
+/// records however it likes — sparsely, with gaps, in strides — rather
+/// than densely like Kafka, where the next record after `n` happens to
+/// be at `n + 1`. Adapters over a dense log do that arithmetic
+/// themselves, where the assumption is a known fact about the store
+/// rather than a guess about positions in general.
+///
 /// Methods return `impl Future + Send` (rather than plain `async fn`) so
 /// pumps holding a source can be spawned.
 ///
@@ -167,24 +190,26 @@ impl From<odradek_client::ClientError> for SourceError {
 /// `odradek-protocol` is the pattern already in use, and says so where
 /// it is defined.
 pub trait RecordSource: Send + 'static {
+    /// Records strictly after `after`, oldest first; `None` starts at
+    /// the oldest record the source still holds.
     fn fetch(
         &mut self,
         topic: &str,
         partition: i32,
-        offset: i64,
+        after: Option<i64>,
     ) -> impl Future<Output = Result<SourceBatch, SourceError>> + Send;
 
-    fn earliest_offset(
+    /// Where a [`Position::Latest`](crate::Position) subscription
+    /// starts: every record the source already holds is at or before
+    /// this position, so a subscriber resuming after it sees only what
+    /// arrives from now on. `None` when the source holds nothing, which
+    /// resumes at the beginning — the same place, for a log with no
+    /// records in it.
+    fn live_start(
         &mut self,
         topic: &str,
         partition: i32,
-    ) -> impl Future<Output = Result<i64, SourceError>> + Send;
-
-    fn latest_offset(
-        &mut self,
-        topic: &str,
-        partition: i32,
-    ) -> impl Future<Output = Result<i64, SourceError>> + Send;
+    ) -> impl Future<Output = Result<Option<i64>, SourceError>> + Send;
 }
 
 /// Makes one source per pump; a pump owns its source exclusively.
@@ -233,20 +258,37 @@ impl KafkaSource {
     }
 }
 
+/// Kafka numbers its records densely, so the record after `n` is at
+/// `n + 1` and the whole of this adapter's position arithmetic is those
+/// three characters. It is correct *here*, where the offset space is a
+/// known fact about the store, and would be a guess anywhere above the
+/// trait — which is why the engine has none of it.
 #[cfg(feature = "kafka")]
 impl RecordSource for KafkaSource {
     async fn fetch(
         &mut self,
         topic: &str,
         partition: i32,
-        offset: i64,
+        after: Option<i64>,
     ) -> Result<SourceBatch, SourceError> {
+        // Kafka fetches inclusively from an offset it must be given, so
+        // a replay from the beginning has to ask where the beginning
+        // currently is — the log start moves with retention, and
+        // fetching below it is an error rather than a clamp.
+        let from = match after {
+            Some(position) => position + 1,
+            None => self
+                .consumer
+                .earliest_offset(topic, partition)
+                .await
+                .map_err(SourceError::from)?,
+        };
         // fetch_with, not fetch: an `Event` is what this bridge wants,
         // and asking for records first means building a whole
         // `Vec<ConsumedRecord>` in order to walk it once and drop it.
         let result = self
             .consumer
-            .fetch_with(topic, partition, offset, |r| {
+            .fetch_with(topic, partition, from, |r| {
                 let mut event = Event::at(topic, partition, r.offset, r.timestamp);
                 event.key = r.key;
                 event.value = r.value;
@@ -257,23 +299,29 @@ impl RecordSource for KafkaSource {
             .map_err(SourceError::from)?;
         Ok(SourceBatch {
             events: result.records,
-            next_offset: result.next_offset,
+            // `next_offset` is where Kafka would have us fetch next, so
+            // the position already consumed is the one before it. A
+            // fetch that advanced nothing leaves the caller's position
+            // alone rather than reporting one below it.
+            next_after: (result.next_offset > from).then(|| result.next_offset - 1),
             high_watermark: result.high_watermark,
         })
     }
 
-    async fn earliest_offset(&mut self, topic: &str, partition: i32) -> Result<i64, SourceError> {
-        self.consumer
-            .earliest_offset(topic, partition)
-            .await
-            .map_err(SourceError::from)
-    }
-
-    async fn latest_offset(&mut self, topic: &str, partition: i32) -> Result<i64, SourceError> {
-        self.consumer
+    async fn live_start(
+        &mut self,
+        topic: &str,
+        partition: i32,
+    ) -> Result<Option<i64>, SourceError> {
+        // The high watermark is one past the newest record, so the
+        // newest record is one before it. At zero there has never been
+        // a record and there is nothing to resume after.
+        let watermark = self
+            .consumer
             .latest_offset(topic, partition)
             .await
-            .map_err(SourceError::from)
+            .map_err(SourceError::from)?;
+        Ok((watermark > 0).then(|| watermark - 1))
     }
 }
 

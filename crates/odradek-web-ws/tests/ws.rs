@@ -49,16 +49,16 @@ impl RecordSource for RevokedSource {
         &mut self,
         _topic: &str,
         _partition: i32,
-        _offset: i64,
+        _after: Option<i64>,
     ) -> Result<SourceBatch, SourceError> {
         Err(SourceError::auth("TOPIC_AUTHORIZATION_FAILED"))
     }
 
-    async fn earliest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
-        Err(SourceError::auth("TOPIC_AUTHORIZATION_FAILED"))
-    }
-
-    async fn latest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
+    async fn live_start(
+        &mut self,
+        _topic: &str,
+        _partition: i32,
+    ) -> Result<Option<i64>, SourceError> {
         Err(SourceError::auth("TOPIC_AUTHORIZATION_FAILED"))
     }
 }
@@ -245,9 +245,10 @@ async fn offset_resume_is_exact() {
     }
     let addr = serve(log.clone()).await;
 
-    // A reconnecting client resumes with from=<last seen + 1>.
+    // A reconnecting client resumes with from=<last seen>, echoed back
+    // exactly as it was received — no arithmetic on the client either.
     let (mut client, status) =
-        WsClient::connect(addr, &format!("/topics/{TOPIC}/partitions/0/ws?from=3")).await;
+        WsClient::connect(addr, &format!("/topics/{TOPIC}/partitions/0/ws?from=2")).await;
     assert!(status.contains("101"), "{status}");
     let json = client.next_json().await;
     assert_eq!(json["offset"], 3);
@@ -314,9 +315,10 @@ async fn topic_stream_merges_partitions_and_resumes_by_cursor() {
     seen.sort_unstable();
     assert_eq!(seen, vec![(0, 0), (0, 1), (1, 0)]);
 
-    // Resume with the cursor those events imply: only new data flows.
+    // Resume with the cursor those events imply — the last offset seen
+    // in each partition: only new data flows.
     let (mut resumed, status) =
-        WsClient::connect(addr, &format!("/topics/{TOPIC}/ws?from=0:2,1:1")).await;
+        WsClient::connect(addr, &format!("/topics/{TOPIC}/ws?from=0:1,1:0")).await;
     assert!(status.contains("101"), "{status}");
     log.append(TOPIC, 1, None, b"p1-b", Vec::new());
     let json = resumed.next_json().await;

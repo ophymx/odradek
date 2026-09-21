@@ -14,7 +14,8 @@
 //!
 //! Each record becomes one SSE event: `event: record`, `data` = one
 //! JSON object (which carries the record's own offset), and `id` = the
-//! *resume token* for the stream position just after it. Browsers
+//! *resume token*: the offset it was read at, which the stream
+//! resumes after. Browsers
 //! reconnect with `Last-Event-ID`, which overrides `from` and is
 //! honoured exactly as sent — so a reconnecting `EventSource` never
 //! misses or repeats a record. Every resume token in the constellation
@@ -247,7 +248,7 @@ async fn stream_partition<F: SourceFactory>(
             // bytes into their own frame.
             Ok(event) => SseEvent::default()
                 .event("record")
-                .id((event.offset + 1).to_string())
+                .id(event.offset.to_string())
                 .data(event.json()),
             // The final item of a failed stream; the channel closes
             // right after, ending the response.
@@ -258,9 +259,10 @@ async fn stream_partition<F: SourceFactory>(
 }
 
 /// The whole topic, all partitions merged. The event id is the
-/// multi-partition cursor (`partition:next_offset,...`), updated per
-/// event, so `Last-Event-ID` on reconnect resumes every partition
-/// loss-free (partitions the cursor has not seen replay from earliest).
+/// multi-partition cursor (`partition:offset,...`) of what the client
+/// has now seen, updated per event, so `Last-Event-ID` on reconnect
+/// resumes every partition loss-free (partitions the cursor has not
+/// seen replay from earliest).
 async fn stream_topic<F: SourceFactory>(
     State(state): State<Arc<SseState<F>>>,
     Path(topic): Path<String>,
@@ -285,7 +287,7 @@ async fn stream_topic<F: SourceFactory>(
     // real partition count, whatever the client sent.
     let covered = subscription.partitions().to_vec();
     let mut running = match position {
-        TopicPosition::Offsets(cursor) => cursor,
+        TopicPosition::After(cursor) => cursor,
         _ => BTreeMap::new(),
     };
     running.retain(|partition, _| covered.contains(partition));
@@ -293,7 +295,7 @@ async fn stream_topic<F: SourceFactory>(
     let stream = ReceiverStream::new(subscription.into_receiver()).map(move |item: StreamItem| {
         Ok::<_, Infallible>(match item {
             Ok(event) => {
-                running.insert(event.partition, event.offset + 1);
+                running.insert(event.partition, event.offset);
                 SseEvent::default()
                     .event("record")
                     .id(cursor::encode(&running))

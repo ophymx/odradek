@@ -42,24 +42,24 @@ impl RecordSource for SlowSource {
         &mut self,
         _topic: &str,
         _partition: i32,
-        offset: i64,
+        after: Option<i64>,
     ) -> Result<SourceBatch, SourceError> {
         tokio::time::sleep(self.poll).await;
         // Built the way an out-of-tree adapter must: `SourceBatch` is
         // non-exhaustive, so `Default` plus assignment is the path, and
         // this test is the proof that path is usable.
         let mut batch = SourceBatch::default();
-        batch.next_offset = offset;
-        batch.high_watermark = offset;
+        batch.next_after = after;
+        batch.high_watermark = 0;
         Ok(batch)
     }
 
-    async fn earliest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
-        Ok(0)
-    }
-
-    async fn latest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
-        Ok(0)
+    async fn live_start(
+        &mut self,
+        _topic: &str,
+        _partition: i32,
+    ) -> Result<Option<i64>, SourceError> {
+        Ok(None)
     }
 }
 
@@ -90,16 +90,16 @@ impl RecordSource for FailingSource {
         &mut self,
         _topic: &str,
         _partition: i32,
-        _offset: i64,
+        _after: Option<i64>,
     ) -> Result<SourceBatch, SourceError> {
         Err(self.error.clone())
     }
 
-    async fn earliest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
-        Err(self.error.clone())
-    }
-
-    async fn latest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
+    async fn live_start(
+        &mut self,
+        _topic: &str,
+        _partition: i32,
+    ) -> Result<Option<i64>, SourceError> {
         Err(self.error.clone())
     }
 }
@@ -142,7 +142,7 @@ async fn replay_from_offset_then_live_without_gaps_or_dups() {
     // Start in history (offset 2), read through the tail, then keep
     // getting live appends — one contiguous offset sequence.
     let mut sub = pump
-        .subscribe(Position::Offset(2), Filter::default())
+        .subscribe(Position::After(1), Filter::default())
         .await
         .unwrap();
     let history = collect(&mut sub, 5).await;
@@ -346,9 +346,9 @@ async fn topic_cursor_resumes_seen_partitions_and_replays_unseen() {
     // The cursor names partition 0 only: resume it at 2, replay
     // partition 1 from the start (absent = never seen).
     let mut cursor = BTreeMap::new();
-    cursor.insert(0, 2i64);
+    cursor.insert(0, 1i64);
     let mut sub = hub
-        .subscribe_topic(TOPIC, TopicPosition::Offsets(cursor), Filter::default())
+        .subscribe_topic(TOPIC, TopicPosition::After(cursor), Filter::default())
         .await
         .unwrap();
 
@@ -869,25 +869,28 @@ impl RecordSource for TruncatedSource {
         &mut self,
         _topic: &str,
         _partition: i32,
-        offset: i64,
+        after: Option<i64>,
     ) -> Result<SourceBatch, SourceError> {
-        if offset < self.log_start {
+        // A position below the horizon is refused; `None` — start at
+        // whatever the source still holds — is always serviceable, which
+        // is the point of spelling a full replay that way.
+        if after.is_some_and(|position| position < self.log_start) {
             self.fetches
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(SourceError::unavailable("offset out of range"));
         }
         let mut batch = SourceBatch::default();
-        batch.next_offset = self.log_start;
+        batch.next_after = Some(self.log_start);
         batch.high_watermark = self.log_start;
         Ok(batch)
     }
 
-    async fn earliest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
-        Ok(self.log_start)
-    }
-
-    async fn latest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
-        Ok(self.log_start)
+    async fn live_start(
+        &mut self,
+        _topic: &str,
+        _partition: i32,
+    ) -> Result<Option<i64>, SourceError> {
+        Ok(Some(self.log_start))
     }
 }
 
@@ -922,7 +925,7 @@ async fn an_offset_below_the_log_start_ends_the_stream() {
 
     let mut hub = Hub::new(Factory { fetches: counter }, PumpConfig::default()).allow_all_topics();
     let mut sub = hub
-        .subscribe(TOPIC, 0, Position::Offset(0), Filter::default())
+        .subscribe(TOPIC, 0, Position::After(0), Filter::default())
         .await
         .unwrap();
 

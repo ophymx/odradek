@@ -58,10 +58,10 @@ where
 
     let mut drains = Vec::with_capacity(subscribers);
     for _ in 0..subscribers {
-        // Offset 0 on an empty log, not `Latest`: identical in effect,
+        // The start of an empty log, not `Latest`: identical in effect,
         // but it cannot race the pump's first look at the live edge.
         let mut sub = pump
-            .subscribe(Position::Offset(0), Filter::default())
+            .subscribe(Position::Earliest, Filter::default())
             .await
             .expect("subscribe");
         let ready = Arc::clone(&ready);

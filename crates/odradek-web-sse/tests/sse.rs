@@ -51,16 +51,16 @@ impl RecordSource for RevokedSource {
         &mut self,
         _topic: &str,
         _partition: i32,
-        _offset: i64,
+        _after: Option<i64>,
     ) -> Result<SourceBatch, SourceError> {
         Err(SourceError::auth("TOPIC_AUTHORIZATION_FAILED"))
     }
 
-    async fn earliest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
-        Err(SourceError::auth("TOPIC_AUTHORIZATION_FAILED"))
-    }
-
-    async fn latest_offset(&mut self, _topic: &str, _partition: i32) -> Result<i64, SourceError> {
+    async fn live_start(
+        &mut self,
+        _topic: &str,
+        _partition: i32,
+    ) -> Result<Option<i64>, SourceError> {
         Err(SourceError::auth("TOPIC_AUTHORIZATION_FAILED"))
     }
 }
@@ -271,8 +271,9 @@ async fn replays_then_streams_live() {
     .await;
     for i in 0..3 {
         let (id, json) = client.next_event().await;
-        // The id is the resume token: the offset after this event.
-        assert_eq!(id, i + 1);
+        // The id is the resume token, and it is this event's own
+        // offset: echoing it back asks for what comes after.
+        assert_eq!(id, i);
         assert_eq!(value_of(&json), format!("old-{i}"));
         assert_eq!(json["topic"], TOPIC);
         assert_eq!(json["offset"], i);
@@ -280,7 +281,7 @@ async fn replays_then_streams_live() {
 
     log.append(TOPIC, 0, None, b"fresh", Vec::new());
     let (id, json) = client.next_event().await;
-    assert_eq!(id, 4);
+    assert_eq!(id, 3);
     assert_eq!(value_of(&json), "fresh");
 }
 
@@ -292,18 +293,19 @@ async fn last_event_id_resumes_exactly_after() {
     }
     let addr = serve(log.clone()).await;
 
-    // A reconnecting EventSource sends the last id it saw; ids are
-    // resume tokens (next offset) used verbatim, so id 3 — received
-    // with the event at offset 2 — resumes at offset 3 even though
-    // `from` says earliest.
+    // A reconnecting EventSource sends the last id it saw, and an id is
+    // the offset of the event that carried it: id 2 came with the event
+    // at offset 2, so the stream resumes at offset 3 — the next one —
+    // even though `from` says earliest. The token is used verbatim, so
+    // what the client echoes is exactly what it was given.
     let mut client = SseClient::get(
         addr,
         &format!("/topics/{TOPIC}/partitions/0/events?from=earliest"),
-        &[("Last-Event-ID", "3")],
+        &[("Last-Event-ID", "2")],
     )
     .await;
     let (id, json) = client.next_event().await;
-    assert_eq!(id, 4);
+    assert_eq!(id, 3);
     assert_eq!(value_of(&json), "v3");
 }
 
@@ -321,7 +323,7 @@ async fn default_position_is_latest() {
 
     log.append(TOPIC, 0, None, b"new", Vec::new());
     let (id, json) = client.next_event().await;
-    assert_eq!(id, 2); // resume token for the event at offset 1
+    assert_eq!(id, 1); // the resume token is the offset itself
     assert_eq!(value_of(&json), "new");
 }
 
@@ -340,11 +342,13 @@ async fn key_prefix_filter_applies() {
     )
     .await;
     let (id, json) = client.next_event().await;
-    assert_eq!((id, value_of(&json)), (1, "keep".into()));
+    assert_eq!((id, value_of(&json)), (0, "keep".into()));
     assert_eq!(json["key"], "user:1");
     let (id, json) = client.next_event().await;
-    // Filtered-out records still advance the resume token.
-    assert_eq!((id, value_of(&json)), (3, "keep-too".into()));
+    // The record at offset 1 was filtered out, so the token jumps
+    // straight from 0 to 2: a resume token names an offset the client
+    // has been carried past, not one it was shown.
+    assert_eq!((id, value_of(&json)), (2, "keep-too".into()));
 }
 
 #[tokio::test]
@@ -382,8 +386,9 @@ async fn topic_stream_merges_partitions_with_cursor_ids() {
     }
     seen.sort_unstable();
     assert_eq!(seen, vec![(0, 0), (0, 1), (1, 0)]);
-    // After all three, the cursor names both partitions' next offsets.
-    assert_eq!(last_cursor, "0:2,1:1");
+    // After all three, the cursor names the last offset seen in each
+    // partition.
+    assert_eq!(last_cursor, "0:1,1:0");
 
     // Reconnect with that cursor: nothing replays, only new arrives.
     let mut resumed = SseClient::get(
@@ -396,7 +401,7 @@ async fn topic_stream_merges_partitions_with_cursor_ids() {
     let (cursor, json) = resumed.next_cursor_event().await;
     assert_eq!(json["partition"], 1);
     assert_eq!(json["offset"], 1);
-    assert_eq!(cursor, "0:2,1:2");
+    assert_eq!(cursor, "0:1,1:1");
 }
 
 /// The event id of a topic stream is bounded by the topic's own
@@ -416,7 +421,8 @@ async fn topic_cursor_ids_are_bounded_by_the_topics_partitions() {
     let addr = serve(log.clone()).await;
 
     // Two real positions, and 2000 partitions that do not exist.
-    let mut seed = String::from("0:98,1:99");
+    // Positions are exclusive, so these resume at 98 and 99.
+    let mut seed = String::from("0:97,1:98");
     for partition in 1000..3000 {
         seed.push_str(&format!(",{partition}:{}", i64::MAX));
     }

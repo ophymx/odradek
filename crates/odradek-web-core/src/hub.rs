@@ -547,9 +547,9 @@ fn partition_position(position: &TopicPosition, partition: i32) -> Position {
         TopicPosition::Latest => Position::Latest,
         // Absent from the cursor = never seen: replay from the start
         // rather than risk losing records.
-        TopicPosition::Offsets(cursor) => cursor
+        TopicPosition::After(cursor) => cursor
             .get(&partition)
-            .map_or(Position::Earliest, |next| Position::Offset(*next)),
+            .map_or(Position::Earliest, |seen| Position::After(*seen)),
     }
 }
 

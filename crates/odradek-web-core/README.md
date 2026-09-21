@@ -4,7 +4,7 @@ Transport-agnostic bridge from Kafka partitions to web-shaped
 subscribers.
 
 One pump per (topic, partition) fans out to any number of subscribers,
-each starting from earliest, latest, or a specific offset, with
+each starting from earliest, latest, or after a specific offset, with
 per-subscriber filters (key prefix, header match). Fan-out is by shared
 handle: an event is read once, rendered as JSON at most once, and
 delivered to every subscriber as a refcount bump. Backpressure is
@@ -30,6 +30,15 @@ traits: Kafka via
 [`odradek-client`](https://crates.io/crates/odradek-client) in
 production, and an in-memory log (published as
 `odradek_web_core::memory`) for deterministic downstream tests.
+
+Positions are exclusive: every one names a record already seen, and
+asks for what follows. A resume token is therefore the offset a client
+last received, echoed back unchanged, and the engine never computes one
+position from another — it says "after the event I just delivered" and
+hands back whatever the source gave it. A source is free to number its
+records sparsely, or in strides, or with gaps; only an adapter over a
+dense log like Kafka's does the `+ 1`, where the numbering is a known
+fact about the store rather than a guess about positions in general.
 
 Source errors are typed (`SourceErrorKind`: not-found, auth,
 unavailable, other): permanent failures stop a pump at once, transient

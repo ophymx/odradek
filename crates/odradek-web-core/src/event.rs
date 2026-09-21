@@ -8,9 +8,11 @@ use bytes::Bytes;
 
 /// One record, self-describing enough to resume from: a transport mints
 /// its resume token out of this offset (subscribe again at
-/// `Position::Offset(offset + 1)`) and hands the client something to
-/// echo back. Minting is the server's side of that contract; clients are
-/// told only "send this back", never how it is built.
+/// `Position::After(offset)`) and hands the client something to echo
+/// back. Minting is the server's side of that contract; clients are
+/// told only "send this back", never how it is built — and because the
+/// token is the offset itself rather than the one after it, minting is
+/// a copy rather than a calculation.
 ///
 /// # Construction
 ///
@@ -136,6 +138,12 @@ impl PartialEq for SharedEvent {
 impl Eq for SharedEvent {}
 
 /// Where a subscription starts.
+///
+/// [`After`](Position::After) is exclusive, like every position this
+/// crate handles: it names the last event the subscriber received, and
+/// the stream resumes with whatever follows it. A client therefore
+/// echoes back the offset it last saw, unmodified — it never has to
+/// know what the next one would be called.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Position {
@@ -143,8 +151,8 @@ pub enum Position {
     Earliest,
     /// Only records produced from now on.
     Latest,
-    /// A specific offset (inclusive) — the resume path.
-    Offset(i64),
+    /// Everything after this offset — the resume path.
+    After(i64),
 }
 
 /// Where a topic-level subscription starts, across all partitions.
@@ -155,10 +163,11 @@ pub enum TopicPosition {
     Earliest,
     /// Every partition from now on.
     Latest,
-    /// Resume: the next offset owed per partition. A partition absent
-    /// from the map replays from earliest — loss-free beats
-    /// duplicate-free, so consumers should be idempotent.
-    Offsets(std::collections::BTreeMap<i32, i64>),
+    /// Resume: the last offset seen per partition, each stream
+    /// continuing after it. A partition absent from the map replays
+    /// from earliest — loss-free beats duplicate-free, so consumers
+    /// should be idempotent.
+    After(std::collections::BTreeMap<i32, i64>),
 }
 
 /// A per-subscriber selection over the partition's records. Empty

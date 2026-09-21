@@ -9,7 +9,7 @@
 //! A resume token is **opaque to the client**: the server mints it, the
 //! client echoes it back unchanged. Its contents are this crate's
 //! business — today an offset for a partition stream and a
-//! `partition:next_offset,...` cursor for a topic stream, both parsed
+//! `partition:offset,...` cursor for a topic stream, both parsed
 //! here. Publishing that shape would invite clients to do arithmetic on
 //! it, and every such client would break the day a source's positions
 //! stop being integers.
@@ -42,14 +42,14 @@ impl StreamParams {
             let offset: i64 = raw
                 .parse()
                 .map_err(|_| "resume token must be an offset".to_owned())?;
-            return Ok(Position::Offset(offset));
+            return Ok(Position::After(offset));
         }
         match self.from.as_deref() {
             None | Some("latest") => Ok(Position::Latest),
             Some("earliest") => Ok(Position::Earliest),
             Some(raw) => raw
                 .parse()
-                .map(Position::Offset)
+                .map(Position::After)
                 .map_err(|_| format!("from must be earliest, latest, or an offset (got {raw:?})")),
         }
     }
@@ -58,12 +58,12 @@ impl StreamParams {
     /// `from`; `from` accepts `earliest`, `latest`, or a cursor.
     pub fn topic_position(&self, resume: Option<&str>) -> Result<TopicPosition, String> {
         if let Some(raw) = resume {
-            return Ok(TopicPosition::Offsets(cursor::parse(raw)?));
+            return Ok(TopicPosition::After(cursor::parse(raw)?));
         }
         match self.from.as_deref() {
             None | Some("latest") => Ok(TopicPosition::Latest),
             Some("earliest") => Ok(TopicPosition::Earliest),
-            Some(raw) => Ok(TopicPosition::Offsets(cursor::parse(raw)?)),
+            Some(raw) => Ok(TopicPosition::After(cursor::parse(raw)?)),
         }
     }
 
@@ -102,7 +102,7 @@ mod tests {
     #[test]
     fn resume_token_wins_over_from() {
         let p = params(Some("earliest"));
-        assert_eq!(p.position(Some("7")).unwrap(), Position::Offset(7));
+        assert_eq!(p.position(Some("7")).unwrap(), Position::After(7));
         assert_eq!(p.position(None).unwrap(), Position::Earliest);
     }
 
@@ -115,7 +115,7 @@ mod tests {
         );
         assert_eq!(
             params(Some("42")).position(None).unwrap(),
-            Position::Offset(42)
+            Position::After(42)
         );
         assert!(params(Some("yesterday")).position(None).is_err());
         assert!(params(None).position(Some("not-a-number")).is_err());
@@ -124,8 +124,8 @@ mod tests {
     #[test]
     fn topic_grammar_takes_cursors() {
         let position = params(Some("0:2,1:5")).topic_position(None).unwrap();
-        let TopicPosition::Offsets(cursor) = position else {
-            panic!("expected offsets");
+        let TopicPosition::After(cursor) = position else {
+            panic!("expected a cursor");
         };
         assert_eq!(cursor[&0], 2);
         assert_eq!(cursor[&1], 5);

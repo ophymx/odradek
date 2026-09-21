@@ -16,8 +16,8 @@
 //! JSON is rendered once per record and shared by every socket reading
 //! the partition, so a frame costs each socket a refcount bump.
 //! WebSocket has no `Last-Event-ID`, so resume is explicit: reconnect
-//! with `from=<next offset>` (partition streams) or
-//! `from=<partition:next_offset,...>` (topic streams). Tokens mean
+//! with `from=<last offset seen>` (partition streams) or
+//! `from=<partition:offset,...>` (topic streams). Tokens mean
 //! "start here" and are interchangeable with the SSE transport's event
 //! ids. Parameter errors are rejected as plain HTTP responses before
 //! the upgrade.
@@ -383,7 +383,7 @@ async fn upgrade_partition<F: SourceFactory>(
 }
 
 /// The whole topic, all partitions merged as one frame stream. Resume
-/// is `from=<partition:next_offset,...>` — each frame carries its
+/// is `from=<partition:offset,...>` — each frame carries its
 /// partition and offset, so the client tracks its own cursor.
 async fn upgrade_topic<F: SourceFactory>(
     State(state): State<Arc<WsState<F>>>,

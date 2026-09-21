@@ -1,16 +1,18 @@
-//! The multi-partition resume cursor: `partition:next_offset` pairs,
+//! The multi-partition resume cursor: `partition:offset` pairs,
 //! comma-separated, sorted by partition — `0:17,1:4,2:9`.
 //!
 //! A topic-level stream interleaves partitions, so one offset cannot
-//! name a position; the cursor carries the next offset owed per
-//! partition. Transports put it in every event's id (SSE) or accept it
-//! as `from=` (WebSocket), so a reconnecting client resumes loss-free.
+//! name a position; the cursor carries the last offset *seen* in each
+//! partition, and each stream resumes after it. Transports put it in
+//! every event's id (SSE) or accept it as `from=` (WebSocket), so a
+//! reconnecting client resumes loss-free — echoing back exactly the
+//! pairs it was given, never a number it had to work out.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
-/// The bytes one `partition:next_offset` pair can take: two decimal
-/// i64s, a colon, and the separator.
+/// The bytes one `partition:offset` pair can take: two decimal i64s, a
+/// colon, and the separator.
 const PAIR_BYTES: usize = 44;
 
 /// Render a cursor (deterministic order: sorted by partition).
@@ -19,12 +21,12 @@ const PAIR_BYTES: usize = 44;
 /// into one buffer rather than allocating a `String` per pair.
 pub fn encode(cursor: &BTreeMap<i32, i64>) -> String {
     let mut out = String::with_capacity(cursor.len() * PAIR_BYTES);
-    for (partition, next_offset) in cursor {
+    for (partition, offset) in cursor {
         if !out.is_empty() {
             out.push(',');
         }
         // Writing to a String cannot fail.
-        let _ = write!(out, "{partition}:{next_offset}");
+        let _ = write!(out, "{partition}:{offset}");
     }
     out
 }
@@ -33,18 +35,18 @@ pub fn encode(cursor: &BTreeMap<i32, i64>) -> String {
 pub fn parse(raw: &str) -> Result<BTreeMap<i32, i64>, String> {
     let mut cursor = BTreeMap::new();
     for pair in raw.split(',') {
-        let (partition, next_offset) = pair
+        let (partition, offset) = pair
             .split_once(':')
             .ok_or_else(|| format!("cursor pair {pair:?} is not partition:offset"))?;
         let partition = partition
             .trim()
             .parse()
             .map_err(|_| format!("bad partition in cursor pair {pair:?}"))?;
-        let next_offset = next_offset
+        let offset = offset
             .trim()
             .parse()
             .map_err(|_| format!("bad offset in cursor pair {pair:?}"))?;
-        cursor.insert(partition, next_offset);
+        cursor.insert(partition, offset);
     }
     Ok(cursor)
 }

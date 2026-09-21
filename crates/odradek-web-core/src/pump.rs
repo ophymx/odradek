@@ -330,10 +330,34 @@ impl PumpHandle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    /// Replaying toward the live edge; `cursor` is the next offset owed.
-    CatchingUp { cursor: i64 },
+    /// Replaying toward the live edge, from [`SubState::cursor`].
+    CatchingUp,
     /// At the edge: new events are pushed as they arrive.
     Live,
+}
+
+/// How far the live path has read, or that it has not yet asked.
+///
+/// The two states a bare `Option<i64>` would have to share: "nobody has
+/// asked the source where now is" and "the live path is at the start of
+/// the log" are different situations with the same shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveEdge {
+    Unknown,
+    /// Read through this position; `None` is the start of the log.
+    At(Option<i64>),
+}
+
+/// Whether the ring holds everything a subscriber at `cursor` is owed.
+///
+/// `ring_floor` is the position the ring begins after, so the test is
+/// simply whether the subscriber has got that far: it has seen
+/// everything up to the floor, and the ring covers the floor onward.
+/// `None` on either side is the start of the log, which sorts below
+/// every position — a subscriber replaying from the beginning is served
+/// from the ring exactly when the ring has never evicted anything.
+fn ring_covers(cursor: Option<i64>, ring_floor: Option<i64>) -> bool {
+    cursor >= ring_floor
 }
 
 struct SubState {
@@ -342,6 +366,16 @@ struct SubState {
     sender: mpsc::Sender<StreamItem>,
     filter: Filter,
     mode: Mode,
+    /// The last offset this subscriber has been shown; everything it is
+    /// owed comes strictly after. `None` until the first one, which is
+    /// also how "from the beginning of the log" is spelled.
+    ///
+    /// One field for both modes, because it means the same thing in
+    /// both: live delivery advances it, and a stall leaves it exactly
+    /// where catch-up must resume. That is what replaced the `+ 1` the
+    /// engine used to carry — a cursor that named the *next* offset had
+    /// to compute one, and only a densely numbered log can.
+    cursor: Option<i64>,
     closed: bool,
     /// Consecutive failures of *this subscriber's* catch-up fetch.
     ///
@@ -363,15 +397,20 @@ impl SubState {
             return;
         }
         if !self.filter.matches(event) {
+            // Seen and declined: the cursor advances anyway, so catch-up
+            // never re-reads a stretch this subscriber has already
+            // refused.
+            self.cursor = Some(event.offset);
             return;
         }
         match self.sender.try_send(Ok(event.clone())) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.mode = Mode::CatchingUp {
-                    cursor: event.offset,
-                };
-            }
+            Ok(()) => self.cursor = Some(event.offset),
+            // The cursor already names the last event delivered, so
+            // catch-up resumes after it with nothing to compute. A
+            // subscriber cannot stall on its very first event — its
+            // queue is empty and holds at least one — so the cursor is
+            // never still `None` here.
+            Err(mpsc::error::TrySendError::Full(_)) => self.mode = Mode::CatchingUp,
             Err(mpsc::error::TrySendError::Closed(_)) => self.closed = true,
         }
     }
@@ -381,15 +420,13 @@ impl SubState {
     /// has room for what the fetch would bring. A subscriber whose queue
     /// is full would stall on the first record, so spending the
     /// iteration's one fetch on it would waste the turn.
-    fn needs_fetch(&self, ring_start: Option<i64>, live_edge: i64) -> bool {
+    fn needs_fetch(&self, ring_floor: Option<i64>, live_edge: Option<i64>) -> bool {
         if self.closed || self.sender.capacity() == 0 {
             return false;
         }
         match self.mode {
             Mode::Live => false,
-            Mode::CatchingUp { cursor } => {
-                cursor < live_edge && ring_start.is_none_or(|start| cursor < start)
-            }
+            Mode::CatchingUp => self.cursor < live_edge && !ring_covers(self.cursor, ring_floor),
         }
     }
 }
@@ -405,7 +442,13 @@ struct Subscribers {
 }
 
 impl Subscribers {
-    fn add(&mut self, sender: mpsc::Sender<StreamItem>, filter: Filter, mode: Mode) {
+    fn add(
+        &mut self,
+        sender: mpsc::Sender<StreamItem>,
+        filter: Filter,
+        mode: Mode,
+        cursor: Option<i64>,
+    ) {
         let id = self.next_id;
         self.next_id += 1;
         self.list.push(SubState {
@@ -413,6 +456,7 @@ impl Subscribers {
             sender,
             filter,
             mode,
+            cursor,
             closed: false,
             catch_up_errors: 0,
         });
@@ -435,13 +479,13 @@ impl Subscribers {
     /// Whose turn it is for the iteration's single catch-up fetch:
     /// the next one owed a fetch at or after the rotor, wrapping to the
     /// start, so no laggard starves behind another.
-    fn next_fetch(&mut self, ring_start: Option<i64>, live_edge: i64) -> Option<usize> {
+    fn next_fetch(&mut self, ring_floor: Option<i64>, live_edge: Option<i64>) -> Option<usize> {
         let rotor = self.rotor;
         let (index, id) = self
             .list
             .iter()
             .enumerate()
-            .filter(|(_, sub)| sub.needs_fetch(ring_start, live_edge))
+            .filter(|(_, sub)| sub.needs_fetch(ring_floor, live_edge))
             // `false < true`: ids from the rotor on come first, and the
             // search wraps to the lowest id only if none remain.
             .min_by_key(|(_, sub)| (sub.id < rotor, sub.id))
@@ -492,8 +536,15 @@ async fn run_pump<S: RecordSource>(
 ) {
     let mut ring: VecDeque<SharedEvent> = VecDeque::new();
     let mut subs = Subscribers::default();
-    // The next offset the live fetch reads; None until first needed.
-    let mut live_cursor: Option<i64> = None;
+    // How far the live path has read. `Unknown` until the first
+    // iteration asks the source where "now" is.
+    let mut live_edge = LiveEdge::Unknown;
+    // The position just before the ring's oldest event, so a subscriber
+    // sitting exactly on the boundary is known to be servable from
+    // memory. Deriving it from `ring.front()` instead would need the
+    // position *before* that event, which is the arithmetic this engine
+    // does not do; carrying it costs one assignment per eviction.
+    let mut ring_floor: Option<i64> = None;
     let mut consecutive_errors = 0u32;
 
     loop {
@@ -517,7 +568,7 @@ async fn run_pump<S: RecordSource>(
             match command {
                 Some(Command::Shutdown) | None => return,
                 Some(cmd) => {
-                    handle_command(cmd, &mut source, &topic, partition, &config, &mut subs).await;
+                    handle_command(cmd, &topic, partition, &config, &mut subs);
                 }
             }
         }
@@ -526,19 +577,22 @@ async fn run_pump<S: RecordSource>(
                 // Drop the senders without an error item: a clean end.
                 return;
             }
-            handle_command(cmd, &mut source, &topic, partition, &config, &mut subs).await;
+            handle_command(cmd, &topic, partition, &config, &mut subs);
         }
 
         // Establish where "live" starts.
-        let cursor = match live_cursor {
-            Some(c) => c,
-            None => match source.latest_offset(&topic, partition).await {
-                Ok(latest) => {
-                    live_cursor = Some(latest);
-                    latest
+        let cursor = match live_edge {
+            LiveEdge::At(position) => position,
+            LiveEdge::Unknown => match source.live_start(&topic, partition).await {
+                Ok(start) => {
+                    live_edge = LiveEdge::At(start);
+                    // Nothing is in the ring yet, so everything it will
+                    // ever hold comes after here.
+                    ring_floor = start;
+                    start
                 }
                 Err(e) => {
-                    tracing::warn!(topic, partition, error = %e, "latest offset lookup failed");
+                    tracing::warn!(topic, partition, error = %e, "live start lookup failed");
                     consecutive_errors += 1;
                     if e.is_permanent() || consecutive_errors > config.max_consecutive_errors {
                         fail_subs(subs.take(), &e);
@@ -553,9 +607,7 @@ async fn run_pump<S: RecordSource>(
         // One live fetch: extend the ring, push to live subscribers.
         match source.fetch(&topic, partition, cursor).await {
             Ok(SourceBatch {
-                events,
-                next_offset,
-                ..
+                events, next_after, ..
             }) => {
                 consecutive_errors = 0;
                 let empty = events.is_empty();
@@ -568,10 +620,16 @@ async fn run_pump<S: RecordSource>(
                     }
                     ring.push_back(event);
                     while ring.len() > config.ring_capacity {
-                        ring.pop_front();
+                        // What falls out of the ring is what the ring
+                        // now begins after.
+                        if let Some(dropped) = ring.pop_front() {
+                            ring_floor = Some(dropped.offset);
+                        }
                     }
                 }
-                live_cursor = Some(next_offset.max(cursor));
+                // `None` sorts below every position, so a fetch that
+                // consumed nothing leaves the edge where it was.
+                live_edge = LiveEdge::At(next_after.max(cursor));
                 if empty {
                     tokio::time::sleep(config.idle_poll).await;
                 }
@@ -590,12 +648,13 @@ async fn run_pump<S: RecordSource>(
         // Catch-up, bounded so it cannot stall the live path: serve
         // everyone the ring can serve (memory only), then spend one
         // source fetch on whichever laggard's turn it is.
-        let live_edge = live_cursor.unwrap_or(0);
-        let ring_start = ring.front().map(|e| e.offset);
+        let LiveEdge::At(live_edge) = live_edge else {
+            continue;
+        };
         for sub in &mut subs.list {
-            advance_from_ring(sub, &ring, live_edge);
+            advance_from_ring(sub, &ring, ring_floor, live_edge);
         }
-        if let Some(index) = subs.next_fetch(ring_start, live_edge) {
+        if let Some(index) = subs.next_fetch(ring_floor, live_edge) {
             let outcome = fetch_catch_up(
                 &mut subs.list[index],
                 &mut source,
@@ -612,9 +671,10 @@ async fn run_pump<S: RecordSource>(
     }
 }
 
-async fn handle_command<S: RecordSource>(
+/// Subscribing is now pure bookkeeping: it touches no source, so it
+/// cannot fail and cannot block the pump loop it runs on.
+fn handle_command(
     cmd: Command,
-    source: &mut S,
     topic: &str,
     partition: i32,
     config: &PumpConfig,
@@ -628,94 +688,96 @@ async fn handle_command<S: RecordSource>(
     else {
         return;
     };
-    let mode = match position {
-        Position::Latest => Ok(Mode::Live),
-        Position::Offset(offset) => Ok(Mode::CatchingUp { cursor: offset }),
-        Position::Earliest => source
-            .earliest_offset(topic, partition)
-            .await
-            .map(|cursor| Mode::CatchingUp { cursor })
-            .map_err(HubError::Source),
+    // No source call for any of the three any more. `Latest` never
+    // needed one — the pump establishes the live edge in its own loop —
+    // and `Earliest` no longer does either: the position before the
+    // oldest record is spelled `None`, and the source resolves what that
+    // means for its own log when the first fetch asks. Subscribing runs
+    // on the pump loop, so a round trip here delayed live delivery for
+    // everybody already subscribed.
+    //
+    // A `Latest` subscriber starts with no cursor at all, and gets one
+    // from the first event it is shown. Nothing reads it before then:
+    // catch-up ignores live subscribers, and the only path that could
+    // demote one — a full queue — cannot fire on a queue that is empty
+    // and holds at least one.
+    let start = match position {
+        Position::Latest => (Mode::Live, None),
+        Position::After(offset) => (Mode::CatchingUp, Some(offset)),
+        Position::Earliest => (Mode::CatchingUp, None),
     };
-    match mode {
-        Ok(mode) => {
-            let (sender, receiver) = mpsc::channel(config.queue_capacity);
-            subs.add(sender, filter, mode);
-            let _ = reply.send(Ok(Subscription {
-                topic: topic.to_owned(),
-                partition,
-                receiver,
-            }));
-        }
-        Err(e) => {
-            let _ = reply.send(Err(e));
-        }
-    }
+    let (mode, cursor) = start;
+    let (sender, receiver) = mpsc::channel(config.queue_capacity);
+    subs.add(sender, filter, mode, cursor);
+    let _ = reply.send(Ok(Subscription {
+        topic: topic.to_owned(),
+        partition,
+        receiver,
+    }));
 }
 
 /// What happened while pushing a run of events to one subscriber.
+///
+/// No offsets ride along: [`SubState::cursor`] is advanced in place as
+/// each event lands, so wherever the run stops the cursor is already
+/// correct and the caller has nothing to reconstruct.
 enum PushOutcome {
-    /// All delivered; cursor is past the run.
-    Delivered(i64),
-    /// The queue filled at this offset; resume there later.
-    Stalled(i64),
+    /// The whole run was delivered.
+    Delivered,
+    /// The queue filled; the cursor names the last event that landed.
+    Stalled,
     /// The subscriber is gone.
     Closed,
 }
 
-/// Push filtered `events` (already in offset order, and already
-/// positioned at `cursor`) to one subscriber, advancing the cursor per
-/// event.
-fn push_run<'a>(
-    sub: &mut SubState,
-    events: impl Iterator<Item = &'a SharedEvent>,
-    mut cursor: i64,
-) -> PushOutcome {
+/// Push filtered `events` (in offset order, all of them after
+/// `sub.cursor`) to one subscriber, advancing its cursor per event.
+fn push_run<'a>(sub: &mut SubState, events: impl Iterator<Item = &'a SharedEvent>) -> PushOutcome {
     for event in events {
         if sub.filter.matches(event) {
             match sub.sender.try_send(Ok(event.clone())) {
                 Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    return PushOutcome::Stalled(event.offset);
-                }
+                Err(mpsc::error::TrySendError::Full(_)) => return PushOutcome::Stalled,
                 Err(mpsc::error::TrySendError::Closed(_)) => return PushOutcome::Closed,
             }
         }
-        cursor = event.offset + 1;
+        sub.cursor = Some(event.offset);
     }
-    PushOutcome::Delivered(cursor)
+    PushOutcome::Delivered
 }
 
 /// Advance one catching-up subscriber as far as the ring allows — pure
 /// memory, so every laggard can have this every iteration. Subscribers
 /// behind the ring are left for [`fetch_catch_up`].
-fn advance_from_ring(sub: &mut SubState, ring: &VecDeque<SharedEvent>, live_edge: i64) {
-    let Mode::CatchingUp { cursor } = sub.mode else {
-        return;
-    };
-    if sub.closed {
+fn advance_from_ring(
+    sub: &mut SubState,
+    ring: &VecDeque<SharedEvent>,
+    ring_floor: Option<i64>,
+    live_edge: Option<i64>,
+) {
+    if sub.mode != Mode::CatchingUp || sub.closed {
         return;
     }
-    if cursor >= live_edge {
+    if sub.cursor >= live_edge {
         // Caught up (or asked for a future offset: wait for the live
         // edge to reach it rather than fetching past the log end).
-        if cursor == live_edge {
+        if sub.cursor == live_edge {
             sub.mode = Mode::Live;
         }
         return;
     }
     // Behind the ring (or the ring is empty): only a fetch can help.
-    if ring.front().is_none_or(|first| cursor < first.offset) {
+    if !ring_covers(sub.cursor, ring_floor) {
         return;
     }
     // Inside the ring: serve the remainder from the cursor, then go
     // live — the ring always ends at the live edge. The ring is
     // offset-sorted, so finding the cursor is a binary search rather
     // than a scan over everything already sent.
-    let from = ring.partition_point(|event| event.offset < cursor);
-    match push_run(sub, ring.range(from..), cursor) {
-        PushOutcome::Delivered(_) => sub.mode = Mode::Live,
-        PushOutcome::Stalled(at) => sub.mode = Mode::CatchingUp { cursor: at },
+    let from = ring.partition_point(|event| Some(event.offset) <= sub.cursor);
+    match push_run(sub, ring.range(from..)) {
+        PushOutcome::Delivered => sub.mode = Mode::Live,
+        PushOutcome::Stalled => {}
         PushOutcome::Closed => sub.closed = true,
     }
 }
@@ -739,25 +801,25 @@ async fn fetch_catch_up<S: RecordSource>(
     partition: i32,
     config: &PumpConfig,
 ) -> Result<(), SourceError> {
-    let Mode::CatchingUp { cursor } = sub.mode else {
+    if sub.mode != Mode::CatchingUp {
         return Ok(());
-    };
-    // The cursor advances through record-less stretches (compaction
-    // gaps, control batches) via next_offset.
+    }
+    let cursor = sub.cursor;
     match source.fetch(topic, partition, cursor).await {
         Ok(batch) => {
             sub.catch_up_errors = 0;
             let events: Vec<SharedEvent> = batch.events.into_iter().map(SharedEvent::new).collect();
-            // Sources answer from `cursor`, but skipping any earlier
+            // Sources answer after `cursor`, but skipping any earlier
             // events they do return costs one binary search.
-            let from = events.partition_point(|event| event.offset < cursor);
-            match push_run(sub, events[from..].iter(), cursor) {
-                PushOutcome::Delivered(done) => {
-                    sub.mode = Mode::CatchingUp {
-                        cursor: done.max(batch.next_offset),
-                    };
-                }
-                PushOutcome::Stalled(at) => sub.mode = Mode::CatchingUp { cursor: at },
+            let from = events.partition_point(|event| Some(event.offset) <= cursor);
+            match push_run(sub, events[from..].iter()) {
+                // A stretch of log that yielded no events still has to
+                // be crossed, or the next fetch asks the same question
+                // and the subscriber never moves. `push_run` has
+                // already taken the cursor as far as the events go;
+                // `next_after` takes it the rest of the way.
+                PushOutcome::Delivered => sub.cursor = sub.cursor.max(batch.next_after),
+                PushOutcome::Stalled => {}
                 PushOutcome::Closed => sub.closed = true,
             }
         }
