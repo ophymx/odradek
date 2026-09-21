@@ -1239,7 +1239,7 @@ fn sasl_handshake_exchange(
     frame_response(
         req_header.correlation_id,
         response_header_version(SaslHandshakeRequest::API_KEY, api_version),
-        |out| resp.encode(out, api_version).unwrap(),
+        |out| resp.encode(out, api_version),
         false,
     )
 }
@@ -1321,7 +1321,7 @@ fn sasl_authenticate_exchange(
     frame_response(
         req_header.correlation_id,
         response_header_version(SaslAuthenticateRequest::API_KEY, api_version),
-        |out| resp.encode(out, api_version).unwrap(),
+        |out| resp.encode(out, api_version),
         false,
     )
 }
@@ -1361,7 +1361,7 @@ fn consumer_group_heartbeat_exchange(
         return frame_response(
             req_header.correlation_id,
             response_header_version(ConsumerGroupHeartbeatRequest::API_KEY, api_version),
-            |out| resp.encode(out, api_version).unwrap(),
+            |out| resp.encode(out, api_version),
             false,
         );
     }
@@ -1375,7 +1375,7 @@ fn consumer_group_heartbeat_exchange(
             return frame_response(
                 req_header.correlation_id,
                 response_header_version(ConsumerGroupHeartbeatRequest::API_KEY, api_version),
-                |out| resp.encode(out, api_version).unwrap(),
+                |out| resp.encode(out, api_version),
                 false,
             );
         }
@@ -1387,7 +1387,7 @@ fn consumer_group_heartbeat_exchange(
         return frame_response(
             req_header.correlation_id,
             response_header_version(ConsumerGroupHeartbeatRequest::API_KEY, api_version),
-            |out| resp.encode(out, api_version).unwrap(),
+            |out| resp.encode(out, api_version),
             false,
         );
     }
@@ -1454,7 +1454,7 @@ fn consumer_group_heartbeat_exchange(
     frame_response(
         req_header.correlation_id,
         response_header_version(ConsumerGroupHeartbeatRequest::API_KEY, api_version),
-        |out| resp.encode(out, api_version).unwrap(),
+        |out| resp.encode(out, api_version),
         false,
     )
 }
@@ -1493,11 +1493,18 @@ fn join_group_exchange(
         resp.generation_id = -1;
         resp.leader = String::new();
         resp.protocol_type = Some(request.protocol_type.clone());
-        resp.protocol_name = None;
+        // `ProtocolName` is nullable only from v7. Below that a null
+        // cannot be encoded at all, and the empty string is what a
+        // broker sends with MEMBER_ID_REQUIRED. Sending `None` there
+        // made the encode fail, and the encode failure used to be an
+        // `unwrap` -- so one unanswerable JoinGroup took the whole
+        // subject down, poisoned the cluster mutex, and reported every
+        // check after it as the subject being unreachable.
+        resp.protocol_name = (api_version < JOIN_GROUP_NULLABLE_PROTOCOL).then(String::new);
         return frame_response(
             req_header.correlation_id,
             response_header_version(JoinGroupRequest::API_KEY, api_version),
-            |out| resp.encode(out, api_version).unwrap(),
+            |out| resp.encode(out, api_version),
             false,
         );
     }
@@ -1551,7 +1558,7 @@ fn join_group_exchange(
     frame_response(
         req_header.correlation_id,
         response_header_version(JoinGroupRequest::API_KEY, api_version),
-        |out| resp.encode(out, api_version).unwrap(),
+        |out| resp.encode(out, api_version),
         false,
     )
 }
@@ -1606,7 +1613,7 @@ fn sync_group_exchange(
     frame_response(
         req_header.correlation_id,
         response_header_version(SyncGroupRequest::API_KEY, api_version),
-        |out| resp.encode(out, api_version).unwrap(),
+        |out| resp.encode(out, api_version),
         false,
     )
 }
@@ -1632,7 +1639,7 @@ fn heartbeat_exchange(
     frame_response(
         req_header.correlation_id,
         response_header_version(HeartbeatRequest::API_KEY, api_version),
-        |out| resp.encode(out, api_version).unwrap(),
+        |out| resp.encode(out, api_version),
         false,
     )
 }
@@ -1675,7 +1682,7 @@ fn leave_group_exchange(
     frame_response(
         req_header.correlation_id,
         response_header_version(LeaveGroupRequest::API_KEY, api_version),
-        |out| resp.encode(out, api_version).unwrap(),
+        |out| resp.encode(out, api_version),
         false,
     )
 }
@@ -1776,7 +1783,7 @@ fn list_offsets_exchange(
     frame_response(
         req_header.correlation_id,
         response_header_version(ListOffsetsRequest::API_KEY, api_version),
-        |out| resp.encode(out, api_version).unwrap(),
+        |out| resp.encode(out, api_version),
         false,
     )
 }
@@ -1847,7 +1854,7 @@ fn find_coordinator_exchange(
     frame_response(
         req_header.correlation_id,
         response_header_version(FindCoordinatorRequest::API_KEY, api_version),
-        |out| resp.encode(out, api_version).unwrap(),
+        |out| resp.encode(out, api_version),
         false,
     )
 }
@@ -1901,7 +1908,7 @@ fn offset_commit_exchange(
         return frame_response(
             req_header.correlation_id,
             response_header_version(OffsetCommitRequest::API_KEY, api_version),
-            |out| resp.encode(out, api_version).unwrap(),
+            |out| resp.encode(out, api_version),
             false,
         );
     }
@@ -1951,7 +1958,7 @@ fn offset_commit_exchange(
     frame_response(
         req_header.correlation_id,
         response_header_version(OffsetCommitRequest::API_KEY, api_version),
-        |out| resp.encode(out, api_version).unwrap(),
+        |out| resp.encode(out, api_version),
         false,
     )
 }
@@ -2071,15 +2078,19 @@ fn offset_fetch_exchange(
     frame_response(
         req_header.correlation_id,
         response_header_version(OffsetFetchRequest::API_KEY, api_version),
-        |out| resp.encode(out, api_version).unwrap(),
+        |out| resp.encode(out, api_version),
         false,
     )
 }
 
+/// The first JoinGroup response version whose `ProtocolName` may be
+/// null.
+const JOIN_GROUP_NULLABLE_PROTOCOL: i16 = 7;
+
 fn frame_response(
     correlation_id: i32,
     header_version: i16,
-    body: impl FnOnce(&mut BytesMut),
+    body: impl FnOnce(&mut BytesMut) -> Result<(), odradek_protocol::EncodeError>,
     trailing_garbage: bool,
 ) -> Option<BytesMut> {
     let mut resp_header = ResponseHeader::default();
@@ -2087,7 +2098,7 @@ fn frame_response(
     let mut out = BytesMut::new();
     frame::frame(&mut out, |out| {
         resp_header.encode(out, header_version)?;
-        body(out);
+        body(out)?;
         if trailing_garbage {
             out.extend_from_slice(&[0xde, 0xad, 0xbe]);
         }
@@ -2157,7 +2168,7 @@ fn api_versions_exchange(mut frame: Bytes, api_version: i16, faults: &[Fault]) -
     frame_response(
         correlation_id,
         resp_header_version,
-        |out| resp.encode(out, encode_at).unwrap(),
+        |out| resp.encode(out, encode_at),
         has(Fault::TrailingGarbage),
     )
 }
@@ -2301,7 +2312,7 @@ fn metadata_exchange(
     frame_response(
         header.correlation_id,
         resp_header_version,
-        |out| resp.encode(out, api_version).unwrap(),
+        |out| resp.encode(out, api_version),
         false,
     )
 }
@@ -2363,7 +2374,7 @@ fn create_topics_exchange(
     frame_response(
         req_header.correlation_id,
         response_header_version(CreateTopicsRequest::API_KEY, api_version),
-        |out| resp.encode(out, api_version).unwrap(),
+        |out| resp.encode(out, api_version),
         false,
     )
 }
@@ -2566,7 +2577,7 @@ fn produce_exchange(
     frame_response(
         req_header.correlation_id,
         response_header_version(ProduceRequest::API_KEY, api_version),
-        |out| resp.encode(out, encode_at).unwrap(),
+        |out| resp.encode(out, encode_at),
         false,
     )
 }
@@ -2730,7 +2741,7 @@ async fn fetch_exchange(
     frame_response(
         req_header.correlation_id,
         response_header_version(FetchRequest::API_KEY, api_version),
-        |out| resp.encode(out, api_version).unwrap(),
+        |out| resp.encode(out, api_version),
         faults.contains(&Fault::FetchTrailingGarbage),
     )
 }
@@ -2798,7 +2809,7 @@ fn init_producer_id_exchange(
     frame_response(
         req_header.correlation_id,
         response_header_version(InitProducerIdRequest::API_KEY, api_version),
-        |out| resp.encode(out, api_version).unwrap(),
+        |out| resp.encode(out, api_version),
         false,
     )
 }
@@ -2855,7 +2866,7 @@ fn add_partitions_to_txn_exchange(
     frame_response(
         req_header.correlation_id,
         response_header_version(AddPartitionsToTxnRequest::API_KEY, api_version),
-        |out| resp.encode(out, api_version).unwrap(),
+        |out| resp.encode(out, api_version),
         false,
     )
 }
@@ -2939,7 +2950,7 @@ fn end_txn_exchange(
     frame_response(
         req_header.correlation_id,
         response_header_version(EndTxnRequest::API_KEY, api_version),
-        |out| resp.encode(out, api_version).unwrap(),
+        |out| resp.encode(out, api_version),
         false,
     )
 }
@@ -3145,7 +3156,7 @@ fn delete_topics_exchange(
     frame_response(
         req_header.correlation_id,
         response_header_version(DeleteTopicsRequest::API_KEY, api_version),
-        |out| resp.encode(out, api_version).unwrap(),
+        |out| resp.encode(out, api_version),
         false,
     )
 }
@@ -3212,7 +3223,7 @@ fn describe_groups_exchange(
     frame_response(
         req_header.correlation_id,
         response_header_version(DescribeGroupsRequest::API_KEY, api_version),
-        |out| resp.encode(out, api_version).unwrap(),
+        |out| resp.encode(out, api_version),
         false,
     )
 }
@@ -3284,7 +3295,7 @@ fn add_offsets_to_txn_exchange(
     frame_response(
         req_header.correlation_id,
         response_header_version(AddOffsetsToTxnRequest::API_KEY, api_version),
-        |out| resp.encode(out, api_version).unwrap(),
+        |out| resp.encode(out, api_version),
         false,
     )
 }
@@ -3353,7 +3364,7 @@ fn txn_offset_commit_exchange(
     frame_response(
         req_header.correlation_id,
         response_header_version(TxnOffsetCommitRequest::API_KEY, api_version),
-        |out| resp.encode(out, api_version).unwrap(),
+        |out| resp.encode(out, api_version),
         false,
     )
 }

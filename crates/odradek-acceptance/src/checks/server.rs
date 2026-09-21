@@ -3792,6 +3792,13 @@ async fn metadata_flexible_header(ctx: &ServerCtx) -> Verdict {
 /// limitation as the subject's fault. Apache Kafka 4.1 still advertises
 /// Produce from v0.
 const PRODUCE_RECORD_BATCH_MIN: i16 = 3;
+
+/// The member id, transactional id and producer id the sequence sweeps
+/// use. None of them exists anywhere; that is the point — every request
+/// built on them is refused before the broker has to hold anything open.
+const SWEEP_MEMBER: &str = "odradek-sweep-member";
+const SWEEP_TXN: &str = "odradek-sweep-txn";
+const SWEEP_PRODUCER_ID: i64 = 987_654_321;
 const PRODUCE_NAME_MAX: i16 = 12;
 const FETCH_NAME_MAX: i16 = 12;
 /// First topic-id-addressed versions.
@@ -9203,12 +9210,27 @@ async fn cluster_committed_offsets_outlive_the_coordinator(ctx: &ServerCtx) -> V
 /// why the failure lists every (api, version) pair rather than stopping
 /// at the first.
 ///
-/// Not swept, and honestly: the group lifecycle (JoinGroup, SyncGroup,
-/// Heartbeat, LeaveGroup, ConsumerGroupHeartbeat), the transaction
-/// apis, and the SASL exchange. Each is a *sequence* whose steps must
-/// agree on a version and which leaves state behind, so sweeping them
-/// means standing up a fresh member or producer per version rather than
-/// re-sending one request. Worth doing; not done here.
+/// The group lifecycle, the transaction apis and the SASL pair are
+/// swept too, which they were not when this was written. They are
+/// *sequences* — steps that agree on a version and leave state behind —
+/// and the way in was noticing the sweep does not need them to
+/// succeed. Every request it sends them is built to be refused on
+/// arrival: a session timeout under the broker's floor, a member
+/// nobody has heard of, a transaction nobody opened. The response
+/// comes back in the shape the version specifies, which is the whole
+/// question, and the coordinator never has to hold anything open or
+/// remember anybody.
+///
+/// Still not swept, and honestly:
+///
+/// - **InitProducerId**, which allocates. Every version swept would
+///   take another producer id off the coordinator, and a bogus one
+///   cannot be sent because the whole point of the call is to be given
+///   one.
+/// - **AddPartitionsToTxn**, whose v4 is a different request: the
+///   batched form brokers send each other, not the one a client sends.
+///   Sweeping both shapes under one name would report a range as
+///   spoken when half of it was never tried.
 async fn versions_advertised_are_speakable(ctx: &ServerCtx) -> Verdict {
     let produced = match produce_flow(ctx, "sweep", Addressing::Name).await {
         Ok(p) => p,
@@ -9338,6 +9360,194 @@ async fn versions_advertised_are_speakable(ctx: &ServerCtx) -> Verdict {
         swept.push(format!("CreateTopics {}", span(&versions)));
     }
 
+    // The sequences. Each request below is refused on arrival, so the
+    // whole range costs one round trip per version and leaves no group,
+    // member or transaction behind; see the helpers for why each one is
+    // refused and why that is enough.
+    let seq_group = check_group("sweepseq");
+    sweep_sequence(
+        ctx,
+        &produced.addr,
+        SequenceSweep {
+            api_key: JoinGroupRequest::API_KEY,
+            name: "JoinGroup",
+            min: JoinGroupRequest::MIN_VERSION,
+            max: JoinGroupRequest::MAX_VERSION,
+            base: 1_700,
+        },
+        &mut swept,
+        &mut failures,
+        |conn, v, c| Box::pin(sweep_join_group(conn, v, seq_group.clone(), c)),
+    )
+    .await;
+    sweep_sequence(
+        ctx,
+        &produced.addr,
+        SequenceSweep {
+            api_key: SyncGroupRequest::API_KEY,
+            name: "SyncGroup",
+            min: SyncGroupRequest::MIN_VERSION,
+            max: SyncGroupRequest::MAX_VERSION,
+            base: 1_720,
+        },
+        &mut swept,
+        &mut failures,
+        |conn, v, c| Box::pin(sweep_sync_group(conn, v, seq_group.clone(), c)),
+    )
+    .await;
+    sweep_sequence(
+        ctx,
+        &produced.addr,
+        SequenceSweep {
+            api_key: HeartbeatRequest::API_KEY,
+            name: "Heartbeat",
+            min: HeartbeatRequest::MIN_VERSION,
+            max: HeartbeatRequest::MAX_VERSION,
+            base: 1_740,
+        },
+        &mut swept,
+        &mut failures,
+        |conn, v, c| Box::pin(sweep_heartbeat(conn, v, seq_group.clone(), c)),
+    )
+    .await;
+    sweep_sequence(
+        ctx,
+        &produced.addr,
+        SequenceSweep {
+            api_key: LeaveGroupRequest::API_KEY,
+            name: "LeaveGroup",
+            min: LeaveGroupRequest::MIN_VERSION,
+            max: LeaveGroupRequest::MAX_VERSION,
+            base: 1_760,
+        },
+        &mut swept,
+        &mut failures,
+        |conn, v, c| Box::pin(sweep_leave_group(conn, v, seq_group.clone(), c)),
+    )
+    .await;
+    sweep_sequence(
+        ctx,
+        &produced.addr,
+        SequenceSweep {
+            api_key: ConsumerGroupHeartbeatRequest::API_KEY,
+            name: "ConsumerGroupHeartbeat",
+            min: ConsumerGroupHeartbeatRequest::MIN_VERSION,
+            max: ConsumerGroupHeartbeatRequest::MAX_VERSION,
+            base: 1_780,
+        },
+        &mut swept,
+        &mut failures,
+        |conn, v, c| {
+            Box::pin(sweep_consumer_group_heartbeat(
+                conn,
+                v,
+                seq_group.clone(),
+                c,
+            ))
+        },
+    )
+    .await;
+    sweep_sequence(
+        ctx,
+        &produced.addr,
+        SequenceSweep {
+            api_key: AddOffsetsToTxnRequest::API_KEY,
+            name: "AddOffsetsToTxn",
+            min: AddOffsetsToTxnRequest::MIN_VERSION,
+            max: AddOffsetsToTxnRequest::MAX_VERSION,
+            base: 1_800,
+        },
+        &mut swept,
+        &mut failures,
+        |conn, v, c| Box::pin(sweep_add_offsets_to_txn(conn, v, seq_group.clone(), c)),
+    )
+    .await;
+    sweep_sequence(
+        ctx,
+        &produced.addr,
+        SequenceSweep {
+            api_key: EndTxnRequest::API_KEY,
+            name: "EndTxn",
+            min: EndTxnRequest::MIN_VERSION,
+            max: EndTxnRequest::MAX_VERSION,
+            base: 1_820,
+        },
+        &mut swept,
+        &mut failures,
+        |conn, v, c| Box::pin(sweep_end_txn(conn, v, c)),
+    )
+    .await;
+    sweep_sequence(
+        ctx,
+        &produced.addr,
+        SequenceSweep {
+            api_key: TxnOffsetCommitRequest::API_KEY,
+            name: "TxnOffsetCommit",
+            min: TxnOffsetCommitRequest::MIN_VERSION,
+            max: TxnOffsetCommitRequest::MAX_VERSION,
+            base: 1_840,
+        },
+        &mut swept,
+        &mut failures,
+        |conn, v, c| {
+            Box::pin(sweep_txn_offset_commit(
+                conn,
+                v,
+                seq_group.clone(),
+                topic.clone(),
+                c,
+            ))
+        },
+    )
+    .await;
+    // The two SASL apis are swept on different listeners, which took a
+    // broker to work out.
+    //
+    // SaslHandshake belongs on the configured listener: it is the
+    // request that listener exists to receive first, and an unsupported
+    // mechanism is refused there with the list of ones that would work.
+    //
+    // SaslAuthenticate does not. A token arriving before any handshake
+    // is out of sequence, and a SASL listener answers that by *hanging
+    // up* — an unauthenticated peer gets no protocol surface, which is
+    // correct and is not a shape. Swept there it reported three
+    // unspeakable versions against a broker doing exactly the right
+    // thing. On the plaintext listener the same question gets
+    // ILLEGAL_SASL_STATE in the shape the version specifies, which is
+    // what this check is asking, and is where
+    // `sasl/authenticate-requires-handshake` already asks it.
+    let sasl_addr = ctx.sasl_addr.clone().unwrap_or_else(|| ctx.addr.clone());
+    sweep_sequence(
+        ctx,
+        &sasl_addr,
+        SequenceSweep {
+            api_key: SaslHandshakeRequest::API_KEY,
+            name: "SaslHandshake",
+            min: SaslHandshakeRequest::MIN_VERSION,
+            max: SaslHandshakeRequest::MAX_VERSION,
+            base: 1_860,
+        },
+        &mut swept,
+        &mut failures,
+        |conn, v, c| Box::pin(sweep_sasl_handshake(conn, v, c)),
+    )
+    .await;
+    sweep_sequence(
+        ctx,
+        &ctx.addr,
+        SequenceSweep {
+            api_key: SaslAuthenticateRequest::API_KEY,
+            name: "SaslAuthenticate",
+            min: SaslAuthenticateRequest::MIN_VERSION,
+            max: SaslAuthenticateRequest::MAX_VERSION,
+            base: 1_880,
+        },
+        &mut swept,
+        &mut failures,
+        |conn, v, c| Box::pin(sweep_sasl_authenticate(conn, v, c)),
+    )
+    .await;
+
     if swept.is_empty() {
         return Verdict::Skipped {
             reason: "the subject advertises none of the apis this sweeps".into(),
@@ -9436,6 +9646,336 @@ async fn sweep_offset_commit(
     )
     .await?;
     Ok(())
+}
+
+// ---- sweeping the sequences ------------------------------------------
+//
+// JoinGroup, SyncGroup, Heartbeat, LeaveGroup, ConsumerGroupHeartbeat
+// and the transaction apis are *sequences*: their steps agree on a
+// version and each leaves state behind. That is why they were left out
+// of the sweep when it was written, and the way in is that the sweep
+// does not need them to succeed. Its standard is shape — an error code
+// is a fine answer; a version that cannot be spoken at all is not — so
+// every request below is built to be refused at once, before the
+// coordinator has to hold anything open or remember anybody.
+//
+// Refused *immediately* matters twice over. A JoinGroup that succeeds
+// parks the connection in a rebalance for seconds per version, and a
+// member that joins has to be cleaned up or the next check inherits it.
+// A session timeout under the broker's floor is rejected before the
+// group is touched, so the response comes back at once and the group
+// never existed.
+
+/// A JoinGroup the coordinator will refuse before it looks at the group.
+///
+/// `session_timeout_ms` of 1 is below every broker's
+/// `group.min.session.timeout.ms` (Kafka's default floor is 6000), and
+/// that bound is checked first — so this exercises the whole response
+/// schema at `version` and leaves no member behind.
+async fn sweep_join_group(
+    conn: &mut RawConnection,
+    version: i16,
+    group: String,
+    correlation: i32,
+) -> Result<(), CheckError> {
+    let mut protocol = JoinGroupRequestProtocol::default();
+    protocol.name = "range".into();
+    protocol.metadata = Bytes::from_static(&[0, 0, 0, 0, 0, 0]);
+    let mut request = JoinGroupRequest::default();
+    request.group_id = group;
+    request.session_timeout_ms = 1;
+    request.rebalance_timeout_ms = 1;
+    request.member_id = String::new();
+    request.protocol_type = "consumer".into();
+    request.protocols = vec![protocol];
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding JoinGroup: {e}")))?;
+    let _: JoinGroupResponse =
+        api_call(conn, JoinGroupRequest::API_KEY, version, correlation, &body).await?;
+    Ok(())
+}
+
+/// A SyncGroup from a member of a group that does not exist.
+async fn sweep_sync_group(
+    conn: &mut RawConnection,
+    version: i16,
+    group: String,
+    correlation: i32,
+) -> Result<(), CheckError> {
+    let mut request = SyncGroupRequest::default();
+    request.group_id = group;
+    request.generation_id = -1;
+    request.member_id = SWEEP_MEMBER.into();
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding SyncGroup: {e}")))?;
+    let _: SyncGroupResponse =
+        api_call(conn, SyncGroupRequest::API_KEY, version, correlation, &body).await?;
+    Ok(())
+}
+
+/// A heartbeat from a member nobody has heard of.
+async fn sweep_heartbeat(
+    conn: &mut RawConnection,
+    version: i16,
+    group: String,
+    correlation: i32,
+) -> Result<(), CheckError> {
+    let mut request = HeartbeatRequest::default();
+    request.group_id = group;
+    request.generation_id = -1;
+    request.member_id = SWEEP_MEMBER.into();
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding Heartbeat: {e}")))?;
+    let _: HeartbeatResponse =
+        api_call(conn, HeartbeatRequest::API_KEY, version, correlation, &body).await?;
+    Ok(())
+}
+
+/// A LeaveGroup for a member that never joined.
+///
+/// The member moves from a scalar to a list at v3, which the schema
+/// models as two fields; both are set so the request is well formed at
+/// either end of the range.
+async fn sweep_leave_group(
+    conn: &mut RawConnection,
+    version: i16,
+    group: String,
+    correlation: i32,
+) -> Result<(), CheckError> {
+    let mut member = MemberIdentity::default();
+    member.member_id = SWEEP_MEMBER.into();
+    let mut request = LeaveGroupRequest::default();
+    request.group_id = group;
+    request.member_id = SWEEP_MEMBER.into();
+    request.members = vec![member];
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding LeaveGroup: {e}")))?;
+    let _: LeaveGroupResponse = api_call(
+        conn,
+        LeaveGroupRequest::API_KEY,
+        version,
+        correlation,
+        &body,
+    )
+    .await?;
+    Ok(())
+}
+
+/// A KIP-848 heartbeat from a member at an epoch it cannot hold.
+async fn sweep_consumer_group_heartbeat(
+    conn: &mut RawConnection,
+    version: i16,
+    group: String,
+    correlation: i32,
+) -> Result<(), CheckError> {
+    let mut request = ConsumerGroupHeartbeatRequest::default();
+    request.group_id = group;
+    request.member_id = SWEEP_MEMBER.into();
+    request.member_epoch = 99;
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding ConsumerGroupHeartbeat: {e}")))?;
+    let _: ConsumerGroupHeartbeatResponse = api_call(
+        conn,
+        ConsumerGroupHeartbeatRequest::API_KEY,
+        version,
+        correlation,
+        &body,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Bind a consumer group to a transaction nobody opened.
+async fn sweep_add_offsets_to_txn(
+    conn: &mut RawConnection,
+    version: i16,
+    group: String,
+    correlation: i32,
+) -> Result<(), CheckError> {
+    let mut request = AddOffsetsToTxnRequest::default();
+    request.transactional_id = SWEEP_TXN.into();
+    request.producer_id = SWEEP_PRODUCER_ID;
+    request.producer_epoch = 0;
+    request.group_id = group;
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding AddOffsetsToTxn: {e}")))?;
+    let _: AddOffsetsToTxnResponse = api_call(
+        conn,
+        AddOffsetsToTxnRequest::API_KEY,
+        version,
+        correlation,
+        &body,
+    )
+    .await?;
+    Ok(())
+}
+
+/// End a transaction nobody opened.
+async fn sweep_end_txn(
+    conn: &mut RawConnection,
+    version: i16,
+    correlation: i32,
+) -> Result<(), CheckError> {
+    let mut request = EndTxnRequest::default();
+    request.transactional_id = SWEEP_TXN.into();
+    request.producer_id = SWEEP_PRODUCER_ID;
+    request.producer_epoch = 0;
+    request.committed = false;
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding EndTxn: {e}")))?;
+    let _: EndTxnResponse =
+        api_call(conn, EndTxnRequest::API_KEY, version, correlation, &body).await?;
+    Ok(())
+}
+
+/// Commit an offset inside that same transaction nobody opened.
+async fn sweep_txn_offset_commit(
+    conn: &mut RawConnection,
+    version: i16,
+    group: String,
+    topic: String,
+    correlation: i32,
+) -> Result<(), CheckError> {
+    let mut partition = TxnOffsetCommitRequestPartition::default();
+    partition.partition_index = 0;
+    partition.committed_offset = 1;
+    partition.committed_leader_epoch = -1;
+    let mut req_topic = TxnOffsetCommitRequestTopic::default();
+    req_topic.name = topic;
+    req_topic.partitions = vec![partition];
+    let mut request = TxnOffsetCommitRequest::default();
+    request.transactional_id = SWEEP_TXN.into();
+    request.group_id = group;
+    request.producer_id = SWEEP_PRODUCER_ID;
+    request.producer_epoch = 0;
+    request.generation_id = -1;
+    request.member_id = String::new();
+    request.topics = vec![req_topic];
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding TxnOffsetCommit: {e}")))?;
+    let _: TxnOffsetCommitResponse = api_call(
+        conn,
+        TxnOffsetCommitRequest::API_KEY,
+        version,
+        correlation,
+        &body,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Ask for a mechanism no broker implements.
+///
+/// The answer is a refusal either way — UNSUPPORTED_SASL_MECHANISM from
+/// a listener that speaks SASL, ILLEGAL_SASL_STATE from one that does
+/// not — and both are the right shape, which is the whole question
+/// here. Nothing is negotiated, so nothing is left behind.
+async fn sweep_sasl_handshake(
+    conn: &mut RawConnection,
+    version: i16,
+    correlation: i32,
+) -> Result<(), CheckError> {
+    let mut request = SaslHandshakeRequest::default();
+    request.mechanism = "ODRADEK-SWEEP".into();
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding SaslHandshake: {e}")))?;
+    let _: SaslHandshakeResponse = api_call(
+        conn,
+        SaslHandshakeRequest::API_KEY,
+        version,
+        correlation,
+        &body,
+    )
+    .await?;
+    Ok(())
+}
+
+/// A token before any handshake: ILLEGAL_SASL_STATE, in the shape this
+/// version specifies.
+async fn sweep_sasl_authenticate(
+    conn: &mut RawConnection,
+    version: i16,
+    correlation: i32,
+) -> Result<(), CheckError> {
+    let mut request = SaslAuthenticateRequest::default();
+    request.auth_bytes = Bytes::from_static(b"odradek-sweep");
+    let mut body = BytesMut::new();
+    request
+        .encode(&mut body, version)
+        .map_err(|e| CheckError::Infra(format!("encoding SaslAuthenticate: {e}")))?;
+    let _: SaslAuthenticateResponse = api_call(
+        conn,
+        SaslAuthenticateRequest::API_KEY,
+        version,
+        correlation,
+        &body,
+    )
+    .await?;
+    Ok(())
+}
+
+/// One api to sweep across its whole advertised range.
+struct SequenceSweep {
+    api_key: i16,
+    name: &'static str,
+    min: i16,
+    max: i16,
+    /// Correlation ids start here; one per version.
+    base: i32,
+}
+
+/// Sweep one sequence api, a fresh connection per version.
+///
+/// Fresh because a refused SASL exchange may leave the broker unwilling
+/// to say anything else on that socket, and because a server that
+/// refuses a version by hanging up would otherwise condemn every
+/// version after it — the same reason the produce sweep above opens one
+/// per version, learned the same way.
+async fn sweep_sequence<F>(
+    ctx: &ServerCtx,
+    addr: &str,
+    api: SequenceSweep,
+    swept: &mut Vec<String>,
+    failures: &mut Vec<String>,
+    mut exchange: F,
+) where
+    F: FnMut(&mut RawConnection, i16, i32) -> BoxFuture<'_, Result<(), CheckError>>,
+{
+    let Ok(versions) = versions_of(ctx, api.api_key, api.name, api.min, api.max) else {
+        return;
+    };
+    for version in &versions {
+        let correlation = api.base + i32::from(*version);
+        let mut conn = match open(ctx, addr).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                failures.push(format!("{} v{version}: {}", api.name, e.details()));
+                continue;
+            }
+        };
+        if let Err(e) = exchange(&mut conn, *version, correlation).await {
+            failures.push(format!("{} v{version}: {}", api.name, e.details()));
+        }
+    }
+    swept.push(format!("{} {}", api.name, span(&versions)));
 }
 
 /// The versions of `api_key` that both the subject advertises and this
