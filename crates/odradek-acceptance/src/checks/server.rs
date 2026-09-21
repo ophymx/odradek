@@ -8646,68 +8646,109 @@ async fn cluster_group_offsets_need_the_coordinator(ctx: &ServerCtx) -> Verdict 
         return skip;
     }
     let group = check_group("notcoord");
-    let Some(coordinator) = (match await_coordinator(ctx, &group).await {
-        Ok(addr) => addr,
-        Err(e) => return e.into_verdict(),
-    }) else {
-        return Verdict::Skipped {
-            reason: format!("the subject named no coordinator for {group}"),
-        };
-    };
-    let Some(other) = nodes.iter().find(|n| n.addr != coordinator) else {
-        return Verdict::Skipped {
-            reason: format!(
-                "every broker the subject reports is at {coordinator}, so there is no \
-                 non-coordinator to commit against"
-            ),
-        };
-    };
-
-    let mut conn = match open(ctx, &other.addr).await {
-        Ok(c) => c,
-        Err(e) => return e.into_verdict(),
-    };
-    // The topic has to be known there, or the refusal could be about
-    // the topic rather than about the group.
-    if let Err(e) = await_topic_known(ctx, &mut conn, &produced.topic, 1_490).await {
-        return e.into_verdict();
-    }
-    match commit_offset(
-        &mut conn,
-        commit_version,
-        &group,
-        &produced.topic,
-        produced.topic_id,
-        13,
-        1_495,
-    )
-    .await
-    {
-        Ok(()) => Verdict::Fail {
-            details: format!(
-                "node {} accepted a commit for {group}, which {coordinator} coordinates; \
-                 a consumer resuming through the coordinator would never see that offset \
-                 and would reprocess everything after it",
-                other.node_id
-            ),
-        },
-        // `commit_offset` reports a non-zero code as a violation, which
-        // here is the passing answer — so read the code back out of it.
-        Err(CheckError::Violation(details))
-            if details.contains(&format!("{}", ErrorCode::NOT_COORDINATOR)) =>
-        {
-            Verdict::Pass
+    // Resolved inside the loop, not once: "this broker is not the
+    // coordinator" is a fact with a lifetime, and this check is built
+    // entirely on it. Every other check in this family treats a moved
+    // coordinator as a redirect to follow; this one is the inverse —
+    // if the coordinator moves *onto* the broker chosen for not being
+    // it, the commit is accepted for the correct reason and the check
+    // would report the subject for doing the right thing.
+    for attempt in 0..ctx.config.settle_attempts() {
+        if attempt > 0 {
+            tokio::time::sleep(ctx.config.settle_delay).await;
         }
-        Err(CheckError::Violation(details)) => Verdict::Fail {
-            details: format!(
-                "node {} refused the commit, but not with NOT_COORDINATOR, so the client \
-                 is not told where to go instead: {details}",
-                other.node_id
-            ),
-        },
-        Err(e) => e
-            .context("OffsetCommit (to a non-coordinator)")
-            .into_verdict(),
+        let correlation = 1_490 + i32::try_from(attempt).unwrap_or(0) * 4;
+        let Some(coordinator) = (match await_coordinator(ctx, &group).await {
+            Ok(addr) => addr,
+            Err(e) => return e.into_verdict(),
+        }) else {
+            return Verdict::Skipped {
+                reason: format!("the subject named no coordinator for {group}"),
+            };
+        };
+        let Some(other) = nodes.iter().find(|n| n.addr != coordinator) else {
+            return Verdict::Skipped {
+                reason: format!(
+                    "every broker the subject reports is at {coordinator}, so there is no \
+                     non-coordinator to commit against"
+                ),
+            };
+        };
+
+        let mut conn = match open(ctx, &other.addr).await {
+            Ok(c) => c,
+            Err(e) => return e.into_verdict(),
+        };
+        // The topic has to be known there, or the refusal could be
+        // about the topic rather than about the group.
+        if let Err(e) = await_topic_known(ctx, &mut conn, &produced.topic, correlation).await {
+            return e.into_verdict();
+        }
+        match commit_offset(
+            &mut conn,
+            commit_version,
+            &group,
+            &produced.topic,
+            produced.topic_id,
+            13,
+            correlation + 1,
+        )
+        .await
+        {
+            Ok(()) => {
+                // Accepted. Either the subject stores group offsets
+                // wherever they are sent, or the group moved here while
+                // the question was being asked. Ask again before
+                // saying which: the second answer costs one round trip
+                // and is the difference between a finding and a libel.
+                match await_coordinator_at(ctx, &other.addr, &group).await {
+                    Ok(Some(now)) if now == other.addr => continue,
+                    Ok(_) => {}
+                    Err(e) => return e.into_verdict(),
+                }
+                return Verdict::Fail {
+                    details: format!(
+                        "node {} accepted a commit for {group}, which {coordinator} \
+                         coordinates and still does; a consumer resuming through the \
+                         coordinator would never see that offset and would reprocess \
+                         everything after it",
+                        other.node_id
+                    ),
+                };
+            }
+            // `commit_offset` reports a non-zero code as a violation,
+            // which here is the passing answer — so read the code back
+            // out of it.
+            Err(CheckError::Violation(details))
+                if details.contains(&format!("{}", ErrorCode::NOT_COORDINATOR)) =>
+            {
+                return Verdict::Pass;
+            }
+            Err(CheckError::Violation(details)) => {
+                return Verdict::Fail {
+                    details: format!(
+                        "node {} refused the commit, but not with NOT_COORDINATOR, so the \
+                         client is not told where to go instead: {details}",
+                        other.node_id
+                    ),
+                };
+            }
+            Err(e) => {
+                return e
+                    .context("OffsetCommit (to a non-coordinator)")
+                    .into_verdict();
+            }
+        }
+    }
+    // Every attempt found the group had moved to whichever broker was
+    // picked for not coordinating it. Nothing was observed either way,
+    // and a check that cannot ask its question says so.
+    Verdict::Skipped {
+        reason: format!(
+            "the coordinator for {group} moved onto the broker chosen for not being it, on \
+             every attempt within {:?}",
+            ctx.config.settle_budget
+        ),
     }
 }
 
