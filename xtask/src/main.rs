@@ -9,6 +9,11 @@
 //! `cargo xtask conformance` runs the acceptance suite against real broker
 //! implementations in Docker; see `conformance.rs`.
 //!
+//! `cargo xtask ci` runs every CI check that does not need Docker or a
+//! second architecture — including the MSRV one, which is the only
+//! thing standing between a 1.88 language feature and a red build; see
+//! `ci.rs`.
+//!
 //! Tagged fields are materialized as `Option` struct fields (`None` =
 //! absent on the wire); unknown tags round-trip raw. One shape is not
 //! supported (the generator fails loudly on it): fields that are
@@ -29,6 +34,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
+mod ci;
 mod clients;
 mod conformance;
 
@@ -36,6 +42,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let task = args.first().map(String::as_str).unwrap_or_default();
     match task {
+        "ci" => ci::ci(&args[1..]),
         "codegen" => codegen(),
         "conformance" => conformance::conformance(&args[1..]),
         "client-matrix" => clients::client_matrix(&args[1..]),
@@ -44,7 +51,9 @@ fn main() -> Result<()> {
         // can stop and start a broker. See `conformance::node_control`.
         "cluster-node" => conformance::node_control(&args[1..]),
         other => {
-            bail!("unknown task {other:?}; available tasks: codegen, conformance, client-matrix")
+            bail!(
+                "unknown task {other:?}; available tasks: ci, codegen, conformance, client-matrix"
+            )
         }
     }
 }

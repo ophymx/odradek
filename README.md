@@ -154,11 +154,21 @@ certificates fail cleanly.
 Next: crates.io publication.
 
 ```sh
-cargo test --workspace       # everything
+cargo xtask ci               # every CI check that does not need docker
+cargo test --workspace       # just the tests
 cargo xtask codegen          # regenerate message types from schemas
 cargo xtask conformance      # real-broker conformance runs (needs docker)
 cargo xtask conformance --record   # refresh baselines from a run
+cargo xtask client-matrix    # clients through the harness (needs docker)
 ```
+
+`cargo xtask ci` rather than `cargo test` before pushing, for one
+reason worth knowing: the tests run on whatever toolchain is installed,
+which is newer than the 1.85 this workspace promises, so a language
+feature from a later release compiles locally and fails only in CI's
+MSRV job. The task runs that check too (through `rustup run`, against
+the `rust-version` in the manifest, so the two cannot drift), and names
+on exit the jobs it did not run.
 
 ## Security
 
