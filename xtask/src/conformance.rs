@@ -1071,11 +1071,13 @@ fn run_subject(
     // Last, because it is the only pass that leaves state behind — it
     // creates topics and joins groups as a caller would — and the two
     // passes above are about what the broker does with a clean one.
-    if let Some(examples) = examples
-        && let Err(e) = client_pass(subject, examples, &target, record, log)
-    {
-        cluster.dump_logs(log);
-        return Err(e);
+    // Nested rather than a let chain: those need 1.88 and this
+    // workspace compiles on 1.85.
+    if let Some(examples) = examples {
+        if let Err(e) = client_pass(subject, examples, &target, record, log) {
+            cluster.dump_logs(log);
+            return Err(e);
+        }
     }
     Ok(())
 }
