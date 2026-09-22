@@ -13,6 +13,10 @@
 //!   broker per group, so a batch is split by coordinator and rejoined.
 //! - **Deleting a topic asks the controller**, which moves; the retry
 //!   path treats `NOT_CONTROLLER` as "ask again after refetching".
+//!   That sentence described the intent for a while before it described
+//!   the code: the retry redialled the same broker, because nothing
+//!   tracked which one the controller was. [`Cluster::controller`] does
+//!   now, and a redirect refetches metadata to learn where it went.
 //! - **Reading a topic's configuration** can be asked of anyone.
 //!
 //! Everything here is read-only except [`Cluster::delete_topics`].
@@ -30,7 +34,7 @@ use odradek_protocol::messages::describe_groups_response::DescribeGroupsResponse
 use odradek_protocol::messages::list_groups_request::ListGroupsRequest;
 use odradek_protocol::messages::list_groups_response::ListGroupsResponse;
 
-use crate::cluster::{Broker, Cluster};
+use crate::cluster::{Broker, Cluster, is_control_redirect};
 use crate::conn;
 use crate::error::ClientError;
 
@@ -247,11 +251,10 @@ impl Cluster {
     /// surfaces as [`ClientError::Broker`]; callers that tolerate a
     /// missing topic can match on the code.
     pub async fn delete_topics(&self, topics: &[&str]) -> Result<(), ClientError> {
-        let broker = self.control_broker().await?;
+        let broker = self.controller().await?;
         match self.delete_topics_via(&broker, topics).await {
-            Err(e) if e.is_retriable() => {
-                self.forget_control();
-                let broker = self.control_broker().await?;
+            Err(e) if is_control_redirect(&e) => {
+                let broker = self.rediscover_controller().await?;
                 self.delete_topics_via(&broker, topics).await
             }
             other => other,

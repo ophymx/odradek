@@ -6,6 +6,7 @@
 //! cargo xtask conformance --record    # (re)write baselines from this run
 //! cargo xtask conformance redpanda    # only subjects whose name contains
 //! cargo xtask conformance --no-proxy  # skip the second, proxied pass
+//! cargo xtask conformance --no-client # skip the client pass
 //! ```
 //!
 //! Each subject runs in a throwaway container on an ephemeral host port,
@@ -24,6 +25,15 @@
 //! Every subject is then run a second time through
 //! [the proxy example][proxy], enforced against the *same* baseline. See
 //! [`proxy_pass`] for why that comparison is the interesting one.
+//!
+//! Last comes the **client pass** ([`client_pass`]): `odradek-client`'s
+//! own examples, run unmodified against the same live broker. It rides
+//! along here rather than in a job of its own because starting the
+//! brokers is the expensive part and they are already up — and because
+//! until it existed, the client had no automated contact with a real
+//! broker anywhere. Every feature it shipped had been validated by
+//! somebody running these examples by hand, which is a thing that holds
+//! right up until it does not.
 //!
 //! [proxy]: ../../../crates/odradek-protocol/examples/proxy.rs
 
@@ -126,7 +136,173 @@ struct Subject {
     /// substitution; the suite is pointed at the first node and finds
     /// the rest through Metadata, as a client would.
     nodes: u8,
+    /// [`CLIENT_SCENARIOS`] this subject is known not to serve, by name.
+    ///
+    /// Listed rather than skipped, because both directions are worth
+    /// catching: a named scenario that starts succeeding is reported
+    /// just as loudly as an unnamed one that starts failing. A broker
+    /// growing support for something is news, and the alternative —
+    /// quietly not running it — is how an entry outlives its reason.
+    client_unsupported: &'static [&'static str],
 }
+
+/// One end-to-end exercise of `odradek-client` against a live broker.
+///
+/// These are the crate's own examples, run unmodified. That is the point
+/// rather than a convenience: they are what the README points a reader
+/// at, they are written in the public API, and they were the manual
+/// validation this workspace leaned on for every feature it shipped.
+/// What they were not is *automated* — the client had no contact with a
+/// real broker in CI at all, so the whole adoption-gap list (SASL,
+/// idempotence, admin, KIP-848, transactions, read_committed) rested on
+/// somebody remembering to run them by hand.
+struct ClientScenario {
+    /// Names this in the log and in [`Subject::client_unsupported`].
+    name: &'static str,
+    /// The example to run, from `crates/odradek-client/examples`.
+    example: &'static str,
+    /// Arguments after the bootstrap address; `{ca}` becomes the
+    /// subject's generated CA file.
+    args: &'static [&'static str],
+    /// The kind of listener this scenario needs.
+    needs: Needs,
+}
+
+/// Which subjects a client scenario can be put to.
+///
+/// The split exists because the examples take a bootstrap address and
+/// nothing else — a deliberate property, since an example carrying
+/// connection flags is an example about connection flags. So the
+/// subjects whose listeners demand TLS or SASL get `secure_smoke`,
+/// which is the example that *is* about that, and the rest get
+/// everything else.
+enum Needs {
+    /// A listener that answers without credentials or a handshake.
+    Plain,
+    /// A listener that speaks TLS.
+    Tls,
+    /// A listener that demands SASL.
+    Authenticated,
+}
+
+impl Needs {
+    fn met_by(&self, subject: &Subject) -> bool {
+        match self {
+            Needs::Plain => !subject.tls && !subject.authenticated,
+            Needs::Tls => subject.tls,
+            Needs::Authenticated => subject.authenticated,
+        }
+    }
+}
+
+/// How long one client scenario may take before it is killed.
+///
+/// Generous, because two of these wait out a real rebalance and one
+/// waits for a transaction coordinator to be elected. It is a deadlock
+/// backstop, not a performance assertion — a scenario that needs most of
+/// it is one to look at, but not one to fail.
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The client matrix's own rows: what `odradek-client` must be able to
+/// do against every subject that can be asked.
+const CLIENT_SCENARIOS: &[ClientScenario] = &[
+    ClientScenario {
+        name: "produce-consume",
+        example: "produce_consume",
+        args: &[],
+        needs: Needs::Plain,
+    },
+    // One row per codec, because the *client* is what compresses: the
+    // broker stores the batch as it arrives and hands it back, so a
+    // codec this client frames wrongly is a codec no check on the
+    // broker side can see. Snappy is xerial framing and lz4 is the
+    // frame format, and both have been got wrong here before.
+    ClientScenario {
+        name: "produce-consume-gzip",
+        example: "produce_consume",
+        args: &["gzip"],
+        needs: Needs::Plain,
+    },
+    ClientScenario {
+        name: "produce-consume-lz4",
+        example: "produce_consume",
+        args: &["lz4"],
+        needs: Needs::Plain,
+    },
+    ClientScenario {
+        name: "produce-consume-snappy",
+        example: "produce_consume",
+        args: &["snappy"],
+        needs: Needs::Plain,
+    },
+    ClientScenario {
+        name: "produce-consume-zstd",
+        example: "produce_consume",
+        args: &["zstd"],
+        needs: Needs::Plain,
+    },
+    ClientScenario {
+        name: "admin",
+        example: "admin",
+        args: &[],
+        needs: Needs::Plain,
+    },
+    ClientScenario {
+        name: "group-join",
+        example: "group_join",
+        args: &[],
+        needs: Needs::Plain,
+    },
+    ClientScenario {
+        name: "group-consume",
+        example: "group_consume",
+        args: &[],
+        needs: Needs::Plain,
+    },
+    ClientScenario {
+        name: "kip848-join",
+        example: "group848_join",
+        args: &[],
+        needs: Needs::Plain,
+    },
+    ClientScenario {
+        name: "kip848-consume",
+        example: "group848_consume",
+        args: &[],
+        needs: Needs::Plain,
+    },
+    ClientScenario {
+        name: "transactions",
+        example: "transactions",
+        args: &[],
+        needs: Needs::Plain,
+    },
+    ClientScenario {
+        name: "tls",
+        example: "secure_smoke",
+        args: &["--ca", "{ca}"],
+        needs: Needs::Tls,
+    },
+    // The credentials the subject was provisioned with, over a
+    // plaintext listener — which SCRAM is fine on (it never transmits
+    // the password) but which the client refuses for PLAIN. Asking for
+    // the mechanism that is safe here means no scenario passes
+    // `--allow-plaintext-credentials`, so a refusal that ought to
+    // happen still would.
+    ClientScenario {
+        name: "sasl-scram",
+        example: "secure_smoke",
+        args: &[
+            "--mechanism",
+            "scram256",
+            "--user",
+            "conformance",
+            "--pass",
+            "conformance",
+        ],
+        needs: Needs::Authenticated,
+    },
+];
 
 /// The subject matrix. The container must expose its plaintext Kafka
 /// listener on 9092 and a SASL one on 9094; `{port}` and `{sasl_port}`
@@ -181,6 +357,7 @@ const SUBJECTS: &[Subject] = &[
         authenticated: false,
         tls: false,
         nodes: 1,
+        client_unsupported: &[],
         // SCRAM credentials live in the metadata log, so they are added
         // after the broker is up rather than configured into it.
         provision: &[&[
@@ -261,6 +438,7 @@ const SUBJECTS: &[Subject] = &[
         authenticated: false,
         tls: true,
         nodes: 1,
+        client_unsupported: &[],
         provision: &[],
     },
     // The same broker, four minor releases back, for the versions the
@@ -312,6 +490,11 @@ const SUBJECTS: &[Subject] = &[
         authenticated: false,
         tls: false,
         nodes: 1,
+        // ConsumerGroupHeartbeat is advertised and answered
+        // UNSUPPORTED_VERSION: KIP-848 is early access here and off by
+        // default. The client reports exactly that code, which is the
+        // behaviour a caller needs to fall back on.
+        client_unsupported: &["kip848-join", "kip848-consume"],
         provision: &[&[
             "/opt/kafka/bin/kafka-configs.sh",
             "--bootstrap-server",
@@ -355,6 +538,11 @@ const SUBJECTS: &[Subject] = &[
         authenticated: false,
         tls: false,
         nodes: 1,
+        // Redpanda 25.2 does not advertise ConsumerGroupHeartbeat at
+        // all, so the client refuses before it sends: NoCommonVersion
+        // rather than an error code. The honest failure of the two, and
+        // worth recording as a distinct shape from Kafka 3.7's.
+        client_unsupported: &["kip848-join", "kip848-consume"],
         provision: &[],
     },
     Subject {
@@ -418,6 +606,7 @@ const SUBJECTS: &[Subject] = &[
         authenticated: false,
         tls: false,
         nodes: 3,
+        client_unsupported: &[],
         provision: &[],
     },
     Subject {
@@ -467,6 +656,11 @@ const SUBJECTS: &[Subject] = &[
         authenticated: false,
         tls: false,
         nodes: 3,
+        // Redpanda 25.2 does not advertise ConsumerGroupHeartbeat at
+        // all, so the client refuses before it sends: NoCommonVersion
+        // rather than an error code. The honest failure of the two, and
+        // worth recording as a distinct shape from Kafka 3.7's.
+        client_unsupported: &["kip848-join", "kip848-consume"],
         provision: &[],
     },
     Subject {
@@ -510,6 +704,7 @@ const SUBJECTS: &[Subject] = &[
         authenticated: true,
         tls: false,
         nodes: 1,
+        client_unsupported: &[],
         // The user is created through the admin api once the broker is
         // up: it lives in the cluster's own state, not in its config.
         provision: &[&[
@@ -536,6 +731,7 @@ pub fn conformance(args: &[String]) -> Result<()> {
 
     let record = args.iter().any(|a| a == "--record");
     let proxied = !args.iter().any(|a| a == "--no-proxy");
+    let client = !args.iter().any(|a| a == "--no-client");
     let filters: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let selected: Vec<&'static Subject> = SUBJECTS
         .iter()
@@ -558,6 +754,10 @@ pub fn conformance(args: &[String]) -> Result<()> {
     let proxy = proxied.then(|| root.join("target/debug/examples/proxy"));
     if proxied {
         build_proxy(&root)?;
+    }
+    let examples = client.then(|| root.join("target/debug/examples"));
+    if client {
+        build_client_examples(&root)?;
     }
     let conf_dir = root.join("conformance");
     std::fs::create_dir_all(&conf_dir)?;
@@ -593,6 +793,7 @@ pub fn conformance(args: &[String]) -> Result<()> {
         .map(|&subject| {
             let accept = accept.clone();
             let proxy = proxy.clone();
+            let examples = examples.clone();
             let conf_dir = conf_dir.clone();
             let budget = Arc::clone(&budget);
             std::thread::spawn(move || {
@@ -602,6 +803,7 @@ pub fn conformance(args: &[String]) -> Result<()> {
                     subject,
                     &accept,
                     proxy.as_deref(),
+                    examples.as_deref(),
                     &conf_dir,
                     record,
                     &mut log,
@@ -719,6 +921,22 @@ fn build_accept(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Build the client examples the client pass runs.
+///
+/// All of them in one invocation: they share a crate, so building them
+/// separately would be the same compile repeated.
+fn build_client_examples(root: &Path) -> Result<()> {
+    let status = Command::new(env!("CARGO"))
+        .current_dir(root)
+        .args(["build", "-p", "odradek-client", "--examples"])
+        .status()
+        .context("building the odradek-client examples")?;
+    if !status.success() {
+        bail!("building the odradek-client examples failed");
+    }
+    Ok(())
+}
+
 fn build_proxy(root: &Path) -> Result<()> {
     let status = Command::new("cargo")
         .args(["build", "-p", "odradek-protocol", "--example", "proxy"])
@@ -738,6 +956,7 @@ fn run_subject(
     subject: &Subject,
     accept: &Path,
     proxy: Option<&Path>,
+    examples: Option<&Path>,
     conf_dir: &Path,
     record: bool,
     log: &mut String,
@@ -848,6 +1067,16 @@ fn run_subject(
         (Some(proxy), _) => proxy_pass(subject, accept, proxy, &target, &cluster, &baseline, log)?,
         (None, _) => {}
     }
+
+    // Last, because it is the only pass that leaves state behind — it
+    // creates topics and joins groups as a caller would — and the two
+    // passes above are about what the broker does with a clean one.
+    if let Some(examples) = examples
+        && let Err(e) = client_pass(subject, examples, &target, record, log)
+    {
+        cluster.dump_logs(log);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -944,6 +1173,151 @@ struct Target<'a> {
     authenticate: Option<&'a str>,
     /// The CA to trust, when the subject's listener speaks TLS.
     tls_ca: Option<&'a str>,
+}
+
+/// Put `odradek-client` through [`CLIENT_SCENARIOS`] against a live
+/// subject.
+///
+/// Every applicable scenario runs, including the ones
+/// [`Subject::client_unsupported`] says will fail, so the table is
+/// checked in both directions rather than trusted.
+fn client_pass(
+    subject: &Subject,
+    examples: &Path,
+    target: &Target<'_>,
+    record: bool,
+    log: &mut String,
+) -> Result<()> {
+    let mut diverged = Vec::new();
+    for scenario in CLIENT_SCENARIOS {
+        if !scenario.needs.met_by(subject) {
+            continue;
+        }
+        let expected_to_fail = subject.client_unsupported.contains(&scenario.name);
+        let mut cmd = Command::new(examples.join(scenario.example));
+        cmd.arg(target.addr);
+        for arg in scenario.args {
+            cmd.arg(match *arg {
+                "{ca}" => target.tls_ca.unwrap_or_default().to_owned(),
+                other => other.to_owned(),
+            });
+        }
+        let outcome = run_bounded(cmd, CLIENT_TIMEOUT)
+            .with_context(|| format!("running the {} example", scenario.example))?;
+        let verdict = match (outcome.ok(), expected_to_fail) {
+            (true, false) => "ok",
+            (false, true) => "unsupported (as recorded)",
+            (true, true) => {
+                diverged.push(format!(
+                    "{}: recorded as unsupported by {} but it worked — drop it from \
+                     client_unsupported",
+                    scenario.name, subject.name
+                ));
+                "UNEXPECTEDLY OK"
+            }
+            (false, false) => {
+                diverged.push(format!("{}: {}", scenario.name, outcome.describe()));
+                "FAILED"
+            }
+        };
+        let _ = writeln!(log, "  client/{:<24} {verdict}", scenario.name);
+        if !outcome.ok() {
+            let _ = writeln!(log, "{}", indent(&tail(&outcome.output, 8)));
+        }
+    }
+    if diverged.is_empty() {
+        return Ok(());
+    }
+    if record {
+        let _ = writeln!(
+            log,
+            "note: {} client scenario(s) diverge from the table (recorded run, not failing): {}",
+            diverged.len(),
+            diverged.join("; ")
+        );
+        return Ok(());
+    }
+    bail!(
+        "{} client scenario(s) diverged against {}: {}",
+        diverged.len(),
+        subject.name,
+        diverged.join("; ")
+    );
+}
+
+/// What running one client scenario came to.
+struct Outcome {
+    status: Option<std::process::ExitStatus>,
+    output: String,
+}
+
+impl Outcome {
+    fn ok(&self) -> bool {
+        self.status.is_some_and(|s| s.success())
+    }
+
+    fn describe(&self) -> String {
+        match self.status {
+            None => format!("did not finish within {}s", CLIENT_TIMEOUT.as_secs()),
+            Some(status) => format!("exited {status}"),
+        }
+    }
+}
+
+/// Run `cmd` to completion, killing it if it outlasts `timeout`.
+///
+/// A scenario that hangs would otherwise hang the job, and the two group
+/// examples wait on a coordinator that could in principle never answer.
+/// Output is drained on its own threads because a child that fills a
+/// pipe while nobody reads it deadlocks, which is the same hang wearing
+/// a different hat.
+fn run_bounded(mut cmd: Command, timeout: Duration) -> Result<Outcome> {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning the example")?;
+    let mut stdout = child.stdout.take().context("example has no stdout")?;
+    let mut stderr = child.stderr.take().context("example has no stderr")?;
+    let out = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stdout.read_to_string(&mut s);
+        s
+    });
+    let err = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr.read_to_string(&mut s);
+        s
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().context("waiting for the example")? {
+            Some(status) => break Some(status),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    let mut output = out.join().unwrap_or_default();
+    output.push_str(&err.join().unwrap_or_default());
+    Ok(Outcome { status, output })
+}
+
+/// Keep the last `n` lines.
+fn tail(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+fn indent(text: &str) -> String {
+    text.lines()
+        .map(|l| format!("      {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn run_accept(

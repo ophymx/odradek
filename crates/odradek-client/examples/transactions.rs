@@ -200,7 +200,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The offset landed inside the transaction, so a new member of the
     // same group resumes past the records already processed.
-    let committed_offset = member.committed_offset(&input, 0).await?;
+    //
+    // Polled, not read once, and the reason is the same one that makes
+    // `poll_committed` above a loop. A commit makes the coordinator
+    // write a marker to every partition the transaction touched, and
+    // the offsets topic is one of those partitions — a separate write,
+    // to a separate leader, from the one that publishes the output
+    // records. Seeing the output is therefore no promise that the
+    // offset is readable yet. On one broker the two land together often
+    // enough to look synchronous; on a three-node cluster this read
+    // came back `None` while the records were already there.
+    let committed_offset = poll_offset(&member, &input, 0, batch.next_offset).await?;
     println!("committed input offset: {committed_offset:?}");
     assert_eq!(
         committed_offset,
@@ -264,6 +274,28 @@ async fn poll_stable_past(
         let result = read(cluster, topic, partition, IsolationLevel::ReadCommitted).await?;
         if result.last_stable_offset >= offset || Instant::now() >= deadline {
             return Ok(result);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Poll the group's committed offset until it reaches `want`.
+///
+/// Same wait as [`poll_committed`], for a different partition: the
+/// offsets topic gets its own marker, written separately from the one
+/// that publishes the output records, so the output being visible says
+/// nothing about the offset being readable yet.
+async fn poll_offset(
+    member: &GroupMember,
+    topic: &str,
+    partition: i32,
+    want: i64,
+) -> Result<Option<i64>, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let seen = member.committed_offset(topic, partition).await?;
+        if seen == Some(want) || Instant::now() >= deadline {
+            return Ok(seen);
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }

@@ -178,6 +178,13 @@ struct State {
     /// Blocking-request connections per broker: idle ones plus the
     /// concurrency that sizes the pool.
     blocking: HashMap<i32, BlockingPool>,
+    /// The node Metadata last named as the controller, if it named one.
+    ///
+    /// Separate from [`State::control`], which is only "a broker we can
+    /// reach". Most control-plane traffic does not care which broker
+    /// answers it; topic creation and deletion do, and asking the wrong
+    /// one gets `NOT_CONTROLLER`.
+    controller: Option<i32>,
     /// Group id → coordinator node id, as last discovered.
     coordinators: HashMap<String, i32>,
     /// Transactional id → coordinator node id.
@@ -328,8 +335,16 @@ impl Cluster {
             ));
         }
 
+        // -1 means the answering broker does not know who the
+        // controller is, which is a different thing from there not
+        // being one; keeping the last known id beats forgetting it.
+        let controller = (resp.controller_id >= 0).then_some(resp.controller_id);
+
         let mut state = self.state();
         state.brokers = brokers;
+        if let Some(controller) = controller {
+            state.controller = Some(controller);
+        }
         for (name, topic_id, partitions) in refreshed {
             if topic_id != [0u8; 16] {
                 state.topic_ids.insert(topic_id, name.clone());
@@ -380,6 +395,44 @@ impl Cluster {
     /// Drop the control-plane connection; the next use redials.
     pub(crate) fn forget_control(&self) {
         self.state().control = None;
+    }
+
+    /// A connection to the broker Metadata last named as the controller.
+    ///
+    /// Creating and deleting topics is the controller's work, and only
+    /// its work. Falls back to [`Cluster::control_broker`] when no
+    /// metadata has been fetched yet or the answer named no controller:
+    /// that is exactly right on a single-broker cluster and a guess on
+    /// a larger one, which is why the callers retry rather than trust
+    /// it.
+    pub async fn controller(&self) -> Result<Broker, ClientError> {
+        // Read out from under the lock before branching: the fallback
+        // takes the same lock, and a guard living into the `else` would
+        // be a deadlock resting on when a temporary happens to drop.
+        let known = self.state().controller;
+        let Some(id) = known else {
+            return self.control_broker().await;
+        };
+        match self.broker(id).await {
+            Ok(broker) => Ok(broker),
+            // Named a node we cannot reach or have never heard of. Any
+            // broker beats none; `NOT_CONTROLLER` will say so.
+            Err(_) => self.control_broker().await,
+        }
+    }
+
+    /// Forget who the controller was, ask again, and connect to whoever
+    /// the answer names.
+    ///
+    /// Every Metadata response carries `controller_id`, so relearning it
+    /// costs the refresh that a `NOT_CONTROLLER` answer already implies.
+    pub(crate) async fn rediscover_controller(&self) -> Result<Broker, ClientError> {
+        self.state().controller = None;
+        self.forget_control();
+        // No topics: this is asked for the broker list and the
+        // controller id, both of which every answer carries.
+        self.refresh_metadata(&[]).await?;
+        self.controller().await
     }
 
     /// Known brokers, as of the last metadata refresh.
@@ -786,14 +839,13 @@ impl Cluster {
         partitions: i32,
         replication_factor: i16,
     ) -> Result<(), ClientError> {
-        let broker = self.control_broker().await?;
+        let broker = self.controller().await?;
         match self
             .create_topic_via(&broker, name, partitions, replication_factor)
             .await
         {
-            Err(e) if is_control_failure(&e) => {
-                self.forget_control();
-                let broker = self.control_broker().await?;
+            Err(e) if is_control_redirect(&e) => {
+                let broker = self.rediscover_controller().await?;
                 self.create_topic_via(&broker, name, partitions, replication_factor)
                     .await
             }
@@ -846,6 +898,19 @@ fn is_control_failure(e: &ClientError) -> bool {
         e,
         ClientError::ConnectionClosed | ClientError::Io(_) | ClientError::Timeout(_)
     )
+}
+
+/// True when a controller-bound request should be asked of a different
+/// broker: the connection failed, or whoever answered is not the
+/// controller any more.
+///
+/// `NOT_CONTROLLER` is a redirect, not a refusal, and the difference is
+/// not academic — Kafka forwards controller work internally, so a
+/// client that reads it as a refusal works there and fails against an
+/// implementation that answers honestly. This one did.
+pub(crate) fn is_control_redirect(e: &ClientError) -> bool {
+    is_control_failure(e)
+        || matches!(e, ClientError::Broker(code) if *code == ErrorCode::NOT_CONTROLLER)
 }
 
 /// One full connection establishment — TCP, TLS, ApiVersions, SASL —

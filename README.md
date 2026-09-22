@@ -82,7 +82,9 @@ Early but functional end to end:
   (one ConsumerGroupHeartbeat API, broker-side assignment addressed
   by topic id, member-epoch fencing on heartbeats and commits) —
   tested against in-process fake single- and multi-broker clusters,
-  with real-broker smoke examples: `group_consume` and
+  and — since the examples stopped being something a person had to
+  remember to run — against every subject of the broker matrix in CI:
+  `group_consume` and
   `group848_consume` assemble the whole thing — join a group, resume
   from committed offsets, read the assigned partitions, commit, and
   prove a second member picks up exactly where the first stopped —

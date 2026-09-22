@@ -161,6 +161,15 @@ jobs:
         # batch makes some check answer differently than the broker
         # behind it.
         #
+        # Each subject then gets the client pass: odradek-client's own
+        # examples, run unmodified against the same live broker. It
+        # shares this job because the brokers are already up and
+        # starting them is the cost. Before it existed the client had no
+        # automated contact with a real broker at all, and its first run
+        # found that it could not create a topic on a multi-node
+        # Redpanda — NOT_CONTROLLER read as a refusal, which Kafka hides
+        # by forwarding controller work internally.
+        #
         # The xtask overlaps subjects by broker count rather than
         # running all eight at once, which on a two-core runner would
         # slow the brokers enough for the suite's waits to expire and

@@ -116,6 +116,39 @@ thread, and one `fetch()` materializes at most
 `ConsumerConfig::max_fetch_records` records over at most 64 MiB of
 decompressed record bytes.
 
+## What is tested against a real broker
+
+`cargo xtask conformance` runs the examples in `examples/` — unmodified,
+as a caller would — against every subject in the workspace's broker
+matrix: Apache Kafka 4.1 and 3.7, Redpanda 25.2, each as one broker and
+as a three-node cluster, plus TLS and SCRAM. Produce and consume in all
+four codecs, admin, classic consumer groups, KIP-848, and transactions
+with `read_committed`, per subject.
+
+That this is written in the present tense is recent. The examples were
+the validation every feature here shipped on, and they were run by hand;
+nothing ran them in CI, so the whole list above rested on somebody
+remembering. The first automated run found that this client could not
+create a topic against a multi-node Redpanda at all — it read
+`NOT_CONTROLLER` as a refusal rather than as the redirect it is, which
+Kafka hides by forwarding controller work internally and Redpanda does
+not. Every example failed on its first line against a cluster nobody had
+pointed it at.
+
+The matrix also records what a subject cannot do: KIP-848 is
+`unsupported` on Kafka 3.7 (advertised, answered `UNSUPPORTED_VERSION`)
+and on Redpanda 25.2 (not advertised at all), and both are checked in
+that direction too — a scenario that starts working is reported as
+loudly as one that stops.
+
+What it does not reach yet, so that the list above is not read as more
+than it is: of the SASL mechanisms only SCRAM-SHA-256 meets a real
+broker here, because that is the credential the authenticating subject
+is provisioned with — PLAIN and SCRAM-SHA-512 are covered against the
+RFC vectors in `odradek-sasl` and by hand, not by this. Mutual TLS is
+the same: verified live against a cluster requiring client certificates,
+once, by hand; no subject in the matrix asks for one.
+
 ## Features
 
 All on by default: `tls`, `sasl`, `gzip`, `lz4`, `snappy`, `zstd`.

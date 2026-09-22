@@ -587,6 +587,17 @@ brokers Metadata reports".
 
 Use `--no-proxy` to skip the second pass.
 
+## The client pass
+
+`cargo xtask conformance` finishes each subject by running
+`odradek-client`'s own examples against it — unmodified, as a caller
+would. That is not this crate's work and it deliberately does not use
+this crate: it rides the same command because the brokers are already
+up and starting them is the whole cost, about 70 seconds for all seven
+subjects against six and a half minutes of matrix. `--no-client` skips
+it. What it covers, and what it found on its first run, is in
+[the client's README](../odradek-client).
+
 Part of the [odradek](https://github.com/ophymx/odradek) constellation.
 
 ## License

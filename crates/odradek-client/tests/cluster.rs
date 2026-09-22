@@ -40,6 +40,17 @@ type Accepts = Arc<Mutex<std::collections::HashMap<i32, u32>>>;
 /// The fake group coordinator's node id.
 const COORDINATOR: i32 = 1;
 
+/// Which node the fake cluster calls its controller: the last one.
+///
+/// The last rather than the first so that a multi-node fake puts the
+/// controller somewhere the client does not bootstrap to, which is the
+/// only arrangement in which "route to the controller" and "ask whoever
+/// answered" look different. A single-node fake still names node 0, so
+/// the tests that do not care are unaffected.
+fn controller_of(endpoints: &[(i32, String)]) -> i32 {
+    endpoints.last().map_or(0, |(id, _)| *id)
+}
+
 /// Fetching at this offset makes the fake park the connection a while,
 /// like a long-poll waiting out max_wait_ms.
 const SLOW_FETCH_OFFSET: i64 = 777_777;
@@ -378,7 +389,7 @@ async fn serve_conn(
                     })
                     .collect();
                 resp.cluster_id = Some("fake-cluster".into());
-                resp.controller_id = 0;
+                resp.controller_id = controller_of(&endpoints);
                 let mut topic = MetadataResponseTopic::default();
                 topic.name = Some(TOPIC.into());
                 topic.topic_id = FAKE_TOPIC_ID;
@@ -756,11 +767,18 @@ async fn serve_conn(
                 };
                 let req = CreateTopicsRequest::decode(&mut frame, api_version).unwrap();
                 let mut resp = CreateTopicsResponse::default();
+                // Only the controller creates topics, and a broker that
+                // is not it says so rather than obliging. Kafka forwards
+                // this internally and so never exercises the redirect;
+                // Redpanda does not, which is where a client that reads
+                // NOT_CONTROLLER as a refusal stops working.
+                let is_controller = node_id == controller_of(&endpoints);
                 for t in &req.topics {
-                    let fresh = created.lock().unwrap().insert(t.name.clone());
                     let mut tresp = CreatableTopicResult::default();
                     tresp.name = t.name.clone();
-                    tresp.error_code = if fresh {
+                    tresp.error_code = if !is_controller {
+                        ErrorCode::NOT_CONTROLLER.0
+                    } else if created.lock().unwrap().insert(t.name.clone()) {
                         0
                     } else {
                         ErrorCode::TOPIC_ALREADY_EXISTS.0
@@ -1314,6 +1332,36 @@ async fn create_topic_speaks_create_topics_and_surfaces_duplicates() {
         Err(ClientError::Broker(code)) => assert_eq!(code, ErrorCode::TOPIC_ALREADY_EXISTS),
         other => panic!("expected TOPIC_ALREADY_EXISTS, got {other:?}"),
     }
+}
+
+/// `NOT_CONTROLLER` is a redirect, and the client has to follow it.
+///
+/// Against Kafka this is invisible: a broker that is not the controller
+/// forwards controller work itself, so every answer is a success and a
+/// client that never asks who the controller is works perfectly. Against
+/// a three-node Redpanda the same client could not create a topic at
+/// all — and therefore could not run a single one of its own examples.
+/// The fake's controller is its *last* node, so bootstrapping at the
+/// first one means the redirect has to be followed to get anywhere.
+#[tokio::test]
+async fn create_topic_follows_a_not_controller_redirect() {
+    let fake = spawn_fake_cluster(3, &[]).await;
+    let bootstrap = fake.endpoints[0].1.clone();
+    let cluster = Cluster::connect(config_for(&fake)).await.unwrap();
+    assert_ne!(
+        controller_of(&fake.endpoints),
+        0,
+        "the fake must not bootstrap onto its own controller, or this proves nothing"
+    );
+    assert!(
+        config_for(&fake).bootstrap_servers.contains(&bootstrap),
+        "the client must start at the node that will refuse"
+    );
+
+    cluster.create_topic("moved-topic", 1, 1).await.unwrap();
+    // Only the controller inserts, so this is the redirect having been
+    // followed rather than the refusal having been retried in place.
+    assert!(fake.created.lock().unwrap().contains("moved-topic"));
 }
 
 #[tokio::test]
